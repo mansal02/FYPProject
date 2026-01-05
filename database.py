@@ -131,3 +131,18 @@ class MarieDB:
         self.cursor.execute("INSERT INTO rad_memory (category, key_data, value_data) VALUES (?, ?, ?)",
                             (category, key, value))
         self.conn.commit()
+    
+    # --- DELETE METHODS (Add these to MarieDB class) ---
+    def delete_chat_log(self, log_id):
+        self.cursor.execute("DELETE FROM chat_logs WHERE id=?", (log_id,))
+        self.conn.commit()
+
+    def delete_rad_data(self, rad_id):
+        self.cursor.execute("DELETE FROM rad_memory WHERE id=?", (rad_id,))
+        self.conn.commit()
+    
+    def clear_all_chats(self, user_id):
+        self.cursor.execute("DELETE FROM chat_logs WHERE user_id=?", (user_id,))
+        self.conn.commit()
+        
+        
