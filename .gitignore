@@ -1,0 +1,35 @@
+# --- Security (CRITICAL) ---
+token.txt
+.env
+secrets.json
+
+# --- Python Environment ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# --- Large AI Models & Assets ---
+models/
+rvc_models/
+piper/
+checkpoints/
+node_modules/
+
+# --- Audio Cache & Generated Files ---
+cache/
+*.wav
+*.mp3
+*.flac
+
+# --- IDE & OS Settings ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- PyInstaller Build Folders (If you make an exe) ---
+dist/
+build/
+*.spec
