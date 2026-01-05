@@ -131,7 +131,6 @@ class MarieDB:
         self.cursor.execute("INSERT INTO rad_memory (category, key_data, value_data) VALUES (?, ?, ?)",
                             (category, key, value))
         self.conn.commit()
-        
     
     # --- DELETE METHODS (Add these to MarieDB class) ---
     def delete_chat_log(self, log_id):

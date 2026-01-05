@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTableWidgetItem, QHeaderView, QMessageBox, QFileDialog)
 from PyQt5.QtCore import pyqtSignal, Qt, QObject, QTimer
 
-# --- LIVE2D & WINDOW LIBS ---
+# --- LIVE2D IMPORT ---
 try:
     from live2d import v3 as live2d
     from pygame.locals import *
@@ -20,8 +20,7 @@ try:
 except ImportError:
     print("[CRITICAL] Libraries missing. Ensure live2d, pygame, and pywin32 are installed.")
 
-# --- PROJECT IMPORTS ---
-# Ensure these files exist in the same folder
+# --- SAFE PATH SETUP ---
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
 
@@ -343,7 +342,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
 
-        # --- LEFT PANEL (Face) ---
+        # --- LEFT PANEL (Face Container) ---
         self.face_container = QFrame()
         self.face_container.setFixedSize(450, 600)
         self.face_container.setStyleSheet("background-color: #000; border: 2px solid #3e3e42; border-radius: 5px;")
