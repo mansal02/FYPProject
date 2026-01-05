@@ -5,6 +5,7 @@ import pygame
 import math
 import time
 import random
+import re  # <--- NEW IMPORT for text cleaning
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTextEdit, QLineEdit, QPushButton, QLabel, QFrame,
                              QDialog, QTabWidget, QFormLayout, QComboBox, QTableWidget, 
@@ -475,13 +476,30 @@ class MainWindow(QMainWindow):
             self.signals.new_token.emit(token)
             
             if any(punc in token for punc in [".", "!", "?", "\n"]):
-                clean = sentence_buffer.strip()
-                if clean:
-                    self.voice.speak(clean)
-                    sentence_buffer = ""
+                raw_text = sentence_buffer.strip()
+                
+                # --- NEW CLEANING LOGIC START ---
+                # Remove [emotions] using Regex
+                clean_text = re.sub(r'\[.*?\]', '', raw_text)
+                # Remove **bold** asterisks
+                clean_text = re.sub(r'\*+', '', clean_text)
+                # Strip extra spaces
+                clean_text = clean_text.strip()
+                # --- NEW CLEANING LOGIC END ---
 
-        if sentence_buffer.strip():
-            self.voice.speak(sentence_buffer.strip())
+                if clean_text:
+                    self.voice.speak(clean_text)
+                sentence_buffer = ""
+
+        # Flush remaining text
+        remaining_raw = sentence_buffer.strip()
+        if remaining_raw:
+             # Apply same cleaning for the final chunk
+            clean_text = re.sub(r'\[.*?\]', '', remaining_raw)
+            clean_text = re.sub(r'\*+', '', clean_text).strip()
+            if clean_text:
+                self.voice.speak(clean_text)
+                
         self.signals.finished.emit(full_response)
 
     def append_token(self, token):
