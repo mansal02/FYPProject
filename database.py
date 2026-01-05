@@ -144,3 +144,5 @@ class MarieDB:
     def clear_all_chats(self, user_id):
         self.cursor.execute("DELETE FROM chat_logs WHERE user_id=?", (user_id,))
         self.conn.commit()
+        
+        

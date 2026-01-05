@@ -14,7 +14,7 @@ except ImportError:
     sys.exit()
 
 # --- CONFIGURATION ---
-MODEL_PATH = r"d:\pylearn\FYP\AiAssistant\models\kei\runtime\kei_vowels_pro.model3.json"
+MODEL_PATH = r"C:\FYPProject\models\kei\runtime\kei_vowels_pro.model3.json"
 WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 600
 
