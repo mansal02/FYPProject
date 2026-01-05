@@ -458,7 +458,8 @@ class MainWindow(QMainWindow):
         self.chat_history.append(f"<b style='color: #4ec9b0'>YOU:</b> {text}")
         self.chat_history.append(f"<b style='color: #ce9178'>MARIE:</b> ")
         self.input_field.clear()
-        
+
+        threading.Thread(target=self.actions.execute, args=(text,), daemon=True).start()
         threading.Thread(target=self.process_logic, args=(text,), daemon=True).start()
 
     def process_logic(self, text):
