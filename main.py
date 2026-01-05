@@ -459,12 +459,6 @@ class MainWindow(QMainWindow):
         self.chat_history.append(f"<b style='color: #ce9178'>MARIE:</b> ")
         self.input_field.clear()
         
-        # --- [NEW CODE] EXECUTE ACTION IN BACKGROUND ---
-        # We pass 'text' (YOUR command) instead of the AI's response
-        # We use a thread so AppOpener doesn't freeze the GUI while searching
-        threading.Thread(target=self.actions.execute, args=(text,), daemon=True).start()
-        # -----------------------------------------------
-
         threading.Thread(target=self.process_logic, args=(text,), daemon=True).start()
 
     def process_logic(self, text):
@@ -501,7 +495,7 @@ class MainWindow(QMainWindow):
         self.db.log_chat(self.current_user_id, "marie", full_text)
         
         self.chat_history.append("<hr style='background-color: #444; height: 1px; border: 0;'>")
-        #self.actions.execute(full_text)
+        self.actions.execute(full_text)
 
     def closeEvent(self, event):
         self.db.logout_user(self.current_user_id)
@@ -522,5 +516,5 @@ if __name__ == "__main__":
         window = MainWindow(login.user_id, db)
         window.show()
         sys.exit(app.exec_())
-    else:
+    else:       
         sys.exit()
