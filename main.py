@@ -27,8 +27,8 @@ sys.path.append(ROOT_DIR)
 from action import ActionHandler
 from index import get_marie_response_stream
 from voice import MarieVoice
-from database import MarieDB  # <--- NEW IMPORT
-from voice_db import CHARACTERS # To populate dropdowns
+from database import MarieDB
+from voice_db import CHARACTERS 
 
 # =========================================================================
 # 1. LOGIN DIALOG (The "Gatekeeper")
@@ -357,7 +357,7 @@ class MainWindow(QMainWindow):
         title_label = QLabel("SESSION ACTIVE")
         title_label.setStyleSheet("color: #4ec9b0; font-weight: bold;")
         
-        settings_btn = QPushButton("⚙ Settings / DB")
+        settings_btn = QPushButton("Settings / DB")
         settings_btn.setFixedWidth(120)
         settings_btn.setStyleSheet("background-color: #444; padding: 5px;")
         settings_btn.clicked.connect(self.open_settings)
@@ -470,7 +470,12 @@ class MainWindow(QMainWindow):
     def process_logic(self, text):
         full_response = ""
         sentence_buffer = ""
-        for token in get_marie_response_stream(text):
+        
+        # 1. FETCH MEMORY FROM DB (The RAG Part)
+        rag_context = self.db.get_all_rad_data()
+
+        # 2. PASS MEMORY TO THE AI
+        for token in get_marie_response_stream(text, memory_context=rag_context):
             full_response += token
             sentence_buffer += token
             self.signals.new_token.emit(token)

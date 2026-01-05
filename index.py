@@ -1,26 +1,26 @@
 import ollama
 
-def get_marie_response_stream(prompt):
-    """
-    Returns a GENERATOR that yields text chunks one by one.
-    """
+def get_marie_response_stream(prompt, memory_context=""):
+    """Streams responses from Ollama with memory context injected."""
     try:
         if not prompt: return iter([""])
+        
+        system_instructions = "You are MARIE. Be concise. Use emotions like [happy]."
+        if memory_context:
+            system_instructions += f"\nFacts about the user you remember:\n{memory_context}"
 
-        # Create a stream
         stream = ollama.chat(
             model='llama3', 
             messages=[
-                {'role': 'system', 'content': "You are MARIE. Be concise. Use emotions like [happy]."},
+                {'role': 'system', 'content': system_instructions},
                 {'role': 'user', 'content': prompt}
             ],
-            stream=True  # <--- ENABLE STREAMING
+            stream=True 
         )
         
-        # Yield clean content chunks
         for chunk in stream:
             yield chunk['message']['content']
             
     except Exception as e:
-        print(f"\n[ERROR] Ollama Stream failed: {e}")
-        yield "I am having connection issues."
+        print(f"Ollama Error: {e}")
+        yield "I am having trouble connecting to my brain."
