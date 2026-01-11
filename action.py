@@ -10,13 +10,18 @@ from AppOpener import open as open_app
 from AppOpener import close as close_app
 from AppOpener import give_appnames
 
+# For Excel handling
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.chart import BarChart, Reference
+
 class ActionHandler:
     def __init__(self):
         # 1. CUSTOM APPS / GAMES
         # Add games or portable apps here that the scanner misses.
         # Use double backslashes \\ for paths.
         self.custom_apps = {
-            "genshin": r"C:\Program Files\Genshin Impact\Genshin Impact Game\GenshinImpact.exe",
             "minecraft": r"C:\XboxGames\Minecraft Launcher\Content\Minecraft.exe",
             "steam": r"C:\Program Files (x86)\Steam\steam.exe",
             "obs": r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"
@@ -73,6 +78,65 @@ class ActionHandler:
         elif "mute" in text or "unmute" in text:
             pyautogui.press('volumemute')
             return
+        
+        
+       # ==========================================================
+        # ADVANCED EXCEL HANDLER
+        # ==========================================================
+        if "excel" in text:
+            filename = "MARIE_Master_Report.xlsx"
+            
+            # --- FEATURE 1: AUTO-FORMATTED DATA ENTRY ---
+            if "report" in text:
+                # Example: "excel report for sales 100, 200, 300"
+                data_match = re.findall(r'\d+', text)
+                sales_data = [int(x) for x in data_match]
+                
+                df = pd.DataFrame({'Sales': sales_data})
+                df.to_excel(filename, index=False)
+                
+                # Load with Openpyxl to add "Advanced" features
+                wb = load_workbook(filename)
+                ws = wb.active
+                
+                # Styling the Header
+                header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+                white_font = Font(color="FFFFFF", bold=True)
+                
+                for cell in ws[1]:
+                    cell.fill = header_fill
+                    cell.font = white_font
+                    cell.alignment = Alignment(horizontal="center")
+                
+                # --- FEATURE 2: AUTOMATED CHARTING ---
+                chart = BarChart()
+                chart.title = "Performance Analysis"
+                chart.y_axis.title = 'Units'
+                chart.x_axis.title = 'Items'
+                
+                data = Reference(ws, min_col=1, min_row=1, max_row=len(sales_data)+1)
+                chart.add_data(data, titles_from_data=True)
+                ws.add_chart(chart, "C2")
+                
+                wb.save(filename)
+                os.startfile(filename)
+                print(f"[ACTION] Advanced Report Generated with Charts.")
+                return
+
+            # --- FEATURE 3: DATA CLEANING ---
+            if "clean" in text:
+                try:
+                    df = pd.read_excel(filename)
+                    df.drop_duplicates(inplace=True)
+                    df.fillna(0, inplace=True) # Replace empty cells with 0
+                    df.to_excel(filename, index=False)
+                    print("[ACTION] Data cleaned and duplicates removed.")
+                except Exception as e:
+                    print(f"[ERROR] Cleaning failed: {e}")
+                return
+        #==========================================================
+        
+        
 
         # =========================================================
         # 4. OPEN APPS (Custom + General)
