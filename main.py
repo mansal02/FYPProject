@@ -1,4 +1,5 @@
 import sys
+import requests  
 import os
 import threading
 import pygame
@@ -20,19 +21,14 @@ try:
 except ImportError:
     print("[CRITICAL] Libraries missing. Ensure live2d, pygame, and pywin32 are installed.")
 
-# --- SAFE PATH SETUP ---
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
 
 from action import ActionHandler
-from index import get_marie_response_stream
-from voice import MarieVoice
 from database import MarieDB
 from voice_db import CHARACTERS 
 
-# =========================================================================
-# 1. LOGIN DIALOG (The "Gatekeeper")
-# =========================================================================
+# 1. LOGIN DIALOG
 class LoginDialog(QDialog):
     def __init__(self, db_instance):
         super().__init__()
@@ -44,7 +40,6 @@ class LoginDialog(QDialog):
 
         layout = QVBoxLayout(self)
         
-        # Inputs
         self.user_input = QLineEdit()
         self.user_input.setPlaceholderText("Username")
         self.user_input.setStyleSheet("padding: 5px; border: 1px solid #555;")
@@ -54,7 +49,6 @@ class LoginDialog(QDialog):
         self.pass_input.setEchoMode(QLineEdit.Password)
         self.pass_input.setStyleSheet("padding: 5px; border: 1px solid #555;")
         
-        # Buttons
         self.login_btn = QPushButton("Login")
         self.login_btn.clicked.connect(self.handle_login)
         self.login_btn.setStyleSheet("background-color: #007acc; padding: 5px;")
@@ -76,7 +70,7 @@ class LoginDialog(QDialog):
         
         if uid:
             self.user_id = uid
-            self.accept() # Closes dialog and lets main window open
+            self.accept()
         else:
             QMessageBox.warning(self, "Error", "Invalid username or password")
 
@@ -93,9 +87,9 @@ class LoginDialog(QDialog):
         else:
             QMessageBox.warning(self, "Error", msg)
 
-# =========================================================================
-# 2. SETTINGS DASHBOARD (Tabs for Requirements 2-5)
-# =========================================================================
+
+# 2. SETTINGS DASHBOARD 
+
 class SettingsWindow(QDialog):
     def __init__(self, parent_window):
         super().__init__(parent_window)
@@ -115,17 +109,14 @@ class SettingsWindow(QDialog):
             QTableWidget { gridline-color: #444; }
         """)
         
-        # --- TAB 1: PREFERENCES ---
         self.tab_prefs = QWidget()
         self.init_prefs_tab()
         self.tabs.addTab(self.tab_prefs, "Preferences")
 
-        # --- TAB 2: CHAT LOGS (Updated with Delete) ---
         self.tab_logs = QWidget()
         self.init_logs_tab()
         self.tabs.addTab(self.tab_logs, "Chat Logs")
 
-        # --- TAB 3: RAD MEMORY (Updated with Delete) ---
         self.tab_rad = QWidget()
         self.init_rad_tab()
         self.tabs.addTab(self.tab_rad, "RAD Memory")
@@ -165,15 +156,13 @@ class SettingsWindow(QDialog):
     def init_logs_tab(self):
         layout = QVBoxLayout(self.tab_logs)
         
-        # Table
         self.log_table = QTableWidget()
-        self.log_table.setColumnCount(5) # Col 0 is Hidden ID
+        self.log_table.setColumnCount(5)
         self.log_table.setHorizontalHeaderLabels(["ID", "Time", "Sender", "Message", "Emotion"])
-        self.log_table.hideColumn(0) # Hide the ID column
+        self.log_table.hideColumn(0)
         self.log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.log_table.setSelectionBehavior(QTableWidget.SelectRows)
         
-        # Controls
         btn_layout = QHBoxLayout()
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.load_logs)
@@ -199,7 +188,6 @@ class SettingsWindow(QDialog):
     def init_rad_tab(self):
         layout = QVBoxLayout(self.tab_rad)
         
-        # Add New Fact
         form_layout = QHBoxLayout()
         self.rad_key = QLineEdit()
         self.rad_key.setPlaceholderText("Key (e.g., 'birthday')")
@@ -216,15 +204,13 @@ class SettingsWindow(QDialog):
         form_layout.addWidget(self.rad_val)
         form_layout.addWidget(add_btn)
         
-        # Table
         self.rad_table = QTableWidget()
-        self.rad_table.setColumnCount(4) # Col 0 is Hidden ID
+        self.rad_table.setColumnCount(4)
         self.rad_table.setHorizontalHeaderLabels(["ID", "Category", "Key", "Value"])
         self.rad_table.hideColumn(0)
         self.rad_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.rad_table.setSelectionBehavior(QTableWidget.SelectRows)
 
-        # Delete Button
         del_layout = QHBoxLayout()
         del_btn = QPushButton("Delete Selected Fact")
         del_btn.setStyleSheet("background: #cc3333; padding: 5px; color: white;")
@@ -237,7 +223,7 @@ class SettingsWindow(QDialog):
         layout.addLayout(del_layout)
         self.load_rad_data()
 
-    # --- LOGIC & EVENTS ---
+# Logic for browsing model file
     def browse_model(self):
         fname, _ = QFileDialog.getOpenFileName(self, "Select Model3 JSON", "", "Live2D Model (*.model3.json)")
         if fname: self.model_path_input.setText(fname)
@@ -246,12 +232,13 @@ class SettingsWindow(QDialog):
         voice = self.voice_combo.currentText()
         model = self.model_path_input.text()
         self.db.save_preference(self.uid, voice, model)
-        self.main_win.voice.set_voice(voice)
+        
+        self.main_win.current_character = voice
         self.main_win.model_path = model 
-        QMessageBox.information(self, "Saved", "Preferences saved.")
+        
+        QMessageBox.information(self, "Saved", "Preferences saved. (Restart may be needed for Model change)")
 
     def load_logs(self):
-        # We now fetch ID as well
         self.db.cursor.execute("SELECT id, timestamp, message_type, content, emotion_tag FROM chat_logs WHERE user_id=? ORDER BY id DESC", (self.uid,))
         rows = self.db.cursor.fetchall()
         self.log_table.setRowCount(0)
@@ -263,7 +250,6 @@ class SettingsWindow(QDialog):
     def delete_selected_log(self):
         row = self.log_table.currentRow()
         if row >= 0:
-            # Get the hidden ID from column 0
             log_id = self.log_table.item(row, 0).text()
             self.db.delete_chat_log(log_id)
             self.log_table.removeRow(row)
@@ -299,9 +285,7 @@ class SettingsWindow(QDialog):
             self.db.delete_rad_data(rad_id)
             self.rad_table.removeRow(row)
 
-# =========================================================================
-# 3. MAIN WINDOW (Updated)
-# =========================================================================
+# 3. MAIN APPLICATION WINDOW
 class StreamSignals(QObject):
     new_token = pyqtSignal(str)
     finished = pyqtSignal(str)
@@ -316,22 +300,24 @@ class MainWindow(QMainWindow):
         self.resize(1100, 700)
         self.setStyleSheet("background-color: #1e1e1e; color: white;")
 
-        # Engines
-        self.voice = MarieVoice()
+        self.brain_url = "http://127.0.0.1:8000/chat"
+        self.voice_url = "http://127.0.0.1:8001/speak"
         self.actions = ActionHandler()
         self.signals = StreamSignals()
         
-        # Default Model or Load from DB
+        self.is_speaking_remotely = False
+        
         self.model_path = r"d:\pylearn\FYP\AiAssistant\models\kei\runtime\kei_vowels_pro.model3.json"
+        self.current_character = "tachyon" 
+
         prefs = self.db.get_preference(self.current_user_id)
         if prefs:
             saved_voice, saved_model = prefs
-            if saved_voice: self.voice.set_voice(saved_voice)
+            if saved_voice: self.current_character = saved_voice
             if saved_model: self.model_path = saved_model
 
         self.init_ui()
         
-        # Connect Signals
         self.signals.new_token.connect(self.append_token)
         self.signals.finished.connect(self.finalize_response)
 
@@ -342,17 +328,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
 
-        # --- LEFT PANEL (Face Container) ---
         self.face_container = QFrame()
         self.face_container.setFixedSize(450, 600)
         self.face_container.setStyleSheet("background-color: #000; border: 2px solid #3e3e42; border-radius: 5px;")
         main_layout.addWidget(self.face_container)
 
-        # --- RIGHT PANEL (Chat + Controls) ---
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
 
-        # TOP BAR (Settings Button)
         top_bar = QHBoxLayout()
         title_label = QLabel("SESSION ACTIVE")
         title_label.setStyleSheet("color: #4ec9b0; font-weight: bold;")
@@ -429,7 +412,7 @@ class MainWindow(QMainWindow):
         self.t_breath += 0.05
         self.model.SetParameterValue("ParamBreath", (math.sin(self.t_breath) + 1) / 2)
         
-        mouth_val = random.uniform(0.3, 1.0) if self.voice.is_speaking else 0.0
+        mouth_val = random.uniform(0.3, 1.0) if self.is_speaking_remotely else 0.0
         self.model.SetParameterValue("ParamMouthOpenY", mouth_val)
         
         self.model.SetParameterValue("Param85", 1.0)
@@ -452,7 +435,6 @@ class MainWindow(QMainWindow):
         text = self.input_field.text().strip()
         if not text: return
 
-        # LOG TO DB
         self.db.log_chat(self.current_user_id, "user", text)
 
         self.chat_history.append(f"<b style='color: #4ec9b0'>YOU:</b> {text}")
@@ -463,27 +445,36 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self.process_logic, args=(text,), daemon=True).start()
 
     def process_logic(self, text):
-        full_response = ""
-        sentence_buffer = ""
-        
-        # 1. FETCH MEMORY FROM DB (The RAG Part)
-        rag_context = self.db.get_all_rad_data()
-
-        # 2. PASS MEMORY TO THE AI
-        for token in get_marie_response_stream(text, memory_context=rag_context):
-            full_response += token
-            sentence_buffer += token
-            self.signals.new_token.emit(token)
+        try:
+            # 1. SEND TO BRAIN (Port 8000)
+            payload = {
+                "text": text,
+                "user_id": self.current_user_id
+            }
             
-            if any(punc in token for punc in [".", "!", "?", "\n"]):
-                clean = sentence_buffer.strip()
-                if clean:
-                    self.voice.speak(clean)
-                    sentence_buffer = ""
+            response = requests.post(self.brain_url, json=payload).json()
+            ai_reply = response.get("response", "[Error: Brain Empty]")
+            
+            self.signals.new_token.emit(ai_reply)
+            self.signals.finished.emit(ai_reply)
 
-        if sentence_buffer.strip():
-            self.voice.speak(sentence_buffer.strip())
-        self.signals.finished.emit(full_response)
+            # 3. SEND TO VOICE (Port 8001)
+            requests.post(self.voice_url, json={
+                "text": ai_reply,
+                "character": self.current_character
+            })
+            
+            self.is_speaking_remotely = True
+            
+            duration = max(1000, len(ai_reply) * 80)
+            QTimer.singleShot(int(duration), self.stop_mouth)
+            
+        except Exception as e:
+            print(f"Connection Error: {e}")
+            self.signals.new_token.emit("[System Error: Brain/Voice server is offline]")
+
+    def stop_mouth(self):
+        self.is_speaking_remotely = False
 
     def append_token(self, token):
         cursor = self.chat_history.textCursor()
@@ -492,7 +483,6 @@ class MainWindow(QMainWindow):
         self.chat_history.setTextCursor(cursor)
 
     def finalize_response(self, full_text):
-        # LOG TO DB
         self.db.log_chat(self.current_user_id, "marie", full_text)
         
         self.chat_history.append("<hr style='background-color: #444; height: 1px; border: 0;'>")
@@ -507,13 +497,10 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
-    # 1. Init DB
     db = MarieDB()
     
-    # 2. Show Login
     login = LoginDialog(db)
     if login.exec_() == QDialog.Accepted:
-        # 3. If Login Success, Start Main Window
         window = MainWindow(login.user_id, db)
         window.show()
         sys.exit(app.exec_())

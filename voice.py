@@ -17,7 +17,7 @@ class MarieVoice:
         if not os.path.exists(PIPER_EXE):
             raise FileNotFoundError("piper.exe not found!")
 
-        # Create a dedicated cache folder to avoid file conflicts
+        # Create a cache folder to avoid file conflicts
         self.cache_dir = os.path.join(os.path.dirname(__file__), "cache")
         os.makedirs(self.cache_dir, exist_ok=True)
         self._clear_cache()
@@ -36,7 +36,7 @@ class MarieVoice:
         self.is_running = True
         self.is_speaking = False
         
-        # Start Worker
+
         self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
         self.worker_thread.start()
 
@@ -108,7 +108,6 @@ class MarieVoice:
             
             self.is_speaking = True
             
-            # Use rotating filenames to prevent file locking issues
             filename = f"sentence_{file_counter}.wav"
             filepath = os.path.join(self.cache_dir, filename)
             file_counter = (file_counter + 1) % 20 # Keep only 20 files max
@@ -168,3 +167,43 @@ class MarieVoice:
             
             # Small pause between sentences for natural flow
             time.sleep(0.05)
+            
+    
+    def generate_only(self, text):
+        """Generates WAV file using Piper but DOES NOT play it."""
+        clean_text, speed = self._get_physics(text)
+        
+        filename = "temp_tts.wav"
+        filepath = os.path.join(self.cache_dir, filename)
+        
+        length_scale = 1.0 / float(speed)
+        
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        cmd = [
+            PIPER_EXE, 
+            "--model", self.model_path, 
+            "--output_file", filepath, 
+            "--length_scale", str(length_scale)
+        ]
+
+        try:
+            subprocess.run(cmd, input=clean_text.encode('utf-8'), 
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, startupinfo=startupinfo)
+            return filepath
+        except Exception as e:
+            print(f"[PIPER ERROR] {e}")
+            return None
+
+    def play_file(self, filepath):
+        """Plays any WAV file (Raw or RVC converted)."""
+        if not os.path.exists(filepath): return
+        
+        try:
+            sound = pygame.mixer.Sound(filepath)
+            self.channel.play(sound)
+            while self.channel.get_busy():
+                pygame.time.Clock().tick(30)
+        except Exception as e:
+            print(f"[PLAY ERROR] {e}")        
