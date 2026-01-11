@@ -15,10 +15,10 @@ CHARACTERS = {
         "speaker_id": 0,
         
         # --- RVC SETTINGS (Disabled/Commented) ---
-        # "rvc_enable": True,
-        # "rvc_model": "Tachyon.pth",
-        # "rvc_index": "Tachyon.index",
-        # "pitch_shift": 0,
+        "rvc_enable": True,
+        "rvc_model": "Tachyon.pth",
+        "rvc_index": "Tachyon.index",
+        "pitch_shift": 0,
         
         "emotions": {
             # Note: "pitch_shift" is RVC-specific and currently ignored.
@@ -65,11 +65,11 @@ CHARACTERS = {
         "speaker_id": 19, 
         
         # --- RVC SETTINGS (Disabled/Commented) ---
-        # "rvc_enable": True,
-        # "rvc_model": "jalter.pth", 
-        # "rvc_index": "jalter.index",
-        # "pitch_shift": -2, 
-        
+        "rvc_enable": True,
+        "rvc_model": "jalter.pth", 
+        "rvc_index": "jalter.index",
+        "pitch_shift": -2, 
+
         "emotions": {
             # --- NEUTRAL / COOL ---
             "default":   {"speed": 0.90, "pitch_shift": -2}, 
@@ -104,11 +104,11 @@ CHARACTERS = {
         "speaker_id": 0,
         
         # --- RVC SETTINGS (Disabled/Commented) ---
-        # "rvc_enable": True,
-        # "rvc_model": "miku.pth",      
-        # "rvc_index": "miku.index",    
-        # "pitch_shift": 4,             
-        
+        "rvc_enable": True,
+        "rvc_model": "miku.pth",      
+        "rvc_index": "miku.index",    
+        "pitch_shift": 4,             
+
         "emotions": {
             # --- DEFAULT STATE ---
             "default":   {"speed": 1.00, "pitch_shift": 4},
