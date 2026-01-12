@@ -6,6 +6,8 @@ import pygame
 import math
 import time
 import random
+import keyboard
+from hear import VoiceWorker
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTextEdit, QLineEdit, QPushButton, QLabel, QFrame,
                              QDialog, QTabWidget, QFormLayout, QComboBox, QTableWidget, 
@@ -318,6 +320,13 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         
+        #VOICE INTEGRATION 
+        self.voice_thread = VoiceWorker(wake_word="hey")######################WAKE WORD###############################
+        self.voice_thread.text_received.connect(self.handle_voice_input)
+        self.voice_thread.status_update.connect(self.update_voice_status)
+        self.voice_thread.start()
+        keyboard.add_hotkey('F4', self.voice_thread.toggle_listening)
+        
         self.signals.new_token.connect(self.append_token)
         self.signals.finished.connect(self.finalize_response)
 
@@ -337,6 +346,9 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
 
         top_bar = QHBoxLayout()
+        self.voice_label = QLabel("Mic: OFF (F4)")
+        self.voice_label.setStyleSheet("color: #888; margin-right: 10px;")
+        
         title_label = QLabel("SESSION ACTIVE")
         title_label.setStyleSheet("color: #4ec9b0; font-weight: bold;")
         
@@ -345,6 +357,7 @@ class MainWindow(QMainWindow):
         settings_btn.setStyleSheet("background-color: #444; padding: 5px;")
         settings_btn.clicked.connect(self.open_settings)
         
+        top_bar.addWidget(self.voice_label) 
         top_bar.addWidget(title_label)
         top_bar.addStretch()
         top_bar.addWidget(settings_btn)
@@ -374,6 +387,19 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(send_btn)
 
         main_layout.addWidget(right_panel, stretch=1)
+        
+        
+    def update_voice_status(self, status):
+        color = "#4ec9b0" if "Listening" in status else "#888"
+        if "ON" in status: color = "#00ff00"
+        self.voice_label.setStyleSheet(f"color: {color}; margin-right: 10px;")
+        self.voice_label.setText(f"[{status}]")
+
+    def handle_voice_input(self, text):
+        if not text: return
+        
+        self.input_field.setText(text)
+        self.handle_send()    
 
     def open_settings(self):
         dlg = SettingsWindow(self)
