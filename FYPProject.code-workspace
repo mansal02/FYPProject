@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"name": "FYPProject",
+			"path": "."
+		},
+		{
+			"name": "models",
+			"path": "../Users/User/Downloads/models"
+		},
+		{
+			"name": "piper",
+			"path": "../Users/User/Downloads/piper"
+		}
+	],
+	"settings": {}
+}

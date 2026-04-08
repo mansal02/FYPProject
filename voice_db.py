@@ -7,10 +7,10 @@ RVC_DIR = os.path.join(os.path.dirname(__file__), "rvc_models")
 # --- THE ULTIMATE CHARACTER DATABASE ---
 CHARACTERS = {
     # =========================================================================
-    # CHARACTER 1: AGNES TACHYON (The Mad Scientist)
+    # CHARACTER 1: 
     # =========================================================================
-    "tachyon": {
-        "name": "Agnes Tachyon",
+    "CV-01 (default)": {
+        "name": "CV-01 (default)",
         "piper_model": "en_GB-jenny_dioco-medium.onnx",
         "speaker_id": 0,
         
@@ -57,10 +57,10 @@ CHARACTERS = {
     },
 
     # =========================================================================
-    # CHARACTER 2: JEANNE ALTER (The Dragon Witch)
+    # CHARACTER 2: 
     # =========================================================================
-    "jalter": {
-        "name": "Jeanne Alter",
+    "CV-02": {
+        "name": "CV-02",
         "piper_model": "en_US-libritts-high.onnx",
         "speaker_id": 19, 
         
@@ -96,10 +96,10 @@ CHARACTERS = {
     },
 
     # =========================================================================
-    # CHARACTER 3: HATSUNE MIKU (The Virtual Idol)
+    # CHARACTER 3: 
     # =========================================================================
-    "miku": {
-        "name": "Hatsune Miku",
+    "CV-03 (synth)": {
+        "name": "CV-03 (synth)",
         "piper_model": "en_US-lessac-medium.onnx",
         "speaker_id": 0,
         

@@ -23,4 +23,4 @@ def get_marie_response_stream(prompt, memory_context=""):
             
     except Exception as e:
         print(f"Ollama Error: {e}")
-        yield "I am having trouble connecting to my brain."
+        yield "I am having trouble in my index."
