@@ -54,12 +54,18 @@ class ExcelCommandHandler:
             return False
         if re.fullmatch(r"-?\d+", value):
             return int(value)
-        if re.fullmatch(r"-?\d+\.\d+", value):
+        try:
             return float(value)
+        except ValueError:
+            pass
         return value
 
+    def _ensure_formula_prefix(self, formula_text):
+        cleaned_formula = formula_text.strip()
+        return cleaned_formula if cleaned_formula.startswith("=") else "=" + cleaned_formula
+
     def handle(self, text):
-        open_match = re.fullmatch(r"excel\s+(?:create|open)\s+(.+)", text, flags=re.IGNORECASE)
+        open_match = re.fullmatch(r"excel\s+(?:create|open)\s+(.+?)\s*$", text, flags=re.IGNORECASE)
         if open_match:
             file_path = self._normalize_path(open_match.group(1))
             workbook = self._load_or_create_workbook(file_path)
@@ -93,7 +99,6 @@ class ExcelCommandHandler:
             workbook = self._load_or_create_workbook(file_path)
             sheet = self._pick_sheet(workbook, sheet_name)
             value = sheet[cell.upper()].value
-            workbook.save(file_path)
             print(f"[ACTION][EXCEL] {cell.upper()} = {value}")
             return True
 
@@ -107,8 +112,15 @@ class ExcelCommandHandler:
             file_path = self._normalize_path(file_name)
             workbook = self._load_or_create_workbook(file_path)
             sheet = self._pick_sheet(workbook, sheet_name)
-            parsed_row = next(csv.reader(StringIO(row_values_text), skipinitialspace=True))
-            sheet.append([self._to_value(item) for item in parsed_row])
+            try:
+                parsed_row = next(csv.reader(StringIO(row_values_text)), [])
+            except csv.Error:
+                print("[ACTION][EXCEL] Row input is malformed. Use comma-separated values, e.g. apple,10,done.")
+                return True
+            if not parsed_row or all(not item.strip() for item in parsed_row):
+                print("[ACTION][EXCEL] No valid row values provided. Use comma-separated values.")
+                return True
+            sheet.append([self._to_value(item.strip()) for item in parsed_row])
             workbook.save(file_path)
             print(f"[ACTION][EXCEL] Row added in {file_path}")
             return True
@@ -123,14 +135,7 @@ class ExcelCommandHandler:
             file_path = self._normalize_path(file_name)
             workbook = self._load_or_create_workbook(file_path)
             sheet = self._pick_sheet(workbook, sheet_name)
-            total = 0
-            for row in sheet[source_range.upper()]:
-                for cell in row:
-                    if isinstance(cell.value, (int, float)):
-                        total += cell.value
-                    elif isinstance(cell.value, str) and re.fullmatch(r"-?\d+(\.\d+)?", cell.value.strip()):
-                        total += float(cell.value)
-            sheet[target_cell.upper()] = total
+            sheet[target_cell.upper()] = self._ensure_formula_prefix(f"SUM({source_range.upper()})")
             workbook.save(file_path)
             print(f"[ACTION][EXCEL] Sum {source_range.upper()} -> {target_cell.upper()} in {file_path}")
             return True
@@ -145,10 +150,7 @@ class ExcelCommandHandler:
             file_path = self._normalize_path(file_name)
             workbook = self._load_or_create_workbook(file_path)
             sheet = self._pick_sheet(workbook, sheet_name)
-            cleaned_formula = formula_text.strip()
-            if not cleaned_formula.startswith("="):
-                cleaned_formula = "=" + cleaned_formula
-            sheet[target_cell.upper()] = cleaned_formula
+            sheet[target_cell.upper()] = self._ensure_formula_prefix(formula_text)
             workbook.save(file_path)
             print(f"[ACTION][EXCEL] Formula set in {target_cell.upper()} for {file_path}")
             return True
