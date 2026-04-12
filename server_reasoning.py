@@ -9,15 +9,18 @@ db = MarieDB()
 @app.post("/chat")
 def chat_endpoint(payload: dict = Body(...)):
     user_text = payload.get("text")
-    rag_context = db.get_all_rad_data() 
+    rag_context = payload.get("memory_context")
+    if not rag_context:
+        rag_context = db.get_all_rad_data()
+
+    action_result = payload.get("action_result", "")
+    if action_result:
+        rag_context = f"{rag_context}\n\nLatest action/tool output:\n{action_result}".strip()
     
 
     full_response = ""
     for token in get_marie_response_stream(user_text, memory_context=rag_context):
         full_response += token
-        
-        
-    db.log_chat(payload.get("user_id"), "marie", full_response) 
     
     return {"response": full_response}
 

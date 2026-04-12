@@ -1,4 +1,6 @@
 import os
+import threading
+import wave
 import uvicorn
 from fastapi import FastAPI, Body
 from voice import MarieVoice
@@ -21,10 +23,28 @@ if RVC_AVAILABLE:
     device = "cuda:0" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
     rvc_engine = RVCInference(device=device)
 
+
+def _get_wav_duration_ms(path):
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        with wave.open(path, "rb") as wav_file:
+            frame_count = wav_file.getnframes()
+            sample_rate = wav_file.getframerate()
+            if sample_rate <= 0:
+                return 0
+            return int((frame_count / float(sample_rate)) * 1000)
+    except Exception:
+        return 0
+
 @app.post("/speak")
 def speak_endpoint(payload: dict = Body(...)):
     text = payload.get("text")
     char_id = payload.get("character", "tachyon").lower()
+    async_play = payload.get("async_play", True)
+
+    if not text:
+        return {"status": "empty", "file": None, "duration_ms": 0, "async": bool(async_play)}
     
 
     char_data, _ = get_character_data(char_id)
@@ -69,9 +89,19 @@ def speak_endpoint(payload: dict = Body(...)):
             print(f"[RVC ERROR] {e}")
             final_path = raw_audio_path
 
-    voice_engine.play_file(final_path)
+    duration_ms = _get_wav_duration_ms(final_path)
 
-    return {"status": "speaking", "file": final_path}
+    if async_play and final_path:
+        threading.Thread(target=voice_engine.play_file, args=(final_path,), daemon=True).start()
+    else:
+        voice_engine.play_file(final_path)
+
+    return {
+        "status": "speaking",
+        "file": final_path,
+        "duration_ms": duration_ms,
+        "async": bool(async_play),
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8001)

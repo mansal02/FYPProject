@@ -1,3 +1,6 @@
+import argparse
+import html
+import json
 import sys
 import requests  
 import os
@@ -11,7 +14,7 @@ from hear import VoiceWorker
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTextEdit, QLineEdit, QPushButton, QLabel, QFrame,
                              QDialog, QTabWidget, QFormLayout, QComboBox, QTableWidget, 
-                             QTableWidgetItem, QHeaderView, QMessageBox, QFileDialog)
+                             QTableWidgetItem, QHeaderView, QMessageBox, QFileDialog, QCheckBox)
 from PyQt5.QtCore import pyqtSignal, Qt, QObject, QTimer
 
 # --- LIVE2D IMPORT ---
@@ -26,6 +29,40 @@ except ImportError:
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
 
+AUTO_LOGIN_FILE = os.path.join(ROOT_DIR, ".marie_autologin.json")
+
+
+def save_auto_login_user(user_id):
+    try:
+        with open(AUTO_LOGIN_FILE, "w", encoding="utf-8") as f:
+            json.dump({"user_id": user_id}, f)
+    except Exception as e:
+        print(f"[LOGIN] Failed to save one-time login token: {e}")
+
+
+def load_auto_login_user():
+    if not os.path.exists(AUTO_LOGIN_FILE):
+        return None
+
+    try:
+        with open(AUTO_LOGIN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        user_id = data.get("user_id")
+        if isinstance(user_id, int):
+            return user_id
+    except Exception as e:
+        print(f"[LOGIN] Failed to read one-time login token: {e}")
+
+    return None
+
+
+def clear_auto_login_user():
+    if os.path.exists(AUTO_LOGIN_FILE):
+        try:
+            os.remove(AUTO_LOGIN_FILE)
+        except Exception as e:
+            print(f"[LOGIN] Failed to clear one-time login token: {e}")
+
 from action import ActionHandler
 from database import MarieDB
 from voice_db import CHARACTERS 
@@ -36,8 +73,9 @@ class LoginDialog(QDialog):
         super().__init__()
         self.db = db_instance
         self.setWindowTitle("MARIE - User Login")
-        self.setFixedSize(300, 200)
+        self.setFixedSize(320, 230)
         self.user_id = None
+        self.session_id = None
         self.setStyleSheet("background-color: #252526; color: white;")
 
         layout = QVBoxLayout(self)
@@ -59,19 +97,28 @@ class LoginDialog(QDialog):
         self.reg_btn.clicked.connect(self.handle_register)
         self.reg_btn.setStyleSheet("background-color: #333; padding: 5px;")
 
+        self.remember_cb = QCheckBox("One-time login (remember this account)")
+        self.remember_cb.setChecked(True)
+        self.remember_cb.setStyleSheet("color: #d4d4d4;")
+
         layout.addWidget(QLabel("<h2>Welcome back</h2>"))
         layout.addWidget(self.user_input)
         layout.addWidget(self.pass_input)
+        layout.addWidget(self.remember_cb)
         layout.addWidget(self.login_btn)
         layout.addWidget(self.reg_btn)
 
     def handle_login(self):
         username = self.user_input.text()
         password = self.pass_input.text()
-        uid = self.db.login_user(username, password)
+        auth_data = self.db.login_user(username, password)
         
-        if uid:
-            self.user_id = uid
+        if auth_data:
+            self.user_id, self.session_id = auth_data
+            if self.remember_cb.isChecked():
+                save_auto_login_user(self.user_id)
+            else:
+                clear_auto_login_user()
             self.accept()
         else:
             QMessageBox.warning(self, "Error", "Invalid username or password")
@@ -98,6 +145,8 @@ class SettingsWindow(QDialog):
         self.main_win = parent_window
         self.db = parent_window.db
         self.uid = parent_window.current_user_id
+        self.current_session_id = parent_window.current_session_id
+        self.current_session_only = False
         
         self.setWindowTitle("Database & Settings Manager")
         self.resize(700, 500)
@@ -144,10 +193,15 @@ class SettingsWindow(QDialog):
         save_btn.setStyleSheet("background: #007acc; padding: 8px; font-weight: bold; color: white;")
         save_btn.clicked.connect(self.save_preferences)
 
+        forget_login_btn = QPushButton("Forget One-Time Login")
+        forget_login_btn.setStyleSheet("background: #6a1b1b; padding: 6px; color: white;")
+        forget_login_btn.clicked.connect(self.forget_one_time_login)
+
         layout.addRow("Voice Persona:", self.voice_combo)
         layout.addRow("Model Path:", self.model_path_input)
         layout.addRow("", browse_btn)
         layout.addRow("", save_btn)
+        layout.addRow("", forget_login_btn)
         
         prefs = self.db.get_preference(self.uid)
         if prefs:
@@ -159,8 +213,8 @@ class SettingsWindow(QDialog):
         layout = QVBoxLayout(self.tab_logs)
         
         self.log_table = QTableWidget()
-        self.log_table.setColumnCount(5)
-        self.log_table.setHorizontalHeaderLabels(["ID", "Time", "Sender", "Message", "Emotion"])
+        self.log_table.setColumnCount(6)
+        self.log_table.setHorizontalHeaderLabels(["ID", "Session", "Time", "Sender", "Message", "Emotion"])
         self.log_table.hideColumn(0)
         self.log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.log_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -174,12 +228,17 @@ class SettingsWindow(QDialog):
         delete_btn.setStyleSheet("background: #cc3333; padding: 5px; font-weight: bold; color: white;")
         delete_btn.clicked.connect(self.delete_selected_log)
 
+        self.filter_btn = QPushButton("Current Session Only: OFF")
+        self.filter_btn.setStyleSheet("background: #505050; padding: 5px; color: white;")
+        self.filter_btn.clicked.connect(self.toggle_log_filter)
+
         clear_btn = QPushButton("Clear ALL My Logs")
         clear_btn.setStyleSheet("background: #8b0000; padding: 5px; color: white;")
         clear_btn.clicked.connect(self.clear_all_logs)
         
         btn_layout.addWidget(refresh_btn)
         btn_layout.addWidget(delete_btn)
+        btn_layout.addWidget(self.filter_btn)
         btn_layout.addStretch()
         btn_layout.addWidget(clear_btn)
         
@@ -240,9 +299,19 @@ class SettingsWindow(QDialog):
         
         QMessageBox.information(self, "Saved", "Preferences saved. (Restart may be needed for Model change)")
 
+    def forget_one_time_login(self):
+        clear_auto_login_user()
+        QMessageBox.information(self, "Done", "One-time login was cleared.")
+
+    def toggle_log_filter(self):
+        self.current_session_only = not self.current_session_only
+        state = "ON" if self.current_session_only else "OFF"
+        self.filter_btn.setText(f"Current Session Only: {state}")
+        self.load_logs()
+
     def load_logs(self):
-        self.db.cursor.execute("SELECT id, timestamp, message_type, content, emotion_tag FROM chat_logs WHERE user_id=? ORDER BY id DESC", (self.uid,))
-        rows = self.db.cursor.fetchall()
+        selected_session = self.current_session_id if self.current_session_only else None
+        rows = self.db.get_chat_logs(self.uid, selected_session)
         self.log_table.setRowCount(0)
         for row_idx, row_data in enumerate(rows):
             self.log_table.insertRow(row_idx)
@@ -257,9 +326,15 @@ class SettingsWindow(QDialog):
             self.log_table.removeRow(row)
 
     def clear_all_logs(self):
-        confirm = QMessageBox.question(self, "Confirm", "Delete ALL your chat history? This cannot be undone.", QMessageBox.Yes | QMessageBox.No)
+        if self.current_session_only:
+            confirm_text = "Delete logs from this session only? This cannot be undone."
+        else:
+            confirm_text = "Delete ALL your chat history? This cannot be undone."
+
+        confirm = QMessageBox.question(self, "Confirm", confirm_text, QMessageBox.Yes | QMessageBox.No)
         if confirm == QMessageBox.Yes:
-            self.db.clear_all_chats(self.uid)
+            selected_session = self.current_session_id if self.current_session_only else None
+            self.db.clear_all_chats(self.uid, selected_session)
             self.load_logs()
 
     def add_rad_fact(self):
@@ -291,12 +366,19 @@ class SettingsWindow(QDialog):
 class StreamSignals(QObject):
     new_token = pyqtSignal(str)
     finished = pyqtSignal(str)
+    voice_hold = pyqtSignal(int)
 
 class MainWindow(QMainWindow):
-    def __init__(self, user_id, db_instance):
+    def __init__(self, user_id, session_id, db_instance, app_mode="both", transparent_face=False):
         super().__init__()
         self.current_user_id = user_id
+        self.current_session_id = session_id
         self.db = db_instance
+        self.app_mode = app_mode
+        self.transparent_face = transparent_face
+        self.voice_input_enabled = app_mode in ("both", "voice")
+        self.voice_output_enabled = app_mode in ("both", "voice")
+        self.text_input_enabled = app_mode in ("both", "gui")
         
         self.setWindowTitle("MARIE - Intelligent Environment")
         self.resize(1100, 700)
@@ -304,10 +386,22 @@ class MainWindow(QMainWindow):
 
         self.brain_url = "http://127.0.0.1:8000/chat"
         self.voice_url = "http://127.0.0.1:8001/speak"
-        self.actions = ActionHandler()
+        self.actions = ActionHandler(
+            db=self.db,
+            context_provider=lambda: {
+                "user_id": self.current_user_id,
+                "session_id": self.current_session_id,
+            },
+        )
         self.signals = StreamSignals()
         
         self.is_speaking_remotely = False
+        self.is_processing_response = False
+        self.waiting_for_voice_finish = False
+        self.latest_user_text = ""
+        self.latest_action_result = ""
+        self.voice_thread = None
+        self.hotkey_id = None
         
         self.model_path = r"d:\pylearn\FYP\AiAssistant\models\kei\runtime\kei_vowels_pro.model3.json"
         self.current_character = "tachyon" 
@@ -319,17 +413,36 @@ class MainWindow(QMainWindow):
             if saved_model: self.model_path = saved_model
 
         self.init_ui()
+
+        if self.text_input_enabled:
+            self.input_field.setEnabled(True)
+            self.send_btn.setEnabled(True)
+        else:
+            self.input_field.setEnabled(False)
+            self.send_btn.setEnabled(False)
+            self.input_field.setPlaceholderText("Voice-only mode is active.")
         
-        #VOICE INTEGRATION 
-        self.voice_thread = VoiceWorker(wake_word="hey")######################WAKE WORD###############################
-        self.voice_thread.text_received.connect(self.handle_voice_input)
-        self.voice_thread.status_update.connect(self.update_voice_status)
-        self.voice_thread.start()
-        keyboard.add_hotkey('F4', self.voice_thread.toggle_listening)
+        # VOICE INTEGRATION
+        if self.voice_input_enabled:
+            self.voice_thread = VoiceWorker(wake_word="hey")
+            self.voice_thread.text_received.connect(self.handle_voice_input)
+            self.voice_thread.status_update.connect(self.update_voice_status)
+            self.voice_thread.start()
+            self.hotkey_id = keyboard.add_hotkey('F4', self.voice_thread.toggle_listening)
+
+            if self.app_mode == "voice":
+                self.voice_thread.is_active = True
+                self.voice_label.setText("[Mic ON]")
+                self.voice_label.setStyleSheet("color: #00ff00; margin-right: 10px;")
+        else:
+            self.voice_label.setText("[Mic disabled in GUI mode]")
+            self.voice_label.setStyleSheet("color: #888; margin-right: 10px;")
         
         self.signals.new_token.connect(self.append_token)
         self.signals.finished.connect(self.finalize_response)
+        self.signals.voice_hold.connect(self.schedule_voice_release)
 
+        self.perform_startup_checks()
         QTimer.singleShot(100, self.init_live2d_embedding)
 
     def init_ui(self):
@@ -339,7 +452,10 @@ class MainWindow(QMainWindow):
 
         self.face_container = QFrame()
         self.face_container.setFixedSize(450, 600)
-        self.face_container.setStyleSheet("background-color: #000; border: 2px solid #3e3e42; border-radius: 5px;")
+        if self.transparent_face:
+            self.face_container.setStyleSheet("background-color: rgba(0, 0, 0, 0); border: 2px solid #3e3e42; border-radius: 5px;")
+        else:
+            self.face_container.setStyleSheet("background-color: #000; border: 2px solid #3e3e42; border-radius: 5px;")
         main_layout.addWidget(self.face_container)
 
         right_panel = QWidget()
@@ -349,8 +465,8 @@ class MainWindow(QMainWindow):
         self.voice_label = QLabel("Mic: OFF (F4)")
         self.voice_label.setStyleSheet("color: #888; margin-right: 10px;")
         
-        title_label = QLabel("SESSION ACTIVE")
-        title_label.setStyleSheet("color: #4ec9b0; font-weight: bold;")
+        self.mode_label = QLabel(f"SESSION ACTIVE [{self.app_mode.upper()}]")
+        self.mode_label.setStyleSheet("color: #4ec9b0; font-weight: bold;")
         
         settings_btn = QPushButton("Settings / DB")
         settings_btn.setFixedWidth(120)
@@ -358,7 +474,7 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self.open_settings)
         
         top_bar.addWidget(self.voice_label) 
-        top_bar.addWidget(title_label)
+        top_bar.addWidget(self.mode_label)
         top_bar.addStretch()
         top_bar.addWidget(settings_btn)
 
@@ -377,29 +493,62 @@ class MainWindow(QMainWindow):
         self.input_field.setStyleSheet("background-color: #333; padding: 10px; border-radius: 5px; color: white;")
         self.input_field.returnPressed.connect(self.handle_send)
 
-        send_btn = QPushButton("Send")
-        send_btn.setStyleSheet("background-color: #007acc; padding: 10px; font-weight: bold; border-radius: 5px; color: white;")
-        send_btn.clicked.connect(self.handle_send)
+        self.send_btn = QPushButton("Send")
+        self.send_btn.setStyleSheet("background-color: #007acc; padding: 10px; font-weight: bold; border-radius: 5px; color: white;")
+        self.send_btn.clicked.connect(self.handle_send)
 
         right_layout.addLayout(top_bar)
         right_layout.addWidget(self.chat_history)
         right_layout.addWidget(self.input_field)
-        right_layout.addWidget(send_btn)
+        right_layout.addWidget(self.send_btn)
 
         main_layout.addWidget(right_panel, stretch=1)
         
         
     def update_voice_status(self, status):
-        color = "#4ec9b0" if "Listening" in status else "#888"
-        if "ON" in status: color = "#00ff00"
+        color = "#888"
+        if "Listening" in status:
+            color = "#4ec9b0"
+        elif "ON" in status:
+            color = "#00ff00"
+        elif "Auto-paused" in status:
+            color = "#d7ba7d"
         self.voice_label.setStyleSheet(f"color: {color}; margin-right: 10px;")
         self.voice_label.setText(f"[{status}]")
 
+    def perform_startup_checks(self):
+        warnings = []
+
+        if not os.path.exists(self.model_path):
+            warnings.append(f"Live2D model not found at: {self.model_path}")
+
+        try:
+            requests.get("http://127.0.0.1:8000/docs", timeout=1.2)
+        except Exception:
+            warnings.append("Reasoning server (8000) is unreachable.")
+
+        if self.voice_output_enabled:
+            try:
+                requests.get("http://127.0.0.1:8001/docs", timeout=1.2)
+            except Exception:
+                warnings.append("Voice server (8001) is unreachable.")
+
+        if warnings:
+            self.chat_history.append("<span style='color:#d7ba7d'><b>System Check:</b></span>")
+            for warning in warnings:
+                self.chat_history.append(f"<span style='color:#d7ba7d'>- {warning}</span>")
+        else:
+            self.chat_history.append("<span style='color:#4ec9b0'><b>System Check:</b> all core services look ready.</span>")
+
     def handle_voice_input(self, text):
-        if not text: return
-        
+        if not text or not self.voice_input_enabled:
+            return
+
+        if self.is_processing_response:
+            return
+
         self.input_field.setText(text)
-        self.handle_send()    
+        self.submit_user_text(text)
 
     def open_settings(self):
         dlg = SettingsWindow(self)
@@ -418,12 +567,16 @@ class MainWindow(QMainWindow):
 
         live2d.init()
         live2d.glInit()
+        self.model = None
         
         if os.path.exists(self.model_path):
             os.chdir(os.path.dirname(self.model_path))
             self.model = live2d.LAppModel()
             self.model.LoadModelJson(self.model_path)
             self.model.Resize(450, 600)
+        else:
+            print(f"[LIVE2D] Model file not found: {self.model_path}")
+            return
             
         self.t_breath = 0.0
         self.last_blink = time.time()
@@ -433,6 +586,9 @@ class MainWindow(QMainWindow):
         self.anim_timer.start(16)
 
     def update_live2d_frame(self):
+        if not getattr(self, "model", None):
+            return
+
         for event in pygame.event.get(): pass
 
         self.t_breath += 0.05
@@ -453,51 +609,116 @@ class MainWindow(QMainWindow):
             self.model.SetParameterValue("ParamEyeROpen", 1.0)
 
         self.model.Update()
-        live2d.clearBuffer(0.1, 0.1, 0.1, 1.0)
+        if self.transparent_face:
+            live2d.clearBuffer(0.0, 0.0, 0.0, 0.0)
+        else:
+            live2d.clearBuffer(0.1, 0.1, 0.1, 1.0)
         self.model.Draw()
         pygame.display.flip()
 
     def handle_send(self):
-        text = self.input_field.text().strip()
-        if not text: return
+        if not self.text_input_enabled:
+            return
 
-        self.db.log_chat(self.current_user_id, "user", text)
+        text = self.input_field.text().strip()
+        self.submit_user_text(text)
+
+    def submit_user_text(self, text):
+        if not text:
+            return
+
+        if self.is_processing_response:
+            self.chat_history.append("<span style='color:#d7ba7d'><i>[System] Processing previous request...</i></span>")
+            return
+
+        self.db.log_chat(self.current_user_id, "user", text, session_id=self.current_session_id)
+        self.latest_user_text = text
 
         self.chat_history.append(f"<b style='color: #4ec9b0'>YOU:</b> {text}")
         self.chat_history.append(f"<b style='color: #ce9178'>MARIE:</b> ")
         self.input_field.clear()
 
-        threading.Thread(target=self.actions.execute, args=(text,), daemon=True).start()
-        threading.Thread(target=self.process_logic, args=(text,), daemon=True).start()
+        action_result = self.actions.execute_and_collect(text)
+        self.latest_action_result = action_result
+        if action_result:
+            pretty = html.escape(action_result).replace("\n", "<br>")
+            self.chat_history.append(f"<span style='color:#9cdcfe'><i>{pretty}</i></span>")
 
-    def process_logic(self, text):
+        self.is_processing_response = True
+        if self.voice_thread:
+            self.voice_thread.pause_for_processing()
+
+        threading.Thread(target=self.process_logic, args=(text, action_result), daemon=True).start()
+
+    def process_logic(self, text, action_result=""):
+        ai_reply = ""
+        voice_hold_ms = 0
         try:
+            memory_context = self.db.build_memory_context(self.current_user_id, self.current_session_id)
+
             # 1. SEND TO BRAIN (Port 8000)
             payload = {
                 "text": text,
-                "user_id": self.current_user_id
+                "user_id": self.current_user_id,
+                "session_id": self.current_session_id,
+                "memory_context": memory_context,
+                "action_result": action_result,
             }
             
-            response = requests.post(self.brain_url, json=payload).json()
-            ai_reply = response.get("response", "[Error: Brain Empty]")
+            response = requests.post(self.brain_url, json=payload, timeout=120)
+            response.raise_for_status()
+            data = response.json()
+            ai_reply = data.get("response", "[Error: Brain Empty]")
             
             self.signals.new_token.emit(ai_reply)
             self.signals.finished.emit(ai_reply)
 
-            # 3. SEND TO VOICE (Port 8001)
-            requests.post(self.voice_url, json={
-                "text": ai_reply,
-                "character": self.current_character
-            })
-            
-            self.is_speaking_remotely = True
-            
-            duration = max(1000, len(ai_reply) * 80)
-            QTimer.singleShot(int(duration), self.stop_mouth)
+            # 2. SEND TO VOICE (Port 8001)
+            if self.voice_output_enabled and ai_reply:
+                self.is_speaking_remotely = True
+                try:
+                    voice_response = requests.post(
+                        self.voice_url,
+                        json={
+                            "text": ai_reply,
+                            "character": self.current_character,
+                            "async_play": True,
+                        },
+                        timeout=120,
+                    )
+                    if voice_response.ok:
+                        voice_data = voice_response.json()
+                        voice_hold_ms = int(voice_data.get("duration_ms", 0))
+                        if voice_hold_ms > 0:
+                            self.waiting_for_voice_finish = True
+                            self.signals.voice_hold.emit(voice_hold_ms)
+                except Exception as e:
+                    print(f"Voice Error: {e}")
+                finally:
+                    if voice_hold_ms <= 0:
+                        self.stop_mouth()
             
         except Exception as e:
             print(f"Connection Error: {e}")
-            self.signals.new_token.emit("[System Error: Brain/Voice server is offline]")
+            fail_msg = "[System Error: Brain server is offline]"
+            self.signals.new_token.emit(fail_msg)
+            self.signals.finished.emit(fail_msg)
+        finally:
+            self.is_processing_response = False
+            if self.voice_thread and not self.waiting_for_voice_finish:
+                self.voice_thread.resume_after_processing()
+
+    def schedule_voice_release(self, duration_ms):
+        hold_ms = max(800, min(int(duration_ms) + 250, 180000))
+        self.waiting_for_voice_finish = True
+        self.is_speaking_remotely = True
+        QTimer.singleShot(hold_ms, self.finish_voice_release)
+
+    def finish_voice_release(self):
+        self.waiting_for_voice_finish = False
+        self.stop_mouth()
+        if self.voice_thread and not self.is_processing_response:
+            self.voice_thread.resume_after_processing()
 
     def stop_mouth(self):
         self.is_speaking_remotely = False
@@ -509,25 +730,89 @@ class MainWindow(QMainWindow):
         self.chat_history.setTextCursor(cursor)
 
     def finalize_response(self, full_text):
-        self.db.log_chat(self.current_user_id, "marie", full_text)
+        self.db.log_chat(self.current_user_id, "marie", full_text, session_id=self.current_session_id)
+        self.db.log_conversation_turn(
+            self.current_user_id,
+            self.current_session_id,
+            self.latest_user_text,
+            full_text,
+        )
+
+        auto_saved = self.db.auto_store_important_conversation_data(self.latest_user_text, full_text)
+        if auto_saved:
+            preview_items = [f"{k}={v}" for k, v in auto_saved[:3]]
+            preview = "; ".join(preview_items)
+            self.chat_history.append(f"<span style='color:#b5cea8'><i>[RAD auto-saved] {preview}</i></span>")
+        self.latest_user_text = ""
+        self.latest_action_result = ""
         
         self.chat_history.append("<hr style='background-color: #444; height: 1px; border: 0;'>")
-        self.actions.execute(full_text)
+        threading.Thread(target=self.actions.execute, args=(full_text,), daemon=True).start()
 
     def closeEvent(self, event):
-        self.db.logout_user(self.current_user_id)
-        live2d.dispose()
+        self.db.logout_user(self.current_user_id, self.current_session_id)
+
+        if self.voice_thread:
+            self.voice_thread.running = False
+            self.voice_thread.wait(1000)
+
+        if self.hotkey_id is not None:
+            try:
+                keyboard.remove_hotkey(self.hotkey_id)
+            except Exception:
+                pass
+
+        try:
+            live2d.dispose()
+        except Exception:
+            pass
+
         pygame.quit()
         event.accept()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="MARIE Launcher")
+    parser.add_argument("--mode", choices=["both", "gui", "voice"], default="both", help="Input/output mode")
+    parser.add_argument("--force-login", action="store_true", help="Ignore saved one-time login token")
+    parser.add_argument("--reset-login", action="store_true", help="Clear one-time login token and exit")
+    parser.add_argument("--transparent-face", action="store_true", help="Use transparent background behind Live2D canvas")
+    args = parser.parse_args()
+
+    if args.reset_login:
+        clear_auto_login_user()
+        print("[LOGIN] One-time login token cleared.")
+        sys.exit(0)
+
     app = QApplication(sys.argv)
     
     db = MarieDB()
+
+    if not args.force_login:
+        remembered_user_id = load_auto_login_user()
+        if remembered_user_id and db.user_exists(remembered_user_id):
+            resumed_session_id = db.resume_user_session(remembered_user_id)
+            if resumed_session_id:
+                window = MainWindow(
+                    remembered_user_id,
+                    resumed_session_id,
+                    db,
+                    app_mode=args.mode,
+                    transparent_face=args.transparent_face,
+                )
+                window.show()
+                sys.exit(app.exec_())
+        elif remembered_user_id:
+            clear_auto_login_user()
     
     login = LoginDialog(db)
     if login.exec_() == QDialog.Accepted:
-        window = MainWindow(login.user_id, db)
+        window = MainWindow(
+            login.user_id,
+            login.session_id,
+            db,
+            app_mode=args.mode,
+            transparent_face=args.transparent_face,
+        )
         window.show()
         sys.exit(app.exec_())
     else:       
