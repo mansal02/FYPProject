@@ -1,11 +1,17 @@
 import sqlite3
 import hashlib
 import re
+import os
 
-DB_NAME = "marie_data.db"
+from app_config import CONFIG
+
+DB_NAME = CONFIG["paths"]["db_path"]
 
 class MarieDB:
     def __init__(self):
+        db_folder = os.path.dirname(DB_NAME)
+        if db_folder:
+            os.makedirs(db_folder, exist_ok=True)
         self.conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         self.cursor = self.conn.cursor()
         self.create_tables()
@@ -84,11 +90,25 @@ class MarieDB:
             )
         ''')
 
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS long_term_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                memory_key TEXT NOT NULL,
+                memory_value TEXT NOT NULL,
+                source TEXT DEFAULT 'conversation',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, memory_key, memory_value),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        ''')
+
         self._ensure_schema_migrations()
 
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_logs_user_session ON chat_logs(user_id, session_id)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_turns_user_session ON conversation_turns(user_id, session_id)")
+        self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_long_term_user ON long_term_memory(user_id)")
         self.conn.commit()
 
     def _ensure_schema_migrations(self):
@@ -242,6 +262,30 @@ class MarieDB:
         self.conn.commit()
         return True
 
+    def save_long_term_memory(self, user_id, key, value, source="conversation"):
+        if user_id is None or not key or not value:
+            return False
+        try:
+            self.cursor.execute(
+                "INSERT OR IGNORE INTO long_term_memory (user_id, memory_key, memory_value, source) VALUES (?, ?, ?, ?)",
+                (user_id, key, value, source),
+            )
+            self.conn.commit()
+            return self.cursor.rowcount > 0
+        except Exception:
+            return False
+
+    def get_long_term_memory(self, user_id, limit=120):
+        self.cursor.execute(
+            "SELECT memory_key, memory_value FROM long_term_memory WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        )
+        rows = self.cursor.fetchall()
+        if not rows:
+            return ""
+        lines = [f"{k}: {v}" for k, v in reversed(rows)]
+        return "\n".join(lines)
+
     def _extract_important_facts(self, text):
         if not text:
             return []
@@ -312,7 +356,7 @@ class MarieDB:
 
         return points
 
-    def auto_store_important_conversation_data(self, user_text, assistant_text=""):
+    def auto_store_important_conversation_data(self, user_text, assistant_text="", user_id=None):
         stored = []
         candidate_facts = self._extract_important_facts(user_text)
         candidate_facts.extend(self._extract_assistant_points(assistant_text))
@@ -320,6 +364,8 @@ class MarieDB:
         for key, value, confidence in candidate_facts:
             if self.add_rad_data_if_new("auto_fact", key, value, confidence):
                 stored.append((key, value))
+            if user_id is not None:
+                self.save_long_term_memory(user_id, key, value, source="conversation")
         return stored
 
     def get_all_rad_data(self, limit=300):
@@ -367,16 +413,41 @@ class MarieDB:
 
     def build_memory_context(self, user_id, session_id=None):
         """Combines RAD memory + prior conversation turns for continuity."""
-        rad_context = self.get_all_rad_data(limit=220)
-        turn_context = self.get_recent_turn_context(user_id, session_id=session_id, limit=10)
+        mem_cfg = CONFIG.get("memory", {})
+        rad_limit = int(mem_cfg.get("rad_limit", 220))
+        turn_limit = int(mem_cfg.get("recent_turn_limit", 10))
+        max_context_chars = int(mem_cfg.get("max_context_chars", 9000))
+
+        rad_context = self.get_all_rad_data(limit=rad_limit)
+        ltm_context = self.get_long_term_memory(user_id, limit=80)
+        turn_context = self.get_recent_turn_context(user_id, session_id=session_id, limit=turn_limit)
 
         chunks = []
         if rad_context:
             chunks.append("Known memory:\n" + rad_context)
+        if ltm_context:
+            chunks.append("Long-term memory:\n" + ltm_context)
         if turn_context:
             chunks.append("Recent conversation:\n" + turn_context)
 
-        return "\n\n".join(chunks)
+        context = "\n\n".join(chunks)
+        if len(context) <= max_context_chars:
+            return context
+
+        # Keep newest lines so long-running sessions do not overflow model context.
+        lines = [line for line in context.splitlines() if line.strip()]
+        kept = []
+        used = 0
+        for line in reversed(lines):
+            line_size = len(line) + 1
+            if used + line_size > max_context_chars:
+                break
+            kept.append(line)
+            used += line_size
+
+        kept.reverse()
+        trimmed = "\n".join(kept)
+        return "[Context trimmed automatically to fit memory window]\n" + trimmed
     
     # --- DELETE METHODS ---
     def delete_chat_log(self, log_id):

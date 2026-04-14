@@ -4,6 +4,9 @@ import time
 import os
 import subprocess
 import threading
+import json
+import platform
+import shutil
 import pywhatkit
 import csv
 import importlib
@@ -16,6 +19,7 @@ from urllib.parse import quote_plus
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import LineChart, Reference
 from openpyxl.utils import get_column_letter
+from app_config import CONFIG
 
 try:
     Document = importlib.import_module("docx").Document
@@ -52,10 +56,35 @@ except ImportError:
     Presentation = None
     POWERPOINT_AVAILABLE = False
 
-# Import AppOpener functions
-from AppOpener import open as open_app
-from AppOpener import close as close_app
-from AppOpener import give_appnames
+SYSTEM_NAME = platform.system().lower()
+IS_WINDOWS = SYSTEM_NAME.startswith("win")
+
+
+def _open_with_default_app(path):
+    try:
+        if IS_WINDOWS and hasattr(os, "startfile"):
+            os.startfile(path)
+        elif SYSTEM_NAME == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception as e:
+        print(f"[ACTION] Could not open file with default app: {e}")
+        return False
+
+
+try:
+    # Import AppOpener functions (best on Windows).
+    from AppOpener import open as open_app
+    from AppOpener import close as close_app
+    from AppOpener import give_appnames
+    APPOPENER_AVAILABLE = True
+except Exception:
+    open_app = None
+    close_app = None
+    give_appnames = None
+    APPOPENER_AVAILABLE = False
 
 class ExcelCommandHandler:
     def __init__(self):
@@ -142,8 +171,10 @@ class ExcelCommandHandler:
         print(f"[ACTION][EXCEL] Random {rows}x{cols} table + chart created in {file_path}")
 
         try:
-            os.startfile(file_path)
-            print("[ACTION][EXCEL] Opened workbook in available spreadsheet software.")
+            if _open_with_default_app(file_path):
+                print("[ACTION][EXCEL] Opened workbook in available spreadsheet software.")
+            else:
+                print("[ACTION][EXCEL] Workbook created, but opening the file failed.")
         except Exception as e:
             print(f"[ACTION][EXCEL] Workbook created but auto-open failed: {e}")
 
@@ -531,8 +562,10 @@ class PowerPointCommandHandler:
                 print(f"[ACTION][PPT] File not found: {file_path}")
                 return True
             try:
-                os.startfile(file_path)
-                print(f"[ACTION][PPT] Opened {file_path}")
+                if _open_with_default_app(file_path):
+                    print(f"[ACTION][PPT] Opened {file_path}")
+                else:
+                    print(f"[ACTION][PPT] Failed to open {file_path}")
             except Exception as e:
                 print(f"[ACTION][PPT] Failed to open: {e}")
             return True
@@ -562,6 +595,9 @@ class ActionHandler:
         self.excel = ExcelCommandHandler()
         self.word = WordCommandHandler()
         self.powerpoint = PowerPointCommandHandler()
+        action_cfg = CONFIG.get("actions", {})
+        self.safe_mode = bool(action_cfg.get("safe_mode", True))
+        self.allow_legacy_text_commands = bool(action_cfg.get("allow_legacy_text_commands", True))
 
     def execute_and_collect(self, text):
         if not text:
@@ -744,10 +780,176 @@ class ActionHandler:
         except Exception as e:
             print(f"[ACTION][WEB] Research failed: {e}")
 
+    def _open_text_editor(self):
+        try:
+            if IS_WINDOWS:
+                os.system("start notepad")
+                return
+            if SYSTEM_NAME == "darwin":
+                subprocess.Popen(["open", "-a", "TextEdit"])
+                return
+
+            for editor in ("gedit", "kate", "mousepad", "xed"):
+                if shutil.which(editor):
+                    subprocess.Popen([editor])
+                    return
+        except Exception as e:
+            print(f"[ACTION] Could not open text editor: {e}")
+
+    def _open_app_name(self, app_name):
+        print(f"[ACTION] Opening: '{app_name}'")
+
+        for key, path in self.custom_apps.items():
+            if key in app_name:
+                print(f"[ACTION] Found custom path for {key}")
+                try:
+                    if _open_with_default_app(path):
+                        return True
+                except Exception as e:
+                    print(f"[ERROR] Custom path failed: {e}")
+
+        if APPOPENER_AVAILABLE and IS_WINDOWS:
+            try:
+                open_app(app_name, match_closest=True, output=False, throw_error=True)
+                return True
+            except Exception:
+                pass
+
+        try:
+            if IS_WINDOWS:
+                os.system(f"start {app_name}")
+            elif SYSTEM_NAME == "darwin":
+                subprocess.Popen(["open", "-a", app_name])
+            else:
+                subprocess.Popen([app_name])
+            return True
+        except Exception:
+            print(f"[ERROR] Could not open '{app_name}'")
+            return False
+
+    def _close_app_name(self, app_name):
+        if APPOPENER_AVAILABLE and IS_WINDOWS:
+            try:
+                close_app(app_name, match_closest=True, output=False, throw_error=True)
+                return True
+            except Exception:
+                pass
+
+        try:
+            if IS_WINDOWS:
+                subprocess.run(["taskkill", "/f", "/im", f"{app_name}.exe"], check=False)
+            else:
+                subprocess.run(["pkill", "-f", app_name], check=False)
+            return True
+        except Exception:
+            print(f"[ERROR] Could not close '{app_name}'")
+            return False
+
+    def _extract_json_action(self, text):
+        if not text:
+            return None
+
+        candidates = []
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            candidates.append(stripped)
+
+        fenced = re.findall(r"```json\s*(\{[\s\S]*?\})\s*```", text, flags=re.IGNORECASE)
+        candidates.extend(fenced)
+
+        loose = re.findall(r"(\{\s*\"action\"[\s\S]*?\})", text)
+        candidates.extend(loose)
+
+        for candidate in candidates:
+            try:
+                obj = json.loads(candidate)
+            except Exception:
+                continue
+
+            if not isinstance(obj, dict):
+                continue
+
+            action = str(obj.get("action", "")).strip().lower()
+            target = str(obj.get("target", "")).strip()
+            value = obj.get("value", "")
+            if action in {"open", "close", "search_web", "open_website", "volume", "write_note", "play"}:
+                return {"action": action, "target": target, "value": value}
+
+        return None
+
+    def _execute_json_action(self, action_obj):
+        action = action_obj.get("action", "")
+        target = (action_obj.get("target") or "").strip()
+        value = action_obj.get("value", "")
+
+        if action == "open":
+            return self._open_app_name(re.sub(r"[^\w\s]", "", target.lower()))
+
+        if action == "close":
+            return self._close_app_name(re.sub(r"[^\w\s]", "", target.lower()))
+
+        if action == "search_web":
+            if not target:
+                return False
+            search_url = f"https://duckduckgo.com/?q={quote_plus(target)}"
+            webbrowser.open(search_url)
+            print(f"[ACTION][WEB] Searching web for: {target}")
+            return True
+
+        if action == "open_website":
+            if not target:
+                return False
+            self._open_website(target)
+            return True
+
+        if action == "volume":
+            value_text = f"{target} {value}".lower()
+            if "up" in value_text:
+                pyautogui.press("volumeup")
+                return True
+            if "down" in value_text:
+                pyautogui.press("volumedown")
+                return True
+            if "mute" in value_text or "unmute" in value_text:
+                pyautogui.press("volumemute")
+                return True
+            return False
+
+        if action == "write_note":
+            content = target or str(value)
+            if not content:
+                return False
+            self._open_text_editor()
+            time.sleep(1.0)
+            pyautogui.write(content, interval=0.05)
+            print(f"[ACTION] Writing to editor: {content}")
+            return True
+
+        if action == "play":
+            if not target:
+                return False
+            pywhatkit.playonyt(target)
+            print(f"[ACTION] Playing on YouTube: {target}")
+            return True
+
+        return False
+
+    def execute_from_assistant(self, text):
+        action_obj = self._extract_json_action(text)
+        if not action_obj:
+            print("[ACTION][SAFE] Assistant output has no valid JSON action. Ignored.")
+            return False
+        return self._execute_json_action(action_obj)
+
     def execute(self, text):
         if not text: return
         raw_text = text.strip()
         text = raw_text.lower()
+
+        structured_action = self._extract_json_action(raw_text)
+        if structured_action:
+            self._execute_json_action(structured_action)
+            return
 
         # =========================================================
         # EXCEL COMMANDS
@@ -846,8 +1048,11 @@ class ActionHandler:
         # =========================================================
         if "scan apps" in text or "update apps" in text:
             print("[ACTION] Scanning for new apps...")
-            # Run this in a thread so it doesn't freeze MARIE
-            threading.Thread(target=give_appnames, daemon=True).start()
+            if APPOPENER_AVAILABLE and give_appnames:
+                # Run this in a thread so it doesn't freeze MARIE
+                threading.Thread(target=give_appnames, daemon=True).start()
+            else:
+                print("[ACTION] App scanning is only available when AppOpener is installed.")
             return
 
         # =========================================================
@@ -870,8 +1075,8 @@ class ActionHandler:
 
         if triggered_word:
             content = text.replace(triggered_word, "").strip()
-            print(f"[ACTION] Writing to Notepad: {content}")
-            os.system("start notepad")
+            print(f"[ACTION] Writing to editor: {content}")
+            self._open_text_editor()
             time.sleep(1.0)
             pyautogui.write(content, interval=0.05)
             return
@@ -897,27 +1102,7 @@ class ActionHandler:
             app_name = raw_name.replace("please", "").replace("now", "").strip()
             app_name = re.sub(r'[^\w\s]', '', app_name)
 
-            print(f"[ACTION] Opening: '{app_name}'")
-
-            # A. Check Custom List first (Games/Portable)
-            for key, path in self.custom_apps.items():
-                if key in app_name:
-                    print(f"[ACTION] Found custom path for {key}")
-                    try:
-                        os.startfile(path)
-                    except Exception as e:
-                        print(f"[ERROR] Custom path failed: {e}")
-                    return
-
-            # B. Check General List (AppOpener)
-            try:
-                open_app(app_name, match_closest=True, output=False, throw_error=True)
-            except Exception:
-                # C. Last Resort: Windows Start
-                try:
-                    os.system(f"start {app_name}")
-                except Exception:
-                    print(f"[ERROR] Could not open '{app_name}'")
+            self._open_app_name(app_name)
             return
 
         # =========================================================
@@ -927,8 +1112,5 @@ class ActionHandler:
             app_name = text.replace("close ", "").replace("please", "").strip()
             app_name = re.sub(r'[^\w\s]', '', app_name)
 
-            try:
-                close_app(app_name, match_closest=True, output=False, throw_error=True)
-            except Exception:
-                print(f"[ERROR] Could not close '{app_name}'")
+            self._close_app_name(app_name)
             return

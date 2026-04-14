@@ -3,6 +3,7 @@ import threading
 import wave
 import uvicorn
 from fastapi import FastAPI, Body
+from app_config import CONFIG
 from voice import MarieVoice
 from voice_db import get_character_data, RVC_DIR
 
@@ -103,5 +104,19 @@ def speak_endpoint(payload: dict = Body(...)):
         "async": bool(async_play),
     }
 
+
+@app.post("/stop")
+def stop_endpoint(payload: dict = Body(None)):
+    _ = payload or {}
+    try:
+        voice_engine.stop()
+        return {"status": "stopped"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8001)
+    uvicorn.run(
+        app,
+        host=CONFIG["servers"]["voice_host"],
+        port=int(CONFIG["servers"]["voice_port"]),
+    )

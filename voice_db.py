@@ -1,8 +1,9 @@
 import os
+from app_config import CONFIG
 
-# Define the base folder relative to this script
-PIPER_DIR = os.path.join(os.path.dirname(__file__), "piper")
-RVC_DIR = os.path.join(os.path.dirname(__file__), "rvc_models")
+# Runtime paths come from config.yaml / .env.
+PIPER_DIR = CONFIG["paths"]["piper_dir"]
+RVC_DIR = CONFIG["paths"]["rvc_dir"]
 
 # --- THE ULTIMATE CHARACTER DATABASE ---
 CHARACTERS = {

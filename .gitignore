@@ -2,6 +2,12 @@
 token.txt
 .env
 secrets.json
+.marie_autologin.json
+
+# --- Local State Databases ---
+*.db
+*.sqlite
+*.sqlite3
 
 # --- Python Environment ---
 __pycache__/
@@ -22,6 +28,8 @@ cache/
 *.wav
 *.mp3
 *.flac
+temp_audio.wav
+chroma/
 
 # --- IDE & OS Settings ---
 .vscode/

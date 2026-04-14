@@ -8,6 +8,7 @@ import re
 import queue
 import glob
 from voice_db import get_character_data, PIPER_DIR
+from app_config import CONFIG
 
 PIPER_EXE = os.path.join(PIPER_DIR, "piper.exe")
 
@@ -35,6 +36,8 @@ class MarieVoice:
         self.speech_queue = queue.Queue()
         self.is_running = True
         self.is_speaking = False
+        self.stop_requested = False
+        self.current_process = None
         
 
         self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
@@ -80,6 +83,9 @@ class MarieVoice:
         else:
             data = self.emotions.get("default", {})
             target_speed = data.get("speed", 1.0)
+
+        global_speed = float(CONFIG.get("voice", {}).get("speaking_speed", 1.0))
+        target_speed = max(0.35, min(target_speed * global_speed, 2.5))
             
         return clean_text, target_speed
 
@@ -89,10 +95,17 @@ class MarieVoice:
 
     def stop(self):
         """Stops playback and clears pending sentences."""
+        self.stop_requested = True
         with self.speech_queue.mutex:
             self.speech_queue.queue.clear()
         if self.channel:
             self.channel.stop()
+
+        if self.current_process and self.current_process.poll() is None:
+            try:
+                self.current_process.terminate()
+            except Exception:
+                pass
         self.is_speaking = False
 
     def _process_queue(self):
@@ -107,6 +120,7 @@ class MarieVoice:
                 continue
             
             self.is_speaking = True
+            self.stop_requested = False
             
             filename = f"sentence_{file_counter}.wav"
             filepath = os.path.join(self.cache_dir, filename)
@@ -139,7 +153,12 @@ class MarieVoice:
 
         # Generate Audio
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, startupinfo=startupinfo)
+        self.current_process = proc
         proc.communicate(input=clean_text.encode('utf-8'))
+        self.current_process = None
+
+        if self.stop_requested:
+            return
 
         # Playback
         if os.path.exists(filepath):
@@ -153,6 +172,9 @@ class MarieVoice:
                 while self.channel.get_busy():
                     # Check if app is closing
                     if not self.is_running: 
+                        self.channel.stop()
+                        break
+                    if self.stop_requested:
                         self.channel.stop()
                         break
                     

@@ -1,0 +1,61 @@
+paths:
+  db_path: ./marie_data.db
+  auto_login_file: ./.marie_autologin.json
+  default_live2d_model: ./models/kei/runtime/kei_vowels_pro.model3.json
+  piper_dir: ./piper
+  rvc_dir: ./rvc_models
+  knowledge_dir: ./knowledge
+
+servers:
+  reasoning_url: http://127.0.0.1:8000/chat
+  reasoning_stream_url: http://127.0.0.1:8000/chat/stream
+  reasoning_stop_url: http://127.0.0.1:8000/chat/stop
+  voice_url: http://127.0.0.1:8001/speak
+  voice_stop_url: http://127.0.0.1:8001/stop
+  reasoning_host: 127.0.0.1
+  reasoning_port: 8000
+  voice_host: 127.0.0.1
+  voice_port: 8001
+
+ollama:
+  model: llama3
+  num_predict: 180
+  num_ctx: 2048
+  temperature: 0.2
+  system_prompt: |
+    You are MARIE, a friendly assistant.
+    Reply with only the important points and keep answers short.
+    Use clear alignment with tool/action output when available.
+    Default to 2-5 concise bullet points when explaining.
+    Stay warm and natural, not robotic.
+
+memory:
+  max_context_chars: 9000
+  recent_turn_limit: 10
+  rad_limit: 220
+
+voice:
+  default_character: tachyon
+  speaking_speed: 1.0
+  whisper_device: cpu
+  enable_faster_whisper: false
+  wake_word: hey marie
+  microphone_hotkey: F4
+  summon_hotkey: ctrl+space
+  enable_openwakeword: false
+  enable_silero_vad: true
+
+ui:
+  theme: dark
+  transparent_face: false
+
+vision:
+  screen_share_enabled: false
+  vision_model: ""
+  screenshot_dir: ./cache/screens
+  capture_interval_sec: 0.8
+  max_width: 1280
+
+actions:
+  safe_mode: true
+  allow_legacy_text_commands: true

@@ -10,12 +10,18 @@ import math
 import time
 import random
 import keyboard
+from urllib.parse import urlparse
 from hear import VoiceWorker
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTextEdit, QLineEdit, QPushButton, QLabel, QFrame,
                              QDialog, QTabWidget, QFormLayout, QComboBox, QTableWidget, 
-                             QTableWidgetItem, QHeaderView, QMessageBox, QFileDialog, QCheckBox)
+                             QTableWidgetItem, QHeaderView, QMessageBox, QFileDialog, QCheckBox,
+                             QSystemTrayIcon, QMenu, QAction, QStyle)
 from PyQt5.QtCore import pyqtSignal, Qt, QObject, QTimer
+from app_config import CONFIG
+from event_bus import EventBus, Events
+from reasoning_worker import ReasoningStreamWorker
+from screen_vision import PYAUTOGUI_AVAILABLE, capture_screen_snapshot
 
 # --- LIVE2D IMPORT ---
 try:
@@ -29,7 +35,7 @@ except ImportError:
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
 
-AUTO_LOGIN_FILE = os.path.join(ROOT_DIR, ".marie_autologin.json")
+AUTO_LOGIN_FILE = CONFIG["paths"]["auto_login_file"]
 
 
 def save_auto_login_user(user_id):
@@ -375,17 +381,27 @@ class MainWindow(QMainWindow):
         self.current_session_id = session_id
         self.db = db_instance
         self.app_mode = app_mode
-        self.transparent_face = transparent_face
+        self.transparent_face = bool(transparent_face or CONFIG.get("ui", {}).get("transparent_face", False))
         self.voice_input_enabled = app_mode in ("both", "voice")
         self.voice_output_enabled = app_mode in ("both", "voice")
         self.text_input_enabled = app_mode in ("both", "gui")
+        self.ui_theme = str(CONFIG.get("ui", {}).get("theme", "dark")).lower()
+        self.screen_share_enabled = bool(CONFIG.get("vision", {}).get("screen_share_enabled", False))
+        self.screen_capture_warned = False
         
         self.setWindowTitle("MARIE - Intelligent Environment")
         self.resize(1100, 700)
-        self.setStyleSheet("background-color: #1e1e1e; color: white;")
+        self._apply_theme()
 
-        self.brain_url = "http://127.0.0.1:8000/chat"
-        self.voice_url = "http://127.0.0.1:8001/speak"
+        self.brain_url = CONFIG["servers"]["reasoning_url"]
+        self.brain_stream_url = CONFIG["servers"]["reasoning_stream_url"]
+        self.brain_stop_url = CONFIG["servers"]["reasoning_stop_url"]
+        self.voice_url = CONFIG["servers"]["voice_url"]
+        self.voice_stop_url = CONFIG["servers"]["voice_stop_url"]
+        self.mic_hotkey = CONFIG["voice"].get("microphone_hotkey", "F4")
+        self.summon_hotkey = CONFIG["voice"].get("summon_hotkey", "ctrl+space")
+
+        self.event_bus = EventBus()
         self.actions = ActionHandler(
             db=self.db,
             context_provider=lambda: {
@@ -398,13 +414,22 @@ class MainWindow(QMainWindow):
         self.is_speaking_remotely = False
         self.is_processing_response = False
         self.waiting_for_voice_finish = False
+        self.voice_release_deadline = 0.0
+        self.voice_release_token = 0
+        self.viseme_timeline = []
+        self.viseme_lock = threading.RLock()
+        self.current_viseme_value = 0.0
         self.latest_user_text = ""
         self.latest_action_result = ""
         self.voice_thread = None
+        self.reasoning_worker = None
+        self.current_request_id = None
         self.hotkey_id = None
+        self.summon_hotkey_id = None
+        self.tray_icon = None
         
-        self.model_path = r"d:\pylearn\FYP\AiAssistant\models\kei\runtime\kei_vowels_pro.model3.json"
-        self.current_character = "tachyon" 
+        self.model_path = CONFIG["paths"]["default_live2d_model"]
+        self.current_character = CONFIG["voice"].get("default_character", "tachyon")
 
         prefs = self.db.get_preference(self.current_user_id)
         if prefs:
@@ -412,7 +437,10 @@ class MainWindow(QMainWindow):
             if saved_voice: self.current_character = saved_voice
             if saved_model: self.model_path = saved_model
 
+        self._bind_events()
+
         self.init_ui()
+        self.init_system_tray()
 
         if self.text_input_enabled:
             self.input_field.setEnabled(True)
@@ -424,11 +452,23 @@ class MainWindow(QMainWindow):
         
         # VOICE INTEGRATION
         if self.voice_input_enabled:
-            self.voice_thread = VoiceWorker(wake_word="hey")
+            self.voice_thread = VoiceWorker(wake_word=CONFIG["voice"].get("wake_word", "hey marie"))
+            self.voice_thread.keyword_mode = True
             self.voice_thread.text_received.connect(self.handle_voice_input)
             self.voice_thread.status_update.connect(self.update_voice_status)
+            self.voice_thread.speech_detected.connect(self.handle_speech_activity)
             self.voice_thread.start()
-            self.hotkey_id = keyboard.add_hotkey('F4', self.voice_thread.toggle_listening)
+            try:
+                self.hotkey_id = keyboard.add_hotkey(self.mic_hotkey, self.voice_thread.toggle_listening)
+            except Exception as e:
+                print(f"[HOTKEY] Failed to register mic hotkey '{self.mic_hotkey}': {e}")
+            try:
+                self.summon_hotkey_id = keyboard.add_hotkey(
+                    self.summon_hotkey,
+                    lambda: QTimer.singleShot(0, self.toggle_window_visibility),
+                )
+            except Exception as e:
+                print(f"[HOTKEY] Failed to register summon hotkey '{self.summon_hotkey}': {e}")
 
             if self.app_mode == "voice":
                 self.voice_thread.is_active = True
@@ -437,6 +477,15 @@ class MainWindow(QMainWindow):
         else:
             self.voice_label.setText("[Mic disabled in GUI mode]")
             self.voice_label.setStyleSheet("color: #888; margin-right: 10px;")
+
+        if self.summon_hotkey_id is None:
+            try:
+                self.summon_hotkey_id = keyboard.add_hotkey(
+                    self.summon_hotkey,
+                    lambda: QTimer.singleShot(0, self.toggle_window_visibility),
+                )
+            except Exception as e:
+                print(f"[HOTKEY] Failed to register summon hotkey '{self.summon_hotkey}': {e}")
         
         self.signals.new_token.connect(self.append_token)
         self.signals.finished.connect(self.finalize_response)
@@ -444,6 +493,51 @@ class MainWindow(QMainWindow):
 
         self.perform_startup_checks()
         QTimer.singleShot(100, self.init_live2d_embedding)
+
+    def _bind_events(self):
+        self.event_bus.subscribe(Events.AI_SENTENCE_READY, self._on_ai_sentence_ready)
+        self.event_bus.subscribe(Events.BARGE_IN, self._on_barge_in_event)
+
+    def _apply_theme(self):
+        if self.ui_theme == "light":
+            self.setStyleSheet("background-color: #f4f4f4; color: #202020;")
+            return
+        if self.ui_theme == "forest":
+            self.setStyleSheet("background-color: #102018; color: #e6f2ea;")
+            return
+        self.setStyleSheet("background-color: #1e1e1e; color: white;")
+
+    def init_system_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
+        self.tray_icon.setToolTip("MARIE Assistant")
+
+        tray_menu = QMenu(self)
+        toggle_action = QAction("Show / Hide", self)
+        toggle_action.triggered.connect(self.toggle_window_visibility)
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.close)
+
+        tray_menu.addAction(toggle_action)
+        tray_menu.addAction(quit_action)
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.toggle_window_visibility()
+
+    def toggle_window_visibility(self):
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+            return
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     def init_ui(self):
         central_widget = QWidget()
@@ -462,11 +556,19 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
 
         top_bar = QHBoxLayout()
-        self.voice_label = QLabel("Mic: OFF (F4)")
+        self.voice_label = QLabel(f"Mic: OFF ({self.mic_hotkey})")
         self.voice_label.setStyleSheet("color: #888; margin-right: 10px;")
         
         self.mode_label = QLabel(f"SESSION ACTIVE [{self.app_mode.upper()}]")
         self.mode_label.setStyleSheet("color: #4ec9b0; font-weight: bold;")
+
+        self.processing_label = QLabel("Status: Idle")
+        self.processing_label.setStyleSheet("color: #888; margin-right: 10px;")
+
+        self.screen_toggle_btn = QPushButton()
+        self.screen_toggle_btn.setFixedWidth(105)
+        self.screen_toggle_btn.clicked.connect(self.toggle_screen_share)
+        self._refresh_screen_toggle_button()
         
         settings_btn = QPushButton("Settings / DB")
         settings_btn.setFixedWidth(120)
@@ -475,6 +577,8 @@ class MainWindow(QMainWindow):
         
         top_bar.addWidget(self.voice_label) 
         top_bar.addWidget(self.mode_label)
+        top_bar.addWidget(self.processing_label)
+        top_bar.addWidget(self.screen_toggle_btn)
         top_bar.addStretch()
         top_bar.addWidget(settings_btn)
 
@@ -516,6 +620,10 @@ class MainWindow(QMainWindow):
         self.voice_label.setStyleSheet(f"color: {color}; margin-right: 10px;")
         self.voice_label.setText(f"[{status}]")
 
+    def _docs_url_from_api(self, api_url):
+        parsed = urlparse(api_url)
+        return f"{parsed.scheme}://{parsed.netloc}/docs"
+
     def perform_startup_checks(self):
         warnings = []
 
@@ -523,15 +631,21 @@ class MainWindow(QMainWindow):
             warnings.append(f"Live2D model not found at: {self.model_path}")
 
         try:
-            requests.get("http://127.0.0.1:8000/docs", timeout=1.2)
+            requests.get(self._docs_url_from_api(self.brain_url), timeout=1.2)
         except Exception:
-            warnings.append("Reasoning server (8000) is unreachable.")
+            warnings.append("Reasoning server is unreachable.")
 
         if self.voice_output_enabled:
             try:
-                requests.get("http://127.0.0.1:8001/docs", timeout=1.2)
+                requests.get(self._docs_url_from_api(self.voice_url), timeout=1.2)
             except Exception:
-                warnings.append("Voice server (8001) is unreachable.")
+                warnings.append("Voice server is unreachable.")
+
+        if self.screen_share_enabled and not PYAUTOGUI_AVAILABLE:
+            warnings.append("Screen share is enabled but PyAutoGUI is unavailable.")
+
+        if self.screen_share_enabled and not str(CONFIG.get("vision", {}).get("vision_model", "")).strip():
+            warnings.append("Screen share is ON without a vision model. Set vision.vision_model for screenshot analysis.")
 
         if warnings:
             self.chat_history.append("<span style='color:#d7ba7d'><b>System Check:</b></span>")
@@ -544,17 +658,117 @@ class MainWindow(QMainWindow):
         if not text or not self.voice_input_enabled:
             return
 
-        if self.is_processing_response:
-            return
+        if self.is_processing_response or self.waiting_for_voice_finish:
+            self.event_bus.emit(Events.BARGE_IN, {"source": "voice_input"})
 
         self.input_field.setText(text)
         self.submit_user_text(text)
+
+    def handle_speech_activity(self):
+        if self.is_processing_response or self.waiting_for_voice_finish:
+            self.event_bus.emit(Events.BARGE_IN, {"source": "speech_activity"})
+
+    def _on_barge_in_event(self, payload=None):
+        _ = payload or {}
+        self.chat_history.append("<span style='color:#d7ba7d'><i>[System] Barge-in detected. Interrupting current output...</i></span>")
+        self.interrupt_current_output()
+
+    def interrupt_current_output(self):
+        if self.reasoning_worker and self.reasoning_worker.isRunning():
+            self.reasoning_worker.cancel()
+
+        if self.current_request_id:
+            try:
+                requests.post(self.brain_stop_url, json={"request_id": self.current_request_id}, timeout=2)
+            except Exception:
+                pass
+
+        try:
+            requests.post(self.voice_stop_url, json={}, timeout=2)
+        except Exception:
+            pass
+
+        self.current_request_id = None
+        self.is_processing_response = False
+        self.waiting_for_voice_finish = False
+        self.voice_release_token += 1
+        self.voice_release_deadline = 0.0
+        self.stop_mouth()
+        self.set_processing_status("Status: Interrupted", "#d7ba7d")
+
+        if self.voice_thread:
+            self.voice_thread.resume_after_processing()
+
+    def set_processing_status(self, text, color="#888"):
+        self.processing_label.setText(text)
+        self.processing_label.setStyleSheet(f"color: {color}; margin-right: 10px;")
+
+    def _refresh_screen_toggle_button(self):
+        if not hasattr(self, "screen_toggle_btn"):
+            return
+
+        if self.screen_share_enabled:
+            self.screen_toggle_btn.setText("Screen: ON")
+            self.screen_toggle_btn.setStyleSheet("background-color: #2d8a2d; padding: 5px; color: white;")
+        else:
+            self.screen_toggle_btn.setText("Screen: OFF")
+            self.screen_toggle_btn.setStyleSheet("background-color: #555; padding: 5px; color: white;")
+
+    def toggle_screen_share(self):
+        self.screen_share_enabled = not self.screen_share_enabled
+        self._refresh_screen_toggle_button()
+
+        if self.screen_share_enabled:
+            self.chat_history.append(
+                "<span style='color:#4ec9b0'><i>[Screen Share] Enabled. A screenshot will be attached to each prompt.</i></span>"
+            )
+            if not PYAUTOGUI_AVAILABLE:
+                self.chat_history.append(
+                    "<span style='color:#f48771'><i>[Screen Share] PyAutoGUI is unavailable, so capture will fail.</i></span>"
+                )
+        else:
+            self.chat_history.append("<span style='color:#888'><i>[Screen Share] Disabled.</i></span>")
+
+    def _collect_screen_payload(self):
+        if not self.screen_share_enabled:
+            return {}
+
+        capture_data = capture_screen_snapshot()
+        capture_error = capture_data.get("error")
+        if capture_error:
+            if not self.screen_capture_warned:
+                safe_err = html.escape(str(capture_error))
+                self.chat_history.append(
+                    f"<span style='color:#f48771'><i>[Screen Share] {safe_err}</i></span>"
+                )
+            self.screen_capture_warned = True
+            return {}
+
+        self.screen_capture_warned = False
+
+        payload = {}
+        image_path = capture_data.get("image_path")
+        if image_path:
+            payload["screen_image_path"] = image_path
+
+        window_title = capture_data.get("window_title")
+        if window_title:
+            payload["screen_window_title"] = window_title
+
+        return payload
 
     def open_settings(self):
         dlg = SettingsWindow(self)
         dlg.exec_()
 
     def init_live2d_embedding(self):
+        if "live2d" not in globals():
+            self.chat_history.append("<span style='color:#d7ba7d'><i>[System] Live2D runtime not available.</i></span>")
+            return
+        if os.name != "nt" or "win32gui" not in globals() or "win32con" not in globals():
+            self.chat_history.append("<span style='color:#d7ba7d'><i>[System] Live2D embedding currently supports Windows in this build.</i></span>")
+            return
+
         pygame.init()
         os.environ['SDL_VIDEO_WINDOW_POS'] = "%d,%d" % (-1000, -1000)
         self.screen = pygame.display.set_mode((450, 600), DOUBLEBUF | OPENGL | NOFRAME)
@@ -585,6 +799,49 @@ class MainWindow(QMainWindow):
         self.anim_timer.timeout.connect(self.update_live2d_frame)
         self.anim_timer.start(16)
 
+    def _char_to_viseme(self, ch):
+        ch = ch.lower()
+        if ch in "ae":
+            return 0.95
+        if ch in "iou":
+            return 0.85
+        if ch in "fvm":
+            return 0.55
+        if ch in "wq":
+            return 0.45
+        if ch in "lrn":
+            return 0.35
+        if ch in "bp":
+            return 0.15
+        return 0.25
+
+    def _enqueue_viseme_timeline(self, text, duration_ms):
+        letters = [c for c in text if c.isalpha()]
+        if not letters or duration_ms <= 0:
+            return
+
+        start_ts = time.time()
+        step = max(0.035, float(duration_ms) / 1000.0 / max(1, len(letters)))
+
+        with self.viseme_lock:
+            ts = start_ts
+            for letter in letters:
+                self.viseme_timeline.append((ts, self._char_to_viseme(letter)))
+                ts += step
+
+            # Ensure a gentle closure after the sentence.
+            self.viseme_timeline.append((ts + 0.06, 0.0))
+
+    def _next_viseme_value(self):
+        now = time.time()
+        with self.viseme_lock:
+            while self.viseme_timeline and self.viseme_timeline[0][0] <= now:
+                _, value = self.viseme_timeline.pop(0)
+                self.current_viseme_value = value
+                if not self.viseme_timeline or self.viseme_timeline[0][0] > now:
+                    return self.current_viseme_value
+        return self.current_viseme_value
+
     def update_live2d_frame(self):
         if not getattr(self, "model", None):
             return
@@ -594,7 +851,7 @@ class MainWindow(QMainWindow):
         self.t_breath += 0.05
         self.model.SetParameterValue("ParamBreath", (math.sin(self.t_breath) + 1) / 2)
         
-        mouth_val = random.uniform(0.3, 1.0) if self.is_speaking_remotely else 0.0
+        mouth_val = self._next_viseme_value() if self.is_speaking_remotely else 0.0
         self.model.SetParameterValue("ParamMouthOpenY", mouth_val)
         
         self.model.SetParameterValue("Param85", 1.0)
@@ -627,12 +884,12 @@ class MainWindow(QMainWindow):
         if not text:
             return
 
-        if self.is_processing_response:
-            self.chat_history.append("<span style='color:#d7ba7d'><i>[System] Processing previous request...</i></span>")
-            return
+        if self.is_processing_response or self.waiting_for_voice_finish:
+            self.interrupt_current_output()
 
         self.db.log_chat(self.current_user_id, "user", text, session_id=self.current_session_id)
         self.latest_user_text = text
+        self.event_bus.emit(Events.USER_SPOKE, {"text": text})
 
         self.chat_history.append(f"<b style='color: #4ec9b0'>YOU:</b> {text}")
         self.chat_history.append(f"<b style='color: #ce9178'>MARIE:</b> ")
@@ -645,83 +902,156 @@ class MainWindow(QMainWindow):
             self.chat_history.append(f"<span style='color:#9cdcfe'><i>{pretty}</i></span>")
 
         self.is_processing_response = True
+        self.set_processing_status("Status: Processing...", "#d7ba7d")
         if self.voice_thread:
             self.voice_thread.pause_for_processing()
 
-        threading.Thread(target=self.process_logic, args=(text, action_result), daemon=True).start()
+        self.start_reasoning_stream(text, action_result)
 
-    def process_logic(self, text, action_result=""):
-        ai_reply = ""
-        voice_hold_ms = 0
+    def start_reasoning_stream(self, text, action_result=""):
+        memory_context = self.db.build_memory_context(self.current_user_id, self.current_session_id)
+        screen_payload = self._collect_screen_payload()
+        payload = {
+            "text": text,
+            "user_id": self.current_user_id,
+            "session_id": self.current_session_id,
+            "memory_context": memory_context,
+            "action_result": action_result,
+        }
+        if screen_payload:
+            payload.update(screen_payload)
+
+        if self.reasoning_worker and self.reasoning_worker.isRunning():
+            self.reasoning_worker.cancel()
+            self.reasoning_worker.wait(800)
+
+        self.reasoning_worker = ReasoningStreamWorker(
+            stream_url=self.brain_stream_url,
+            stop_url=self.brain_stop_url,
+            payload=payload,
+            timeout_sec=140,
+        )
+        self.reasoning_worker.stream_started.connect(self._on_stream_started)
+        self.reasoning_worker.token_received.connect(self._on_stream_token)
+        self.reasoning_worker.sentence_ready.connect(self._on_stream_sentence)
+        self.reasoning_worker.completed.connect(self._on_stream_completed)
+        self.reasoning_worker.failed.connect(self._on_stream_failed)
+        self.reasoning_worker.cancelled.connect(self._on_stream_cancelled)
+        self.reasoning_worker.start()
+
+    def _on_stream_started(self, request_id):
+        self.current_request_id = request_id
+
+    def _on_stream_token(self, token):
+        self.event_bus.emit(Events.AI_TOKEN, {"token": token})
+        self.append_token(token)
+
+    def _on_stream_sentence(self, sentence):
+        self.event_bus.emit(Events.AI_SENTENCE_READY, {"sentence": sentence})
+
+    def _on_ai_sentence_ready(self, payload):
+        sentence = (payload or {}).get("sentence", "")
+        if not sentence or not self.voice_output_enabled:
+            return
+        threading.Thread(target=self._speak_sentence_remote, args=(sentence,), daemon=True).start()
+
+    def _speak_sentence_remote(self, sentence):
+        self.is_speaking_remotely = True
         try:
-            memory_context = self.db.build_memory_context(self.current_user_id, self.current_session_id)
-
-            # 1. SEND TO BRAIN (Port 8000)
-            payload = {
-                "text": text,
-                "user_id": self.current_user_id,
-                "session_id": self.current_session_id,
-                "memory_context": memory_context,
-                "action_result": action_result,
-            }
-            
-            response = requests.post(self.brain_url, json=payload, timeout=120)
-            response.raise_for_status()
-            data = response.json()
-            ai_reply = data.get("response", "[Error: Brain Empty]")
-            
-            self.signals.new_token.emit(ai_reply)
-            self.signals.finished.emit(ai_reply)
-
-            # 2. SEND TO VOICE (Port 8001)
-            if self.voice_output_enabled and ai_reply:
-                self.is_speaking_remotely = True
-                try:
-                    voice_response = requests.post(
-                        self.voice_url,
-                        json={
-                            "text": ai_reply,
-                            "character": self.current_character,
-                            "async_play": True,
-                        },
-                        timeout=120,
-                    )
-                    if voice_response.ok:
-                        voice_data = voice_response.json()
-                        voice_hold_ms = int(voice_data.get("duration_ms", 0))
-                        if voice_hold_ms > 0:
-                            self.waiting_for_voice_finish = True
-                            self.signals.voice_hold.emit(voice_hold_ms)
-                except Exception as e:
-                    print(f"Voice Error: {e}")
-                finally:
-                    if voice_hold_ms <= 0:
-                        self.stop_mouth()
-            
+            voice_response = requests.post(
+                self.voice_url,
+                json={
+                    "text": sentence,
+                    "character": self.current_character,
+                    "async_play": True,
+                },
+                timeout=35,
+            )
+            if voice_response.ok:
+                voice_data = voice_response.json()
+                duration_ms = int(voice_data.get("duration_ms", 0))
+                if duration_ms > 0:
+                    self._enqueue_viseme_timeline(sentence, duration_ms)
+                    self.event_bus.emit(Events.AUDIO_READY, {"duration_ms": duration_ms, "sentence": sentence})
+                    self.signals.voice_hold.emit(duration_ms)
         except Exception as e:
-            print(f"Connection Error: {e}")
-            fail_msg = "[System Error: Brain server is offline]"
-            self.signals.new_token.emit(fail_msg)
-            self.signals.finished.emit(fail_msg)
-        finally:
-            self.is_processing_response = False
-            if self.voice_thread and not self.waiting_for_voice_finish:
-                self.voice_thread.resume_after_processing()
+            print(f"Voice sentence error: {e}")
+
+    def _on_stream_completed(self, full_text):
+        self.current_request_id = None
+        self.is_processing_response = False
+        self.set_processing_status("Status: Idle", "#888")
+        self.signals.finished.emit(full_text)
+        self.event_bus.emit(Events.AI_COMPLETED, {"text": full_text})
+
+        if self.voice_thread and not self.waiting_for_voice_finish:
+            self.voice_thread.resume_after_processing()
+
+    def _on_stream_failed(self, error_text):
+        self.current_request_id = None
+        self.is_processing_response = False
+        self.set_processing_status("Status: Error", "#f48771")
+
+        fail_msg = f"[System Error: {error_text}]"
+        self.append_token(fail_msg)
+        self.signals.finished.emit(fail_msg)
+        self.event_bus.emit(Events.ERROR, {"error": error_text})
+        self._play_error_voice_line()
+
+        if self.voice_thread and not self.waiting_for_voice_finish:
+            self.voice_thread.resume_after_processing()
+
+    def _on_stream_cancelled(self):
+        self.current_request_id = None
+        self.is_processing_response = False
+        self.set_processing_status("Status: Interrupted", "#d7ba7d")
+        if self.voice_thread and not self.waiting_for_voice_finish:
+            self.voice_thread.resume_after_processing()
 
     def schedule_voice_release(self, duration_ms):
-        hold_ms = max(800, min(int(duration_ms) + 250, 180000))
+        hold_ms = max(300, min(int(duration_ms) + 180, 20000))
+        now = time.time()
+        if self.voice_release_deadline < now:
+            self.voice_release_deadline = now
+        self.voice_release_deadline += hold_ms / 1000.0
+
         self.waiting_for_voice_finish = True
         self.is_speaking_remotely = True
-        QTimer.singleShot(hold_ms, self.finish_voice_release)
+        self.voice_release_token += 1
+        token = self.voice_release_token
+        delay_ms = max(350, int((self.voice_release_deadline - now) * 1000) + 120)
+        QTimer.singleShot(delay_ms, lambda t=token: self.finish_voice_release(t))
 
-    def finish_voice_release(self):
+    def finish_voice_release(self, token=None):
+        if token is not None and token != self.voice_release_token:
+            return
         self.waiting_for_voice_finish = False
+        self.voice_release_deadline = 0.0
         self.stop_mouth()
         if self.voice_thread and not self.is_processing_response:
             self.voice_thread.resume_after_processing()
 
     def stop_mouth(self):
         self.is_speaking_remotely = False
+        with self.viseme_lock:
+            self.viseme_timeline.clear()
+        self.current_viseme_value = 0.0
+
+    def _play_error_voice_line(self):
+        if not self.voice_output_enabled:
+            return
+        try:
+            requests.post(
+                self.voice_url,
+                json={
+                    "text": "[concerned] Sorry, I ran into an error. Please try again.",
+                    "character": self.current_character,
+                    "async_play": True,
+                },
+                timeout=10,
+            )
+        except Exception:
+            pass
 
     def append_token(self, token):
         cursor = self.chat_history.textCursor()
@@ -730,6 +1060,9 @@ class MainWindow(QMainWindow):
         self.chat_history.setTextCursor(cursor)
 
     def finalize_response(self, full_text):
+        if not full_text:
+            full_text = "[No response]"
+
         self.db.log_chat(self.current_user_id, "marie", full_text, session_id=self.current_session_id)
         self.db.log_conversation_turn(
             self.current_user_id,
@@ -738,7 +1071,11 @@ class MainWindow(QMainWindow):
             full_text,
         )
 
-        auto_saved = self.db.auto_store_important_conversation_data(self.latest_user_text, full_text)
+        auto_saved = self.db.auto_store_important_conversation_data(
+            self.latest_user_text,
+            full_text,
+            user_id=self.current_user_id,
+        )
         if auto_saved:
             preview_items = [f"{k}={v}" for k, v in auto_saved[:3]]
             preview = "; ".join(preview_items)
@@ -747,10 +1084,14 @@ class MainWindow(QMainWindow):
         self.latest_action_result = ""
         
         self.chat_history.append("<hr style='background-color: #444; height: 1px; border: 0;'>")
-        threading.Thread(target=self.actions.execute, args=(full_text,), daemon=True).start()
+        threading.Thread(target=self.actions.execute_from_assistant, args=(full_text,), daemon=True).start()
 
     def closeEvent(self, event):
         self.db.logout_user(self.current_user_id, self.current_session_id)
+
+        if self.reasoning_worker and self.reasoning_worker.isRunning():
+            self.reasoning_worker.cancel()
+            self.reasoning_worker.wait(1200)
 
         if self.voice_thread:
             self.voice_thread.running = False
@@ -761,6 +1102,15 @@ class MainWindow(QMainWindow):
                 keyboard.remove_hotkey(self.hotkey_id)
             except Exception:
                 pass
+
+        if self.summon_hotkey_id is not None:
+            try:
+                keyboard.remove_hotkey(self.summon_hotkey_id)
+            except Exception:
+                pass
+
+        if self.tray_icon:
+            self.tray_icon.hide()
 
         try:
             live2d.dispose()
