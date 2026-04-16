@@ -20,7 +20,7 @@ $pyInstallerArgs = @(
     "--noconfirm",
     "--clean",
     "--windowed",
-    "main.py"
+    "aiassistant/frontend/main_legacy.py"
 )
 
 if ($OneFile) {

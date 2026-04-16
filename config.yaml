@@ -18,7 +18,7 @@ servers:
   voice_port: 8001
 
 ollama:
-  model: llama3
+  model: llama3.2:3b
   num_predict: 180
   num_ctx: 2048
   temperature: 0.2
@@ -33,17 +33,20 @@ memory:
   max_context_chars: 9000
   recent_turn_limit: 10
   rad_limit: 220
+  local_context_file: ./cache/memory.json
 
 voice:
   default_character: tachyon
   speaking_speed: 1.0
   whisper_device: cpu
   enable_faster_whisper: false
-  wake_word: hey marie
+  wake_word: hey
+  always_listen_wake_word_only: true
   microphone_hotkey: F4
   summon_hotkey: ctrl+space
   enable_openwakeword: false
   enable_silero_vad: true
+  allow_online_fallback: true
 
 ui:
   theme: dark
@@ -51,10 +54,14 @@ ui:
 
 vision:
   screen_share_enabled: false
-  vision_model: ""
+  vision_model: moondream
   screenshot_dir: ./cache/screens
   capture_interval_sec: 0.8
   max_width: 1280
+
+runtime:
+  hybrid_mode: false
+  external_model: gemini-2.0-flash
 
 actions:
   safe_mode: true

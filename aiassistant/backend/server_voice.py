@@ -3,9 +3,9 @@ import threading
 import wave
 import uvicorn
 from fastapi import FastAPI, Body
-from app_config import CONFIG
-from voice import MarieVoice
-from voice_db import get_character_data, RVC_DIR
+from aiassistant.infra.config.app_config import CONFIG
+from aiassistant.infra.voice.voice import MarieVoice
+from aiassistant.infra.voice.voice_db import get_character_data, RVC_DIR
 
 
 try:

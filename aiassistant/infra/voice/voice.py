@@ -7,8 +7,8 @@ import random
 import re
 import queue
 import glob
-from voice_db import get_character_data, PIPER_DIR
-from app_config import CONFIG
+from aiassistant.infra.config.app_config import CONFIG
+from aiassistant.infra.voice.voice_db import get_character_data, PIPER_DIR
 
 PIPER_EXE = os.path.join(PIPER_DIR, "piper.exe")
 

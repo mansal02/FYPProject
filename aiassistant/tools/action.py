@@ -19,7 +19,7 @@ from urllib.parse import quote_plus
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import LineChart, Reference
 from openpyxl.utils import get_column_letter
-from app_config import CONFIG
+from aiassistant.infra.config.app_config import CONFIG
 
 try:
     Document = importlib.import_module("docx").Document
@@ -604,18 +604,56 @@ class ActionHandler:
             return ""
 
         buffer = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buffer):
+        with contextlib.redirect_stdout(buffer):
+            try:
                 self.execute(text)
-        except Exception as e:
-            print(f"[ACTION ERROR] {e}")
+            except Exception as e:
+                print(f"[ACTION ERROR] {e}")
         return buffer.getvalue().strip()
+
+    def _looks_like_action_command(self, text):
+        if not text:
+            return False
+        lowered = text.strip().lower()
+        prefixes = (
+            "open ",
+            "close ",
+            "play ",
+            "write ",
+            "note ",
+            "type ",
+            "take a note ",
+            "search web ",
+            "open website ",
+            "browse ",
+            "excel ",
+            "word ",
+            "powerpoint ",
+            "research ",
+            "web research ",
+            "system check",
+            "check system",
+            "scan apps",
+            "update apps",
+            "copy selected text",
+            "copy now",
+            "paste clipboard",
+            "paste now",
+            "save clipboard to rad as ",
+            "malware scan",
+            "scan for malware",
+            "run malware scan",
+            "security quick scan",
+        )
+        if lowered.startswith(prefixes):
+            return True
+        return any(token in lowered for token in ("volume up", "volume down", "mute", "unmute"))
 
     def _print_system_check(self):
         checks = {
             "Python": True,
-            "Reasoning Server File": os.path.exists("server_reasoning.py"),
-            "Voice Server File": os.path.exists("server_voice.py"),
+            "Reasoning Server Module": importlib.util.find_spec("aiassistant.backend.server_reasoning") is not None,
+            "Voice Server Module": importlib.util.find_spec("aiassistant.backend.server_voice") is not None,
             "Piper Folder": os.path.isdir("piper"),
             "Models Folder": os.path.isdir("models"),
             "RVC Models Folder": os.path.isdir("rvc_models"),
@@ -1114,3 +1152,6 @@ class ActionHandler:
 
             self._close_app_name(app_name)
             return
+
+        if self._looks_like_action_command(raw_text):
+            print("[ACTION] No command matched. Run 'office help' for office commands.")

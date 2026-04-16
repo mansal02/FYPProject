@@ -2,7 +2,7 @@ import os
 import threading
 from pathlib import Path
 
-from app_config import CONFIG
+from aiassistant.infra.config.app_config import CONFIG
 
 try:
     import chromadb

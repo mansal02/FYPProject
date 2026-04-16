@@ -1,24 +1,88 @@
 import json
+import os
 import threading
 import uuid
 
+import ollama
 import uvicorn
 from fastapi import Body, FastAPI
 from fastapi.responses import StreamingResponse
 
-from app_config import CONFIG
-from database import MarieDB
-from index import get_marie_response_stream
-from multi_agent_orchestrator import run_multi_agent_round
-from rag_memory import get_rag_context
-from screen_vision import describe_screen_snapshot
-from streaming_utils import drain_complete_sentences
+from aiassistant.core.multi_agent_orchestrator import run_multi_agent_round
+from aiassistant.backend.streaming_utils import drain_complete_sentences
+from aiassistant.infra.config.app_config import CONFIG
+from aiassistant.infra.db.database import MarieDB
+from aiassistant.infra.rag_memory import get_rag_context
+from aiassistant.infra.vision.screen_vision import describe_screen_snapshot
 
 app = FastAPI()
 db = MarieDB()
 
+os.environ.setdefault("OLLAMA_FLASH_ATTENTION", "1")
+os.environ.setdefault("OLLAMA_KV_CACHE_TYPE", "q4_0")
+os.environ.setdefault("OLLAMA_KEEP_ALIVE", "0")
+
+OLLAMA_MODEL = CONFIG["ollama"]["model"]
+OLLAMA_NUM_PREDICT = int(CONFIG["ollama"]["num_predict"])
+OLLAMA_NUM_CTX = int(CONFIG["ollama"]["num_ctx"])
+OLLAMA_TEMPERATURE = float(CONFIG["ollama"].get("temperature", 0.2))
+OLLAMA_SYSTEM_PROMPT = CONFIG["ollama"].get("system_prompt", "You are MARIE, a friendly assistant.")
+
 _cancel_map = {}
 _cancel_lock = threading.RLock()
+
+
+def _truncate_memory_context(memory_context, max_lines=60, max_chars=7000):
+    if not memory_context:
+        return ""
+
+    lines = [line for line in memory_context.splitlines() if line.strip()]
+    recent = lines[-max_lines:]
+    joined = "\n".join(recent)
+    if len(joined) <= max_chars:
+        return joined
+    return joined[-max_chars:]
+
+
+def get_marie_response_stream(prompt, memory_context=""):
+    """Streams responses from Ollama with memory context injected."""
+    try:
+        if not prompt:
+            yield ""
+            return
+
+        system_instructions = OLLAMA_SYSTEM_PROMPT
+        system_instructions += (
+            "\nIf desktop control is required, output exactly one JSON object using this schema: "
+            "{\"action\":\"open|close|search_web|open_website|volume|write_note\","
+            "\"target\":\"string\",\"value\":\"optional\"}. "
+            "Do not produce shell commands or unsafe code."
+        )
+        if memory_context:
+            recent_facts = _truncate_memory_context(memory_context)
+            system_instructions += f"\nFacts about the user you remember:\n{recent_facts}"
+
+        stream = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": system_instructions},
+                {"role": "user", "content": prompt},
+            ],
+            options={
+                "temperature": OLLAMA_TEMPERATURE,
+                "num_predict": OLLAMA_NUM_PREDICT,
+                "num_ctx": OLLAMA_NUM_CTX,
+            },
+            stream=True,
+            keep_alive=0,
+        )
+
+        for chunk in stream:
+            yield chunk["message"]["content"]
+
+    except Exception as exc:
+        print(f"Ollama Error: {exc}")
+        yield "I am having trouble connecting to my brain."
 
 
 def _register_cancel_event(request_id):

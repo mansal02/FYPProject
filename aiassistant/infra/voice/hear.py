@@ -4,7 +4,7 @@ import time
 import speech_recognition as sr
 from collections import deque
 from PyQt5.QtCore import QThread, pyqtSignal
-from app_config import CONFIG
+from aiassistant.infra.config.app_config import CONFIG
 
 # Keep startup responsive even if spaCy (and its optional torch deps) are slow.
 _SPACY_NLP = None
@@ -145,10 +145,12 @@ class VoiceWorker(QThread):
     def __init__(self, model_size="base", wake_word="hey"):
         super().__init__()
         voice_cfg = CONFIG.get("voice", {})
-        resolved_wake = wake_word or voice_cfg.get("wake_word", "hey marie")
-        self.wake_word = resolved_wake.lower()
-        self.is_active = False          
-        self.keyword_mode = False       
+        resolved_wake = str(wake_word or voice_cfg.get("wake_word", "hey")).strip().lower()
+        self.wake_word = resolved_wake or "hey"
+        self.wake_aliases = self._build_wake_aliases(self.wake_word)
+        self.always_listen_wake_word_only = bool(voice_cfg.get("always_listen_wake_word_only", True))
+        self.is_active = False
+        self.keyword_mode = self.always_listen_wake_word_only
         self.running = True
         self.auto_paused = False
         self.model_size = model_size
@@ -180,6 +182,38 @@ class VoiceWorker(QThread):
                     print(f"[Voice] OpenWakeWord disabled: {e}")
             else:
                 self.enable_openwakeword = False
+
+    @staticmethod
+    def _build_wake_aliases(wake_word):
+        aliases = []
+        normalized = re.sub(r"\s+", " ", str(wake_word or "").strip().lower())
+        if normalized:
+            aliases.append(normalized)
+            first_token = normalized.split(" ", 1)[0]
+            if first_token and first_token not in aliases:
+                aliases.append(first_token)
+        if "hey" not in aliases:
+            aliases.append("hey")
+        return aliases
+
+    def _match_wake_alias(self, text):
+        for alias in self.wake_aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", text):
+                return alias
+        return None
+
+    def _strip_wake_prefix(self, text):
+        stripped_text = text.strip()
+        for alias in sorted(self.wake_aliases, key=len, reverse=True):
+            candidate = re.sub(
+                rf"^\s*{re.escape(alias)}(?:\b|[\s,.:;!?-])*\s*",
+                "",
+                stripped_text,
+                flags=re.IGNORECASE,
+            ).strip()
+            if candidate != stripped_text:
+                return candidate
+        return stripped_text
 
     def _has_speech_silero(self, wav_path):
         if not self.enable_silero_vad or not self._silero_model:
@@ -240,11 +274,22 @@ class VoiceWorker(QThread):
         r.dynamic_energy_adjustment_damping = 0.15
         r.non_speaking_duration = 0.25
         r.phrase_threshold = 0.2
-        mic = sr.Microphone()
+
+        mic = None
+        mic_error_reported = False
+        last_mic_retry = 0.0
+        try:
+            mic = sr.Microphone()
+        except Exception as e:
+            print(f"[Voice] Microphone unavailable on startup: {e}")
+
         last_noise_calibration = 0.0
         was_auto_paused = False
 
-        self.status_update.emit("Voice Ready (Press F4 to Toggle)")
+        if self.keyword_mode:
+            self.status_update.emit(f"Voice Ready (Wake: {self.wake_aliases[0]})")
+        else:
+            self.status_update.emit("Voice Ready (Press F4 to Toggle)")
 
         while self.running:
             if self.auto_paused:
@@ -263,6 +308,23 @@ class VoiceWorker(QThread):
             #   b) We are in 'Keyword Mode' (always listening, filtering for wake word)
             
             if not self.is_active and not self.keyword_mode:
+                time.sleep(0.2)
+                continue
+
+            if mic is None:
+                now = time.time()
+                if now - last_mic_retry >= 2.0:
+                    last_mic_retry = now
+                    try:
+                        mic = sr.Microphone()
+                        mic_error_reported = False
+                        last_noise_calibration = 0.0
+                        self.status_update.emit("Mic Ready")
+                    except Exception as e:
+                        if not mic_error_reported:
+                            print(f"[Voice] Microphone unavailable: {e}")
+                            self.status_update.emit("Mic unavailable")
+                            mic_error_reported = True
                 time.sleep(0.2)
                 continue
 
@@ -342,37 +404,51 @@ class VoiceWorker(QThread):
 
             except sr.WaitTimeoutError:
                 pass 
+            except OSError as e:
+                print(f"[Voice Error] Microphone IO error: {e}")
+                mic = None
+                self.status_update.emit("Mic unavailable")
             except Exception as e:
                 print(f"[Voice Error] {e}")
                 self.status_update.emit("Error")
 
     def process_text(self, text):
-        clean_text = text.lower()
-        
-        
-        if self.is_active:
-            self.text_received.emit(text) 
-            
-        elif self.keyword_mode:
-            if self.wake_word in clean_text:
-                # Remove wake word (optional) and send
-                # valid_command = clean_text.split(self.wake_word, 1)[1]
-                self.text_received.emit(text)
+        clean_text = text.lower().strip()
+
+        # Keyword mode takes priority so open-mic state cannot bypass wake-word checks.
+        if self.keyword_mode:
+            if self._match_wake_alias(clean_text):
+                command_text = self._strip_wake_prefix(text)
+                if command_text:
+                    self.text_received.emit(command_text)
                 self.status_update.emit("Wake Word Detected!")
+            return
+
+        if self.is_active:
+            self.text_received.emit(text)
 
     def pause_for_processing(self):
         self.auto_paused = True
 
     def resume_after_processing(self):
         self.auto_paused = False
-        if self.is_active:
-            self.status_update.emit("Mic ON")
-        elif self.keyword_mode:
+        if self.keyword_mode:
             self.status_update.emit("Keyword Mode")
+        elif self.is_active:
+            self.status_update.emit("Mic ON")
         else:
             self.status_update.emit("Mic OFF")
 
     def toggle_listening(self):
+        if self.always_listen_wake_word_only:
+            self.keyword_mode = True
+            self.is_active = False
+            if self.auto_paused:
+                self.status_update.emit("Keyword Mode (Auto-paused)")
+            else:
+                self.status_update.emit("Keyword Mode (always listening)")
+            return
+
         self.is_active = not self.is_active
         state = "ON" if self.is_active else "OFF"
         if self.auto_paused:

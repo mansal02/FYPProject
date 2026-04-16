@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 from threading import RLock
 
-from app_config import CONFIG
+from aiassistant.infra.config.app_config import CONFIG
 
 try:
     import ollama

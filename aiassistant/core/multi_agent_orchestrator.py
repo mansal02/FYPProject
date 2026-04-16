@@ -1,6 +1,6 @@
 import ollama
 
-from app_config import CONFIG
+from aiassistant.infra.config.app_config import CONFIG
 
 
 MODEL = CONFIG["ollama"]["model"]
@@ -19,6 +19,7 @@ def _ask_agent(system_prompt, user_prompt):
             "num_ctx": int(CONFIG["ollama"].get("num_ctx", 2048)),
         },
         stream=False,
+        keep_alive=0,
     )
     return (response.get("message") or {}).get("content", "").strip()
 

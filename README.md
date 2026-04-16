@@ -117,32 +117,54 @@ If your model is elsewhere, update either:
 - RVC models go under `rvc_models/`.
 - RAG documents go under `knowledge/` (txt/md/csv/json/py/pdf).
 
+## Systematic Project Layout
+
+Core implementation now lives under the `aiassistant/` package:
+
+```text
+aiassistant/
+    frontend/    # GUI apps
+    backend/     # FastAPI services
+    core/        # agent/orchestration logic
+    infra/       # config, db, voice, vision, avatar integrations
+    tools/       # desktop/system tool actions
+    workers/     # background workers
+    launchers/   # launch orchestration
+    legacy/      # backward-compatibility shims
+```
+
 ## Run the Application
 
-Start services in separate terminals:
+Recommended startup (single command):
+
+```bash
+python -m aiassistant.launchers.runsys --mode assistant
+```
+
+Available launch modes:
+- `assistant`: new offline GUI only (default)
+- `legacy`: old server stack + legacy GUI
+- `hybrid`: old servers + new GUI
+
+Manual startup (separate terminals) is still supported:
 
 Terminal 1:
 
 ```bash
-python server_reasoning.py
+python -m aiassistant.backend.server_reasoning
 ```
 
 Terminal 2:
 
 ```bash
-python server_voice.py
+python -m aiassistant.backend.server_voice
 ```
 
 Terminal 3:
 
 ```bash
-python main.py --mode both
+python -m aiassistant.frontend.main_gui
 ```
-
-Modes:
-- `both`: text + voice
-- `gui`: text only
-- `voice`: hands-free voice flow
 
 ## Enable Live Screen View
 
@@ -193,7 +215,7 @@ POST /chat/multi-agent
 This runs a local researcher -> coder -> synthesizer chain and returns each agent output.
 
 - Webcam multimodal worker:
-    - `multimodal_vision.py` contains `VisionWorker` (OpenCV + MediaPipe hook points).
+    - `aiassistant/infra/vision/multimodal_vision.py` contains `VisionWorker` (OpenCV + MediaPipe hook points).
     - Intended for gesture/expression-driven controls (for example pause on "stop" hand gesture).
 
 ## Architecture Diagram
@@ -246,8 +268,8 @@ It runs:
 
 ## Troubleshooting
 
-- `Reasoning server unreachable`: ensure `server_reasoning.py` is running.
-- `Voice server unreachable`: ensure `server_voice.py` is running.
+- `Reasoning server unreachable`: ensure `python -m aiassistant.backend.server_reasoning` is running.
+- `Voice server unreachable`: ensure `python -m aiassistant.backend.server_voice` is running.
 - `Live2D model not found`: fix path in `config.yaml` or `.env`.
 - `No speech detected`: verify mic input device and VAD thresholds.
 - `Wake word not triggering`: install `openwakeword` and enable it in `config.yaml`.

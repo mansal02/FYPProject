@@ -5,7 +5,17 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
-ROOT_DIR = Path(__file__).resolve().parent
+def _find_repo_root() -> Path:
+    """Find the project root so config paths stay stable after refactors."""
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "config.yaml").exists() and (parent / "requirements.txt").exists():
+            return parent
+    # Safe fallback: old behavior relative to this file.
+    return current.parent
+
+
+ROOT_DIR = _find_repo_root()
 load_dotenv(ROOT_DIR / ".env")
 
 _DEFAULT_CONFIG = {
@@ -29,7 +39,7 @@ _DEFAULT_CONFIG = {
         "voice_port": 8001,
     },
     "ollama": {
-        "model": "llama3",
+        "model": "llama3.2:3b",
         "num_predict": 180,
         "num_ctx": 2048,
         "temperature": 0.2,
@@ -45,13 +55,15 @@ _DEFAULT_CONFIG = {
         "max_context_chars": 9000,
         "recent_turn_limit": 10,
         "rad_limit": 220,
+        "local_context_file": "./cache/memory.json",
     },
     "voice": {
         "default_character": "tachyon",
         "speaking_speed": 1.0,
         "whisper_device": "cpu",
         "enable_faster_whisper": False,
-        "wake_word": "hey marie",
+        "wake_word": "hey",
+        "always_listen_wake_word_only": True,
         "microphone_hotkey": "F4",
         "summon_hotkey": "ctrl+space",
         "enable_openwakeword": False,
@@ -63,10 +75,14 @@ _DEFAULT_CONFIG = {
     },
     "vision": {
         "screen_share_enabled": False,
-        "vision_model": "",
+        "vision_model": "moondream",
         "screenshot_dir": "./cache/screens",
         "capture_interval_sec": 0.8,
         "max_width": 1280,
+    },
+    "runtime": {
+        "hybrid_mode": False,
+        "external_model": "gemini-2.0-flash",
     },
     "actions": {
         "safe_mode": True,
@@ -182,11 +198,33 @@ def load_config():
         config["vision"].get("max_width", 1280),
     )
 
+    config["runtime"]["hybrid_mode"] = _as_bool(
+        os.environ.get("MARIE_HYBRID_MODE"),
+        config["runtime"].get("hybrid_mode", False),
+    )
+    config["runtime"]["external_model"] = os.environ.get(
+        "MARIE_EXTERNAL_MODEL",
+        config["runtime"].get("external_model", "gemini-2.0-flash"),
+    )
+
+    config["memory"]["local_context_file"] = os.environ.get(
+        "MARIE_LOCAL_CONTEXT_FILE",
+        config["memory"].get("local_context_file", "./cache/memory.json"),
+    )
+
     # Normalize paths
-    for key in ("db_path", "auto_login_file", "default_live2d_model", "piper_dir", "rvc_dir", "knowledge_dir"):
+    for key in (
+        "db_path",
+        "auto_login_file",
+        "default_live2d_model",
+        "piper_dir",
+        "rvc_dir",
+        "knowledge_dir",
+    ):
         config["paths"][key] = _resolve_path(config["paths"][key])
 
     config["vision"]["screenshot_dir"] = _resolve_path(config["vision"]["screenshot_dir"])
+    config["memory"]["local_context_file"] = _resolve_path(config["memory"]["local_context_file"])
 
     return config
 

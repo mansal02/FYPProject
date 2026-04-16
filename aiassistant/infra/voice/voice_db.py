@@ -1,5 +1,5 @@
 import os
-from app_config import CONFIG
+from aiassistant.infra.config.app_config import CONFIG
 
 # Runtime paths come from config.yaml / .env.
 PIPER_DIR = CONFIG["paths"]["piper_dir"]

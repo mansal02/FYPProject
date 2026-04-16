@@ -3,7 +3,7 @@ import hashlib
 import re
 import os
 
-from app_config import CONFIG
+from aiassistant.infra.config.app_config import CONFIG
 
 DB_NAME = CONFIG["paths"]["db_path"]
 

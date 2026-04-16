@@ -11,17 +11,17 @@ import time
 import random
 import keyboard
 from urllib.parse import urlparse
-from hear import VoiceWorker
+from aiassistant.infra.voice.hear import VoiceWorker
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QTextEdit, QLineEdit, QPushButton, QLabel, QFrame,
                              QDialog, QTabWidget, QFormLayout, QComboBox, QTableWidget, 
                              QTableWidgetItem, QHeaderView, QMessageBox, QFileDialog, QCheckBox,
                              QSystemTrayIcon, QMenu, QAction, QStyle)
 from PyQt5.QtCore import pyqtSignal, Qt, QObject, QTimer
-from app_config import CONFIG
-from event_bus import EventBus, Events
-from reasoning_worker import ReasoningStreamWorker
-from screen_vision import PYAUTOGUI_AVAILABLE, capture_screen_snapshot
+from aiassistant.core.event_bus import EventBus, Events
+from aiassistant.infra.config.app_config import CONFIG
+from aiassistant.infra.vision.screen_vision import PYAUTOGUI_AVAILABLE, capture_screen_snapshot
+from aiassistant.workers.reasoning_worker import ReasoningStreamWorker
 
 # --- LIVE2D IMPORT ---
 try:
@@ -69,9 +69,9 @@ def clear_auto_login_user():
         except Exception as e:
             print(f"[LOGIN] Failed to clear one-time login token: {e}")
 
-from action import ActionHandler
-from database import MarieDB
-from voice_db import CHARACTERS 
+from aiassistant.infra.db.database import MarieDB
+from aiassistant.infra.voice.voice_db import CHARACTERS
+from aiassistant.tools.action import ActionHandler
 
 # 1. LOGIN DIALOG
 class LoginDialog(QDialog):
@@ -471,9 +471,10 @@ class MainWindow(QMainWindow):
                 print(f"[HOTKEY] Failed to register summon hotkey '{self.summon_hotkey}': {e}")
 
             if self.app_mode == "voice":
-                self.voice_thread.is_active = True
-                self.voice_label.setText("[Mic ON]")
-                self.voice_label.setStyleSheet("color: #00ff00; margin-right: 10px;")
+                self.voice_thread.is_active = False
+                self.voice_thread.keyword_mode = True
+                self.voice_label.setText("[Keyword Mode]")
+                self.voice_label.setStyleSheet("color: #4ec9b0; margin-right: 10px;")
         else:
             self.voice_label.setText("[Mic disabled in GUI mode]")
             self.voice_label.setStyleSheet("color: #888; margin-right: 10px;")
