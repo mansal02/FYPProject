@@ -40,14 +40,15 @@ _DEFAULT_CONFIG = {
     },
     "ollama": {
         "model": "llama3.2:3b",
-        "num_predict": 180,
+        "num_predict": 360,
         "num_ctx": 2048,
         "temperature": 0.2,
         "system_prompt": (
             "You are MARIE, a friendly assistant. "
-            "Reply with only the important points and keep answers short. "
+            "Do not force short replies or fixed word limits. "
+            "For simple tasks, answer in easy plain language and be direct. "
+            "For complex tasks, provide enough detail to be useful. "
             "Use clear alignment with tool/action output when available. "
-            "Default to 2-5 concise bullet points when explaining. "
             "Stay warm and natural, not robotic."
         ),
     },
@@ -56,6 +57,27 @@ _DEFAULT_CONFIG = {
         "recent_turn_limit": 10,
         "rad_limit": 220,
         "local_context_file": "./cache/memory.json",
+    },
+    "memory_agent": {
+        "enabled": True,
+        "watch_dir": "./knowledge/memory_agent",
+        "persist_dir": "./cache/chroma_memory_agent",
+        "collection": "marie_memory_agent",
+        "embedding_model": "llama3.2:3b",
+        "top_k": 4,
+        "chunk_size": 850,
+        "chunk_overlap": 120,
+        "watch_extensions": [
+            ".txt",
+            ".md",
+            ".py",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".csv",
+            ".rad",
+            ".log",
+        ],
     },
     "voice": {
         "default_character": "tachyon",
@@ -114,6 +136,17 @@ def _as_bool(value, fallback=False):
     if lowered in {"0", "false", "no", "off"}:
         return False
     return fallback
+
+
+def _as_str_list(value, fallback):
+    if value is None:
+        return fallback
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    if not text:
+        return fallback
+    return [part.strip() for part in text.split(",") if part.strip()]
 
 
 def _merge_dict(base, override):
@@ -212,6 +245,43 @@ def load_config():
         config["memory"].get("local_context_file", "./cache/memory.json"),
     )
 
+    config["memory_agent"]["enabled"] = _as_bool(
+        os.environ.get("MARIE_MEMORY_AGENT_ENABLED"),
+        config["memory_agent"].get("enabled", True),
+    )
+    config["memory_agent"]["watch_dir"] = os.environ.get(
+        "MARIE_MEMORY_AGENT_WATCH_DIR",
+        config["memory_agent"].get("watch_dir", "./knowledge/memory_agent"),
+    )
+    config["memory_agent"]["persist_dir"] = os.environ.get(
+        "MARIE_MEMORY_AGENT_PERSIST_DIR",
+        config["memory_agent"].get("persist_dir", "./cache/chroma_memory_agent"),
+    )
+    config["memory_agent"]["collection"] = os.environ.get(
+        "MARIE_MEMORY_AGENT_COLLECTION",
+        config["memory_agent"].get("collection", "marie_memory_agent"),
+    )
+    config["memory_agent"]["embedding_model"] = os.environ.get(
+        "MARIE_MEMORY_AGENT_EMBED_MODEL",
+        config["memory_agent"].get("embedding_model", "llama3.2:3b"),
+    )
+    config["memory_agent"]["top_k"] = _as_int(
+        os.environ.get("MARIE_MEMORY_AGENT_TOP_K"),
+        config["memory_agent"].get("top_k", 4),
+    )
+    config["memory_agent"]["chunk_size"] = _as_int(
+        os.environ.get("MARIE_MEMORY_AGENT_CHUNK_SIZE"),
+        config["memory_agent"].get("chunk_size", 850),
+    )
+    config["memory_agent"]["chunk_overlap"] = _as_int(
+        os.environ.get("MARIE_MEMORY_AGENT_CHUNK_OVERLAP"),
+        config["memory_agent"].get("chunk_overlap", 120),
+    )
+    config["memory_agent"]["watch_extensions"] = _as_str_list(
+        os.environ.get("MARIE_MEMORY_AGENT_EXTENSIONS"),
+        config["memory_agent"].get("watch_extensions", [".txt", ".md"]),
+    )
+
     # Normalize paths
     for key in (
         "db_path",
@@ -225,6 +295,8 @@ def load_config():
 
     config["vision"]["screenshot_dir"] = _resolve_path(config["vision"]["screenshot_dir"])
     config["memory"]["local_context_file"] = _resolve_path(config["memory"]["local_context_file"])
+    config["memory_agent"]["watch_dir"] = _resolve_path(config["memory_agent"]["watch_dir"])
+    config["memory_agent"]["persist_dir"] = _resolve_path(config["memory_agent"]["persist_dir"])
 
     return config
 

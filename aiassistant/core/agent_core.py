@@ -56,11 +56,18 @@ HYBRID_MODE = bool(CONFIG.get("runtime", {}).get("hybrid_mode", False))
 
 SYSTEM_PROMPT = (
     "You are an offline desktop assistant. "
+    "Prioritize action over explanation. "
+    "Default to concise, direct replies focused on what the user needs now. "
+    "Do not teach or explain internal process unless the user asks. "
     "If user intent is vague, break it into a short numbered plan and choose the first safe step. "
+    "For analysis or execution requests, perform the task and report outcomes. "
+    "If asked to analyze files, folders, or the PC, provide practical findings. "
     "Use tools only when needed. If you need a tool, emit JSON inside <tool>...</tool> with one action object. "
     "Supported actions: search_file, semantic_search_file, read_file, open_file, move_mouse, click, "
     "type_text, press_key, hotkey, run_command, toggle_dark_mode, draft_email_attachment, online_query. "
-    "Keep final answers concise, friendly, and non-technical."
+    "Do not include JSON or tool syntax in normal user-facing replies. "
+    "For simple requests, answer in easy plain language and keep it direct. "
+    "For complex requests, provide enough detail to be useful without over-explaining."
 )
 
 
@@ -169,6 +176,7 @@ class AgentConfig:
     max_history_turns: int = 3
     temperature: float = 0.2
     num_ctx: int = 2048
+    num_predict: int = int(CONFIG.get("ollama", {}).get("num_predict", 320))
     rag_enabled: bool = True
     rag_top_k: int = 4
     hybrid_mode: bool = HYBRID_MODE
@@ -394,6 +402,7 @@ class OfflineAgentCore:
                     options={
                         "temperature": self.config.temperature,
                         "num_ctx": self.config.num_ctx,
+                        "num_predict": max(180, int(self.config.num_predict)),
                     },
                     keep_alive=0,
                 )
@@ -533,8 +542,10 @@ class OfflineAgentCore:
             return base_assistant_text
 
         synthesis_prompt = (
-            "Given the user request, your draft answer, and tool results, "
-            "write a final user-facing reply. Keep it friendly and concise. "
+            "Given the user request, draft answer, and tool results, write the final user-facing reply. "
+            "Keep it concise, direct, and outcome-focused. "
+            "State only what the user needs to know right now. "
+            "Do not teach or explain internal steps unless asked. "
             "Do not include JSON or tool call syntax.\n\n"
             f"User request: {user_text}\n\n"
             f"Draft answer: {base_assistant_text}\n\n"
@@ -551,7 +562,11 @@ class OfflineAgentCore:
                 response = self._client.chat(
                     model=self.config.reasoning_model,
                     messages=messages,
-                    options={"temperature": 0.1, "num_ctx": 1536},
+                    options={
+                        "temperature": 0.1,
+                        "num_ctx": 1536,
+                        "num_predict": max(160, int(self.config.num_predict * 0.75)),
+                    },
                     keep_alive=0,
                 )
             return (response.get("message", {}) or {}).get("content", "").strip()

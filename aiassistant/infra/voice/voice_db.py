@@ -11,7 +11,7 @@ CHARACTERS = {
     # CHARACTER 1: AGNES TACHYON (The Mad Scientist)
     # =========================================================================
     "tachyon": {
-        "name": "Agnes Tachyon",
+        "name": "English UK Bright",
         "piper_model": "en_GB-jenny_dioco-medium.onnx",
         "speaker_id": 0,
         
@@ -61,7 +61,7 @@ CHARACTERS = {
     # CHARACTER 2: JEANNE ALTER (The Dragon Witch)
     # =========================================================================
     "jalter": {
-        "name": "Jeanne Alter",
+        "name": "English US Warm",
         "piper_model": "en_US-libritts-high.onnx",
         "speaker_id": 19, 
         
@@ -100,7 +100,7 @@ CHARACTERS = {
     # CHARACTER 3: HATSUNE MIKU (The Virtual Idol)
     # =========================================================================
     "miku": {
-        "name": "Hatsune Miku",
+        "name": "English US Clear",
         "piper_model": "en_US-lessac-medium.onnx",
         "speaker_id": 0,
         

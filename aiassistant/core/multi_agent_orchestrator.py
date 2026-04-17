@@ -29,22 +29,22 @@ def run_multi_agent_round(question, memory_context=""):
     context_block = f"\n\nContext:\n{memory_context}" if memory_context else ""
 
     researcher_output = _ask_agent(
-        "You are a Researcher Agent. Provide concise factual findings and assumptions.",
+        "You are a Researcher Agent. Return only concise findings needed to solve the request. No tutorial tone.",
         f"Question: {question}{context_block}",
     )
 
     coder_output = _ask_agent(
-        "You are a Coder Agent. Produce implementation-focused guidance and checks.",
+        "You are a Coder Agent. Return implementation actions and checks only, concise and practical.",
         f"Question: {question}\nResearcher notes:\n{researcher_output}{context_block}",
     )
 
     final_output = _ask_agent(
-        "You are the Final Synthesizer Agent. Merge findings into one clear final answer.",
+        "You are the Final Synthesizer Agent. Return one concise, execution-first answer with only what the user needs.",
         (
             f"Question: {question}\n\n"
             f"Researcher Agent:\n{researcher_output}\n\n"
             f"Coder Agent:\n{coder_output}\n\n"
-            "Return a balanced response with concrete next steps."
+            "Return only the final answer. Keep it short and direct. Explain details only if explicitly requested."
         ),
     )
 

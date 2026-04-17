@@ -5,6 +5,12 @@ from pathlib import Path
 from aiassistant.infra.config.app_config import CONFIG
 
 try:
+    from aiassistant.infra.memory_agent import get_memory_agent_context, warm_memory_agent_index
+except Exception:
+    get_memory_agent_context = None
+    warm_memory_agent_index = None
+
+try:
     import chromadb
     CHROMA_AVAILABLE = True
 except ImportError:
@@ -138,7 +144,33 @@ _knowledge_dir = CONFIG["paths"].get("knowledge_dir")
 _persist_dir = str((Path(CONFIG["paths"]["db_path"]).resolve().parent / "chroma").resolve())
 
 RAG = LocalRAG(_knowledge_dir, _persist_dir)
+_MEMORY_AGENT_WARMED = False
+
+
+def _query_memory_agent(question, top_k):
+    global _MEMORY_AGENT_WARMED
+
+    if get_memory_agent_context is None:
+        return ""
+
+    try:
+        if not _MEMORY_AGENT_WARMED and warm_memory_agent_index is not None:
+            warm_memory_agent_index()
+            _MEMORY_AGENT_WARMED = True
+        return (get_memory_agent_context(question, top_k=top_k) or "").strip()
+    except Exception:
+        return ""
 
 
 def get_rag_context(question, top_k=4):
-    return RAG.query(question, top_k=top_k)
+    memory_snippets = _query_memory_agent(question, top_k=max(1, int(top_k)))
+    local_snippets = RAG.query(question, top_k=top_k)
+
+    if memory_snippets and local_snippets:
+        return (
+            "Memory agent snippets:\n"
+            f"{memory_snippets}\n\n"
+            "Knowledge folder snippets:\n"
+            f"{local_snippets}"
+        )
+    return memory_snippets or local_snippets

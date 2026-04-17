@@ -89,6 +89,12 @@ DEFAULT_VISION_MODEL = str(CONFIG.get("vision", {}).get("vision_model", "moondre
 DEFAULT_LIVE2D_MODEL = str(CONFIG.get("paths", {}).get("default_live2d_model", ""))
 DEFAULT_TTS_SPEED = float(CONFIG.get("voice", {}).get("speaking_speed", 1.0))
 
+VOICE_PROFILE_LABELS = {
+    "tachyon": "English UK - Bright",
+    "jalter": "English US - Warm",
+    "miku": "English US - Clear",
+}
+
 
 def save_auto_login_user(user_id: int) -> None:
     try:
@@ -460,7 +466,7 @@ class AssistantMainWindow(QMainWindow):
 
         self.voice_profile_combo = QComboBox()
         self._populate_voice_options()
-        form.addRow("Voice profile", self.voice_profile_combo)
+        form.addRow("Voice style", self.voice_profile_combo)
 
         self.speaking_speed_spin = QDoubleSpinBox()
         self.speaking_speed_spin.setRange(0.4, 2.5)
@@ -584,19 +590,51 @@ class AssistantMainWindow(QMainWindow):
         layout = QVBoxLayout(self.help_tab)
         help_text = QTextEdit()
         help_text.setReadOnly(True)
-        help_text.setHtml(
-            """
-            <h2>How to Use</h2>
-            <p><b>1) Login:</b> You can create an account and optionally enable remembered auto-login.</p>
-            <p><b>2) Assistant tab:</b> Type commands, use voice command listening, and enable screen input when needed.</p>
-            <p><b>3) Settings tab:</b> Change voice, reasoning model, vision model, avatar model, and log out.</p>
-            <p><b>4) RAD tab:</b> Check and edit your stored rapid-access facts.</p>
-            <p><b>5) Screen options:</b> Turn on live screen as model input and optionally view live preview.</p>
-            <p><b>6) STOP PROCESS:</b> Immediate safety interrupt for active requests.</p>
-            <hr>
-            <p><b>Note:</b> Voice output uses either pyttsx3 (system voice) or Piper character profiles if piper.exe is available.</p>
-            """
+        voice_samples = []
+        for wake in self.wake_words[:3]:
+            voice_samples.append(f"{wake} open chrome")
+            voice_samples.append(f"{wake} search web local llm optimization")
+        voice_samples = voice_samples[:4]
+
+        section_html = []
+        section_html.append("<h2>Commands and Voice Tasks</h2>")
+        section_html.append("<p>Use the same commands by typing or speaking.</p>")
+
+        section_html.append("<h3>Voice Usage</h3><ul>")
+        section_html.append(
+            "<li>Enable <b>Voice command listening</b> in Assistant tab."
+            " Speak a wake word, then your command.</li>"
         )
+        section_html.append(
+            f"<li>Wake words: <code>{html.escape(', '.join(self.wake_words))}</code></li>"
+        )
+        for sample in voice_samples:
+            section_html.append(f"<li>Example: <code>{html.escape(sample)}</code></li>")
+        section_html.append("</ul>")
+
+        for title, commands in ActionHandler.get_supported_command_sections().items():
+            section_html.append(f"<h3>{html.escape(title)}</h3><ul>")
+            for command in commands:
+                section_html.append(f"<li><code>{html.escape(str(command))}</code></li>")
+            section_html.append("</ul>")
+
+        section_html.append("<h3>Memory Agent Commands</h3><ul>")
+        section_html.append("<li><code>python -m aiassistant.infra.memory_agent --once</code></li>")
+        section_html.append("<li><code>python -m aiassistant.infra.memory_agent</code></li>")
+        section_html.append(
+            "<li><code>python -m aiassistant.infra.memory_agent --query &quot;your question&quot; --top-k 4</code></li>"
+        )
+        section_html.append("</ul>")
+
+        section_html.append("<h3>Safety and Controls</h3><ul>")
+        section_html.append("<li><b>STOP PROCESS</b> interrupts active reasoning immediately.</li>")
+        section_html.append("<li>Use <b>Resume</b> to continue after a stop.</li>")
+        section_html.append(
+            "<li>Voice output uses pyttsx3 (system voice) or Piper voices when piper.exe is available.</li>"
+        )
+        section_html.append("</ul>")
+
+        help_text.setHtml("".join(section_html))
         layout.addWidget(help_text)
 
     # --- history tab ---
@@ -799,9 +837,9 @@ class AssistantMainWindow(QMainWindow):
 
         for char_id in sorted(CHARACTERS.keys()):
             data = CHARACTERS.get(char_id, {})
-            display_name = str(data.get("name") or char_id)
+            display_name = VOICE_PROFILE_LABELS.get(char_id) or str(data.get("name") or char_id)
             self.voice_profile_combo.addItem(
-                f"Character: {display_name} ({char_id})",
+                f"Voice pack: {display_name}",
                 f"character:{char_id}",
             )
 

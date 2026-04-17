@@ -39,6 +39,7 @@ pywin32==311
 # Optional local RAG
 chromadb==0.5.23
 pypdf==5.1.0
+watchdog==6.0.0
 
 # Optional multimodal vision
 mediapipe==0.10.21

@@ -117,6 +117,42 @@ If your model is elsewhere, update either:
 - RVC models go under `rvc_models/`.
 - RAG documents go under `knowledge/` (txt/md/csv/json/py/pdf).
 
+## MARIE Memory Agent (Background Learning)
+
+MARIE now supports a local memory watcher that learns from your notes folder and stores vectors in ChromaDB.
+
+1. Install libraries:
+
+```bash
+pip install chromadb watchdog ollama
+```
+
+2. Use the memory folder for notes and snippets:
+
+```text
+knowledge/memory_agent/
+```
+
+3. Build the memory index once:
+
+```bash
+python -m aiassistant.infra.memory_agent --once
+```
+
+4. Run watcher in the background so it keeps learning while you work:
+
+```bash
+python -m aiassistant.infra.memory_agent
+```
+
+5. Optional quick query test:
+
+```bash
+python -m aiassistant.infra.memory_agent --query "what did i note about RAD schema" --top-k 4
+```
+
+The main MARIE assistant automatically reads this local memory store through the RAG context path.
+
 ## Systematic Project Layout
 
 Core implementation now lives under the `aiassistant/` package:

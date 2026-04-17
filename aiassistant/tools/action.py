@@ -59,6 +59,91 @@ except ImportError:
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME.startswith("win")
 
+GENERAL_TASK_COMMANDS = [
+    "open <app>",
+    "close <app>",
+    "play <topic>",
+    "write <text>",
+    "note <text>",
+    "type <text>",
+    "take a note <text>",
+    "volume up",
+    "volume down",
+    "mute",
+    "unmute",
+    "search web <query>",
+    "open website <url>",
+    "browse <url>",
+    "research <query>",
+    "web research <query>",
+    "research web <query>",
+]
+
+CLIPBOARD_COMMANDS = [
+    "copy selected text",
+    "copy now",
+    "paste clipboard",
+    "paste now",
+    "save clipboard to rad as <key>",
+]
+
+SYSTEM_COMMANDS = [
+    "system check",
+    "check system",
+    "malware scan",
+    "scan for malware",
+    "run malware scan",
+    "security quick scan",
+    "scan apps",
+    "update apps",
+]
+
+OFFICE_HELP_COMMANDS = [
+    "office help",
+    "excel help",
+    "word help",
+    "powerpoint help",
+]
+
+EXCEL_HELP_COMMANDS = [
+    "create an excel workbook with <rows>x<cols> table with random data and then create the graph from it",
+    "excel random table <rows>x<cols> with graph [in <file>]",
+    "excel demo table graph [in <file>]",
+    "excel create <file>",
+    "excel create sheet <sheet_name> in <file>",
+    "excel list sheets in <file>",
+    "excel set <cell> to <value> in <file> [sheet <sheet_name>]",
+    "excel get <cell> in <file> [sheet <sheet_name>]",
+    "excel add row <comma-separated values> in <file> [sheet <sheet_name>]",
+    "excel delete row <number> in <file> [sheet <sheet_name>]",
+    "excel delete column <A..Z> in <file> [sheet <sheet_name>]",
+    "excel sum <A1:B10> in <file> to <cell> [sheet <sheet_name>]",
+    "excel formula <cell> = <formula> in <file> [sheet <sheet_name>]",
+]
+
+WORD_HELP_COMMANDS = [
+    "word create <file>",
+    "word add heading <text> [level 1-6] in <file>",
+    "word add paragraph <text> in <file>",
+    "word read <file>",
+]
+
+POWERPOINT_HELP_COMMANDS = [
+    "powerpoint create <file>",
+    "powerpoint add slide title <title> content <content> in <file>",
+    "powerpoint launch <file>",
+]
+
+ASSISTANT_JSON_ACTIONS = [
+    '{"action":"open","target":"chrome"}',
+    '{"action":"close","target":"notepad"}',
+    '{"action":"search_web","target":"latest ai news"}',
+    '{"action":"open_website","target":"github.com"}',
+    '{"action":"volume","target":"up"}',
+    '{"action":"write_note","target":"meeting summary"}',
+    '{"action":"play","target":"lofi coding music"}',
+]
+
 
 def _open_with_default_app(path):
     try:
@@ -377,19 +462,8 @@ class ExcelCommandHandler:
 
         if re.fullmatch(r"excel\s+help", text, flags=re.IGNORECASE):
             print("[ACTION][EXCEL] Commands:")
-            print("- create an excel workbook with 10x10 table with random data and then create the graph from it")
-            print("- excel random table <rows>x<cols> with graph [in <file>]")
-            print("- excel demo table graph [in <file>]")
-            print("- excel create <file>")
-            print("- excel create sheet <sheet_name> in <file>")
-            print("- excel list sheets in <file>")
-            print("- excel set <cell> to <value> in <file> [sheet <sheet_name>]")
-            print("- excel get <cell> in <file> [sheet <sheet_name>]")
-            print("- excel add row <comma-separated values> in <file> [sheet <sheet_name>]")
-            print("- excel delete row <number> in <file> [sheet <sheet_name>]")
-            print("- excel delete column <A..Z> in <file> [sheet <sheet_name>]")
-            print("- excel sum <A1:B10> in <file> to <cell> [sheet <sheet_name>]")
-            print("- excel formula <cell> = <formula> in <file> [sheet <sheet_name>]")
+            for command in EXCEL_HELP_COMMANDS:
+                print(f"- {command}")
             return True
 
         return False
@@ -483,10 +557,8 @@ class WordCommandHandler:
 
         if re.fullmatch(r"word\s+help", text, flags=re.IGNORECASE):
             print("[ACTION][WORD] Commands:")
-            print("- word create <file>")
-            print("- word add heading <text> [level 1-6] in <file>")
-            print("- word add paragraph <text> in <file>")
-            print("- word read <file>")
+            for command in WORD_HELP_COMMANDS:
+                print(f"- {command}")
             return True
 
         return False
@@ -572,14 +644,26 @@ class PowerPointCommandHandler:
 
         if re.fullmatch(r"powerpoint\s+help", text, flags=re.IGNORECASE):
             print("[ACTION][PPT] Commands:")
-            print("- powerpoint create <file>")
-            print("- powerpoint add slide title <title> content <content> in <file>")
-            print("- powerpoint launch <file>")
+            for command in POWERPOINT_HELP_COMMANDS:
+                print(f"- {command}")
             return True
 
         return False
 
 class ActionHandler:
+    @staticmethod
+    def get_supported_command_sections():
+        return {
+            "General task commands": list(GENERAL_TASK_COMMANDS),
+            "Clipboard commands": list(CLIPBOARD_COMMANDS),
+            "System commands": list(SYSTEM_COMMANDS),
+            "Office quick help": list(OFFICE_HELP_COMMANDS),
+            "Excel commands": list(EXCEL_HELP_COMMANDS),
+            "Word commands": list(WORD_HELP_COMMANDS),
+            "PowerPoint commands": list(POWERPOINT_HELP_COMMANDS),
+            "Assistant JSON command format": list(ASSISTANT_JSON_ACTIONS),
+        }
+
     def __init__(self, db=None, context_provider=None):
         # 1. CUSTOM APPS / GAMES
         # Add games or portable apps here that the scanner misses.

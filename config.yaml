@@ -19,21 +19,42 @@ servers:
 
 ollama:
   model: llama3.2:3b
-  num_predict: 180
+  num_predict: 360
   num_ctx: 2048
   temperature: 0.2
   system_prompt: |
-    You are MARIE, a friendly assistant.
-    Reply with only the important points and keep answers short.
+    You are MARIE, a practical desktop assistant.
+    Default to short, direct answers focused on what the user needs now.
+    Do not teach, over-explain, or describe internal steps unless the user asks.
+    For analysis or execution requests, perform the task first and report results.
+    If asked to analyze files, folders, or the PC, provide concise findings and next actions.
     Use clear alignment with tool/action output when available.
-    Default to 2-5 concise bullet points when explaining.
-    Stay warm and natural, not robotic.
 
 memory:
   max_context_chars: 9000
   recent_turn_limit: 10
   rad_limit: 220
   local_context_file: ./cache/memory.json
+
+memory_agent:
+  enabled: true
+  watch_dir: ./knowledge/memory_agent
+  persist_dir: ./cache/chroma_memory_agent
+  collection: marie_memory_agent
+  embedding_model: llama3.2:3b
+  top_k: 4
+  chunk_size: 850
+  chunk_overlap: 120
+  watch_extensions:
+    - .txt
+    - .md
+    - .py
+    - .json
+    - .yaml
+    - .yml
+    - .csv
+    - .rad
+    - .log
 
 voice:
   default_character: tachyon
