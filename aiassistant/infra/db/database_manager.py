@@ -9,6 +9,7 @@ faster prompts.
 from __future__ import annotations
 
 import hashlib
+import re
 import sqlite3
 import threading
 from datetime import datetime
@@ -91,6 +92,8 @@ class DatabaseManager:
             rag_enabled INTEGER DEFAULT 1,
             desktop_mate_enabled INTEGER DEFAULT 0,
             speaking_speed REAL DEFAULT 1.0,
+            system_prompt_behavior TEXT DEFAULT 'default',
+            system_prompt_custom TEXT DEFAULT '',
             updated_at TEXT,
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
@@ -139,6 +142,23 @@ class DatabaseManager:
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_rad_memory_user_id ON rad_memory(user_id)"
             )
+
+        pref_row = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='user_preferences'"
+        ).fetchone()
+        if pref_row:
+            pref_columns = {
+                col["name"]
+                for col in self.conn.execute("PRAGMA table_info(user_preferences)").fetchall()
+            }
+            if "system_prompt_behavior" not in pref_columns:
+                self.conn.execute(
+                    "ALTER TABLE user_preferences ADD COLUMN system_prompt_behavior TEXT DEFAULT 'default'"
+                )
+            if "system_prompt_custom" not in pref_columns:
+                self.conn.execute(
+                    "ALTER TABLE user_preferences ADD COLUMN system_prompt_custom TEXT DEFAULT ''"
+                )
 
     @staticmethod
     def _hash_password(password: str) -> str:
@@ -260,6 +280,23 @@ class DatabaseManager:
             for row in rows
         ]
 
+    def delete_session_history(self, session_id: str) -> bool:
+        clean_session_id = str(session_id or "").strip()
+        if not clean_session_id:
+            return False
+
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM assistant_interactions WHERE session_id = ?",
+                (clean_session_id,),
+            )
+            cursor = self.conn.execute(
+                "DELETE FROM assistant_sessions WHERE session_id = ?",
+                (clean_session_id,),
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+
     def close(self) -> None:
         with self._lock:
             self.conn.close()
@@ -380,6 +417,8 @@ class DatabaseManager:
             "rag_enabled": "rag_enabled",
             "desktop_mate_enabled": "desktop_mate_enabled",
             "speaking_speed": "speaking_speed",
+            "system_prompt_behavior": "system_prompt_behavior",
+            "system_prompt_custom": "system_prompt_custom",
         }
         bool_keys = {
             "tts_enabled",
@@ -446,6 +485,8 @@ class DatabaseManager:
             "rag_enabled": True,
             "desktop_mate_enabled": False,
             "speaking_speed": float(CONFIG.get("voice", {}).get("speaking_speed", 1.0)),
+            "system_prompt_behavior": "default",
+            "system_prompt_custom": "",
         }
 
         with self._lock:
@@ -462,7 +503,9 @@ class DatabaseManager:
                     screen_preview_enabled,
                     rag_enabled,
                     desktop_mate_enabled,
-                    speaking_speed
+                    speaking_speed,
+                    system_prompt_behavior,
+                    system_prompt_custom
                 FROM user_preferences
                 WHERE user_id = ?
                 """,
@@ -512,6 +555,13 @@ class DatabaseManager:
         except (TypeError, ValueError):
             result["speaking_speed"] = defaults["speaking_speed"]
 
+        result["system_prompt_behavior"] = str(
+            row["system_prompt_behavior"] or defaults["system_prompt_behavior"]
+        ).strip() or "default"
+        result["system_prompt_custom"] = str(
+            row["system_prompt_custom"] or defaults["system_prompt_custom"]
+        )
+
         return result
 
     # --- RAD memory ---
@@ -555,6 +605,163 @@ class DatabaseManager:
                     ),
                 )
             self.conn.commit()
+
+    def add_rad_data_if_new(
+        self,
+        user_id: int,
+        category: str,
+        key_data: str,
+        value_data: str,
+        confidence_score: float = 1.0,
+    ) -> bool:
+        clean_category = (category or "user_fact").strip() or "user_fact"
+        clean_key = (key_data or "").strip()
+        clean_value = (value_data or "").strip()
+        if not clean_key or not clean_value:
+            return False
+
+        with self._lock:
+            if self._rad_has_user_id:
+                row = self.conn.execute(
+                    """
+                    SELECT id FROM rad_memory
+                    WHERE user_id = ?
+                      AND lower(category) = lower(?)
+                      AND lower(key_data) = lower(?)
+                      AND lower(value_data) = lower(?)
+                    LIMIT 1
+                    """,
+                    (int(user_id), clean_category, clean_key, clean_value),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    """
+                    SELECT id FROM rad_memory
+                    WHERE lower(category) = lower(?)
+                      AND lower(key_data) = lower(?)
+                      AND lower(value_data) = lower(?)
+                    LIMIT 1
+                    """,
+                    (clean_category, clean_key, clean_value),
+                ).fetchone()
+
+            if row:
+                return False
+
+        self.add_rad_data(
+            user_id=user_id,
+            category=clean_category,
+            key_data=clean_key,
+            value_data=clean_value,
+            confidence_score=confidence_score,
+        )
+        return True
+
+    @staticmethod
+    def _extract_important_facts(text: str) -> List[tuple[str, str, float]]:
+        clean = (text or "").strip()
+        if not clean:
+            return []
+
+        lowered = clean.lower()
+        facts: List[tuple[str, str, float]] = []
+
+        explicit_prefixes = ["remember that", "remember", "note that", "important", "store this"]
+        for prefix in explicit_prefixes:
+            if lowered.startswith(prefix):
+                note = clean[len(prefix):].strip(" .,:;")
+                if note:
+                    facts.append(("remembered_note", note, 0.96))
+                break
+
+        pattern_rules = [
+            (r"\bmy name is\s+([a-zA-Z][a-zA-Z\s\.'-]{1,40})", "name", 0.98),
+            (r"\bi am\s+(\d{1,3})\s+years old\b", "age", 0.97),
+            (r"\bmy birthday is\s+([a-zA-Z0-9\s,/-]{2,40})", "birthday", 0.96),
+            (r"\bi live in\s+([a-zA-Z\s\.'-]{2,50})", "location", 0.93),
+            (r"\bi work as\s+([a-zA-Z\s\.'-]{2,50})", "job", 0.90),
+            (r"\bi prefer\s+([a-zA-Z0-9\s\.,'-]{2,70})", "preference", 0.88),
+        ]
+
+        for pattern, key, confidence in pattern_rules:
+            match = re.search(pattern, clean, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = match.group(1).strip(" .")
+            if value:
+                facts.append((key, value, confidence))
+
+        favorite_match = re.search(
+            r"\bmy favorite\s+([a-zA-Z\s]{2,24})\s+is\s+([a-zA-Z0-9\s\.,'-]{1,60})",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        if favorite_match:
+            topic = re.sub(r"\s+", "_", favorite_match.group(1).strip().lower())
+            value = favorite_match.group(2).strip(" .")
+            if topic and value:
+                facts.append((f"favorite_{topic}", value, 0.91))
+
+        return facts
+
+    @staticmethod
+    def _extract_assistant_points(assistant_text: str) -> List[tuple[str, str, float]]:
+        clean = (assistant_text or "").strip()
+        if not clean:
+            return []
+
+        points: List[tuple[str, str, float]] = []
+        lines = [line.strip() for line in clean.splitlines() if line.strip()]
+        for line in lines:
+            collapsed = line.strip("-*• ")
+            if ":" not in collapsed:
+                continue
+
+            key_part, value_part = collapsed.split(":", 1)
+            key = re.sub(r"[^a-z0-9]+", "_", key_part.lower()).strip("_")
+            value = value_part.strip(" .")
+            if not key or not value:
+                continue
+            if len(key) > 36 or len(value) < 6:
+                continue
+
+            points.append((f"assistant_{key}", value, 0.72))
+            if len(points) >= 5:
+                break
+
+        return points
+
+    def auto_store_important_conversation_data(
+        self,
+        user_id: int,
+        user_text: str,
+        assistant_text: str = "",
+    ) -> List[Dict[str, str]]:
+        if user_id is None:
+            return []
+
+        candidates: List[tuple[str, str, float]] = []
+        candidates.extend(self._extract_important_facts(user_text))
+        candidates.extend(self._extract_assistant_points(assistant_text))
+
+        stored: List[Dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for key, value, confidence in candidates:
+            pair = (key, value)
+            if pair in seen:
+                continue
+            seen.add(pair)
+
+            if self.add_rad_data_if_new(
+                user_id=int(user_id),
+                category="auto_fact",
+                key_data=key,
+                value_data=value,
+                confidence_score=confidence,
+            ):
+                stored.append({"key": key, "value": value})
+
+        return stored
 
     def get_rad_data(self, user_id: int, limit: int = 300) -> List[Dict[str, object]]:
         with self._lock:

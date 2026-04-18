@@ -682,6 +682,7 @@ class TextToSpeechEngine:
 
     def stop(self) -> None:
         self._running.clear()
+        self._drain_queue()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
 
@@ -691,6 +692,31 @@ class TextToSpeechEngine:
                     self._engine.stop()
                 except Exception:
                     pass
+
+    def interrupt(self) -> None:
+        """Stops current playback and drops queued sentences without shutting down the TTS worker."""
+        self._drain_queue()
+
+        if self._engine is not None:
+            with self._engine_lock:
+                try:
+                    self._engine.stop()
+                except Exception:
+                    pass
+
+        if winsound is not None:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+
+    def _drain_queue(self) -> None:
+        try:
+            while True:
+                self._queue.get_nowait()
+                self._queue.task_done()
+        except queue.Empty:
+            return
 
     def speak(self, text: str) -> None:
         clean = filter_tts_text(text)

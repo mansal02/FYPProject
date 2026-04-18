@@ -20,6 +20,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.chart import LineChart, Reference
 from openpyxl.utils import get_column_letter
 from aiassistant.infra.config.app_config import CONFIG
+from aiassistant.tools.tools_os import run_tool_action
 
 try:
     Document = importlib.import_module("docx").Document
@@ -96,6 +97,80 @@ SYSTEM_COMMANDS = [
     "security quick scan",
     "scan apps",
     "update apps",
+]
+
+FILE_SYSTEM_COMMANDS = [
+    "files roots",
+    "files list <path>",
+    "files deep search <query>",
+    "files deep search <query> [in <root>]",
+    "search file <hint>",
+    "find file <hint>",
+    "locate file <hint>",
+    "files analyze <path>",
+    "files create file <path> [content <text>]",
+    "files create folder <path>",
+    "files create dir <path>",
+    "files create directory <path>",
+    "files move <source> -> <destination>",
+    "files copy <source> -> <destination>",
+    "files delete <path>",
+    "files remove <path>",
+    "files open <path>",
+    "open file <hint>",
+]
+
+SOFTWARE_COMMANDS = [
+    "software open <app>",
+    "software close <app>",
+    "software running",
+    "service open <gmail|outlook|whatsapp|telegram>",
+    "service open <app_or_service>",
+]
+
+COMMUNICATION_COMMANDS = [
+    "email draft to <email> subject <subject> body <body> [attach <file_hint>] [provider gmail|outlook|custom]",
+    "email send to <email> subject <subject> body <body> [attach <file_hint>] [provider gmail|outlook|custom]",
+    "telegram send to <chat_id> token <bot_token> message <text>",
+    "telegram file <path_or_hint> to <chat_id> token <bot_token> [caption <text>]",
+    "whatsapp send to <phone_number> message <text> (WhatsApp Web mode)",
+]
+
+ASSISTANT_TOOL_ACTIONS = [
+    "list_system_roots",
+    "list_directory",
+    "deep_search (alias: deep_search_paths)",
+    "analyze_path",
+    "create_path",
+    "move_path",
+    "copy_path",
+    "delete_path",
+    "search_file",
+    "semantic_search_file",
+    "read_file",
+    "open_file (alias: open_path)",
+    "launch_application",
+    "close_application",
+    "list_running_apps (alias: list_running_applications)",
+    "open_service",
+    "move_mouse",
+    "click",
+    "type_text",
+    "press_key",
+    "hotkey",
+    "run_command",
+    "toggle_dark_mode",
+    "send_email",
+    "draft_email_attachment",
+    "send_telegram",
+    "send_whatsapp",
+    "online_query",
+]
+
+ASSISTANT_TOOL_EXAMPLES = [
+    '<tool>{"action":"list_directory","path":"D:/pylearn/FYP/AiAssistant","max_results":120}</tool>',
+    '<tool>{"action":"deep_search","query":"runsys.py","roots":["D:/pylearn/FYP/AiAssistant"],"include_content":false}</tool>',
+    '<tool>{"action":"send_email","to":"name@example.com","subject":"Report","body":"Please find attached","provider":"outlook","attachments":["report.pdf"],"send_now":false}</tool>',
 ]
 
 OFFICE_HELP_COMMANDS = [
@@ -655,6 +730,9 @@ class ActionHandler:
     def get_supported_command_sections():
         return {
             "General task commands": list(GENERAL_TASK_COMMANDS),
+            "File system commands": list(FILE_SYSTEM_COMMANDS),
+            "Software control commands": list(SOFTWARE_COMMANDS),
+            "Communication commands": list(COMMUNICATION_COMMANDS),
             "Clipboard commands": list(CLIPBOARD_COMMANDS),
             "System commands": list(SYSTEM_COMMANDS),
             "Office quick help": list(OFFICE_HELP_COMMANDS),
@@ -662,6 +740,8 @@ class ActionHandler:
             "Word commands": list(WORD_HELP_COMMANDS),
             "PowerPoint commands": list(POWERPOINT_HELP_COMMANDS),
             "Assistant JSON command format": list(ASSISTANT_JSON_ACTIONS),
+            "Assistant tool actions (action field)": list(ASSISTANT_TOOL_ACTIONS),
+            "Assistant tool call examples": list(ASSISTANT_TOOL_EXAMPLES),
         }
 
     def __init__(self, db=None, context_provider=None):
@@ -700,6 +780,18 @@ class ActionHandler:
             return False
         lowered = text.strip().lower()
         prefixes = (
+            "files ",
+            "software ",
+            "service ",
+            "email ",
+            "telegram ",
+            "whatsapp ",
+            "search file ",
+            "find file ",
+            "locate file ",
+            "open file ",
+            "open folder ",
+            "open document ",
             "open ",
             "close ",
             "play ",
@@ -731,7 +823,40 @@ class ActionHandler:
         )
         if lowered.startswith(prefixes):
             return True
+        if re.search(r"\b(?:open|close)\b\s+[a-z0-9]", lowered):
+            return True
+        if re.search(r"\b(?:open|search|find|locate|look\s+for)\b.*\b(?:file|files|folder|folders|document|documents|path)\b", lowered):
+            return True
         return any(token in lowered for token in ("volume up", "volume down", "mute", "unmute"))
+
+    @staticmethod
+    def _looks_like_file_hint(raw_text):
+        clean = str(raw_text or "").strip().lower()
+        if not clean:
+            return False
+
+        if re.search(r"^[a-z]:\\", clean):
+            return True
+        if "\\" in clean or "/" in clean:
+            return True
+        if re.search(r"\.[a-z0-9]{1,6}\b", clean):
+            return True
+
+        file_tokens = (
+            " file",
+            "files ",
+            "folder",
+            "document",
+            "directory",
+            "path",
+            "report",
+            "notes",
+            "draft",
+            "summary",
+            "invoice",
+            "project",
+        )
+        return any(token in clean for token in file_tokens)
 
     def _print_system_check(self):
         checks = {
@@ -999,6 +1124,368 @@ class ActionHandler:
 
         return None
 
+    def _print_tool_bridge_result(self, result):
+        if not isinstance(result, dict):
+            print(f"[ACTION][TOOLS] {result}")
+            return False
+
+        ok = bool(result.get("success", False))
+        prefix = "[ACTION][TOOLS]" if ok else "[ACTION][TOOLS][ERROR]"
+        message = str(result.get("message", "")).strip()
+        if message:
+            print(f"{prefix} {message}")
+
+        payload = result.get("data")
+        if payload is not None:
+            try:
+                text = json.dumps(payload, ensure_ascii=True)
+            except Exception:
+                text = str(payload)
+            if len(text) > 1800:
+                text = text[:1800] + "..."
+            print(f"{prefix} Data: {text}")
+
+        error = str(result.get("error", "")).strip()
+        if error and not ok:
+            print(f"{prefix} {error}")
+        return ok
+
+    def _run_tool_bridge_action(self, action):
+        try:
+            result = run_tool_action(action)
+            return self._print_tool_bridge_result(result)
+        except Exception as e:
+            print(f"[ACTION][TOOLS][ERROR] {e}")
+            return False
+
+    def _handle_extended_tool_commands(self, raw_text):
+        if not raw_text:
+            return False
+
+        lowered = raw_text.strip().lower()
+
+        natural_search_match = re.search(
+            r"\b(?:search|find|locate|look\s+for)\b.*?\b(?:file|files|folder|folders|document|documents|path)\b\s+(.+)$",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if natural_search_match and "website" not in lowered and "search web" not in lowered:
+            hint = natural_search_match.group(1).strip().strip('"').strip("'")
+            if hint:
+                self._run_tool_bridge_action(
+                    {
+                        "action": "search_file",
+                        "hint": hint,
+                        "max_results": 20,
+                        "include_content": True,
+                    }
+                )
+                return True
+
+        natural_open_match = re.search(
+            r"\bopen\b.*?\b(?:file|folder|document|path)\b\s+(.+)$",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if natural_open_match and "website" not in lowered:
+            target_hint = natural_open_match.group(1).strip().strip('"').strip("'")
+            if target_hint:
+                self._run_tool_bridge_action(
+                    {
+                        "action": "open_file",
+                        "path": target_hint,
+                        "resolve_by_hint": True,
+                        "include_content": True,
+                    }
+                )
+                return True
+
+        # Conversational app open/launch requests.
+        natural_open_app_match = re.search(r"\b(?:open|launch|start|run)\b\s+(.+)$", raw_text, flags=re.IGNORECASE)
+        if natural_open_app_match:
+            if not re.search(r"\b(file|files|folder|folders|document|documents|path)\b", lowered):
+                app_target = natural_open_app_match.group(1).strip().strip('"').strip("'")
+                app_target = re.sub(
+                    r"\b(?:please|now|for\s+me|thanks|thank\s+you)\b",
+                    " ",
+                    app_target,
+                    flags=re.IGNORECASE,
+                )
+                app_target = re.sub(
+                    r"\b(?:app|application|software|program)\b",
+                    " ",
+                    app_target,
+                    flags=re.IGNORECASE,
+                )
+                app_target = re.sub(r"^(?:the|a|an)\s+", "", app_target, flags=re.IGNORECASE)
+                app_target = re.sub(r"\s+", " ", app_target).strip()
+                if app_target and "website" not in app_target.lower():
+                    if re.search(r"(?:https?://|www\.|\.[a-z]{2,6}(?:/|$))", app_target, flags=re.IGNORECASE):
+                        self._open_website(app_target)
+                    else:
+                        self._run_tool_bridge_action(
+                            {
+                                "action": "launch_application",
+                                "app": app_target,
+                            }
+                        )
+                    return True
+
+        natural_close_app_match = re.search(
+            r"\b(?:close|quit|exit|kill|terminate)\b\s+(.+)$",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if natural_close_app_match:
+            if not re.search(r"\b(file|files|folder|folders|document|documents|path)\b", lowered):
+                close_target = natural_close_app_match.group(1).strip().strip('"').strip("'")
+                close_target = re.sub(
+                    r"\b(?:please|now|for\s+me|thanks|thank\s+you)\b",
+                    " ",
+                    close_target,
+                    flags=re.IGNORECASE,
+                )
+                close_target = re.sub(
+                    r"\b(?:app|application|software|program)\b",
+                    " ",
+                    close_target,
+                    flags=re.IGNORECASE,
+                )
+                close_target = re.sub(r"^(?:the|a|an)\s+", "", close_target, flags=re.IGNORECASE)
+                close_target = re.sub(r"\s+", " ", close_target).strip()
+                if close_target:
+                    self._run_tool_bridge_action(
+                        {
+                            "action": "close_application",
+                            "app": close_target,
+                        }
+                    )
+                    return True
+
+        # File system commands.
+        if re.fullmatch(r"files\s+roots\s*", raw_text, flags=re.IGNORECASE):
+            self._run_tool_bridge_action({"action": "list_system_roots"})
+            return True
+
+        match = re.fullmatch(r"files\s+list\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action(
+                {
+                    "action": "list_directory",
+                    "path": match.group(1).strip(),
+                    "max_results": 120,
+                }
+            )
+            return True
+
+        match = re.fullmatch(r"files\s+deep\s+search\s+(.+?)(?:\s+in\s+(.+))?\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            query, root = match.groups()
+            action = {
+                "action": "deep_search",
+                "query": query.strip(),
+                "max_results": 40,
+                "include_content": True,
+            }
+            if root:
+                action["roots"] = [root.strip()]
+            else:
+                action["include_all_drives"] = True
+            self._run_tool_bridge_action(action)
+            return True
+
+        match = re.fullmatch(r"files\s+analyze\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action(
+                {
+                    "action": "analyze_path",
+                    "path": match.group(1).strip(),
+                }
+            )
+            return True
+
+        match = re.fullmatch(
+            r"files\s+create\s+file\s+(.+?)(?:\s+content\s+(.+))?\s*$",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            path, content = match.groups()
+            self._run_tool_bridge_action(
+                {
+                    "action": "create_path",
+                    "path": path.strip(),
+                    "kind": "file",
+                    "content": (content or "").strip(),
+                    "overwrite": False,
+                }
+            )
+            return True
+
+        match = re.fullmatch(r"files\s+create\s+(?:folder|dir|directory)\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action(
+                {
+                    "action": "create_path",
+                    "path": match.group(1).strip(),
+                    "kind": "directory",
+                }
+            )
+            return True
+
+        match = re.fullmatch(r"files\s+move\s+(.+?)\s*->\s*(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            src, dst = match.groups()
+            self._run_tool_bridge_action(
+                {
+                    "action": "move_path",
+                    "src": src.strip(),
+                    "dst": dst.strip(),
+                }
+            )
+            return True
+
+        match = re.fullmatch(r"files\s+copy\s+(.+?)\s*->\s*(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            src, dst = match.groups()
+            self._run_tool_bridge_action(
+                {
+                    "action": "copy_path",
+                    "src": src.strip(),
+                    "dst": dst.strip(),
+                }
+            )
+            return True
+
+        match = re.fullmatch(r"files\s+(?:delete|remove)\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action(
+                {
+                    "action": "delete_path",
+                    "path": match.group(1).strip(),
+                    "recursive": True,
+                    "use_trash": True,
+                }
+            )
+            return True
+
+        match = re.fullmatch(r"files\s+open\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action(
+                {
+                    "action": "open_file",
+                    "path": match.group(1).strip(),
+                    "resolve_by_hint": True,
+                    "include_content": True,
+                }
+            )
+            return True
+
+        # Software commands.
+        match = re.fullmatch(r"software\s+open\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action(
+                {
+                    "action": "launch_application",
+                    "app": match.group(1).strip(),
+                }
+            )
+            return True
+
+        match = re.fullmatch(r"software\s+close\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action(
+                {
+                    "action": "close_application",
+                    "app": match.group(1).strip(),
+                }
+            )
+            return True
+
+        if re.fullmatch(r"software\s+running\s*", raw_text, flags=re.IGNORECASE):
+            self._run_tool_bridge_action({"action": "list_running_apps", "max_results": 120})
+            return True
+
+        match = re.fullmatch(r"service\s+open\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action(
+                {
+                    "action": "open_service",
+                    "service": match.group(1).strip(),
+                }
+            )
+            return True
+
+        # Email and messaging commands.
+        match = re.fullmatch(
+            r"email\s+(draft|send)\s+to\s+(.+?)\s+subject\s+(.+?)\s+body\s+(.+?)(?:\s+attach\s+(.+?))?(?:\s+provider\s+(gmail|outlook|custom))?\s*$",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            mode, to_email, subject, body, attachment, provider = match.groups()
+            payload = {
+                "action": "send_email",
+                "to": to_email.strip(),
+                "subject": subject.strip(),
+                "body": body.strip(),
+                "provider": (provider or ("outlook" if IS_WINDOWS else "gmail")).strip(),
+                "send_now": mode.strip().lower() == "send",
+            }
+            if attachment:
+                payload["attachments"] = [attachment.strip()]
+            self._run_tool_bridge_action(payload)
+            return True
+
+        match = re.fullmatch(
+            r"telegram\s+send\s+to\s+(.+?)\s+token\s+(.+?)\s+message\s+(.+)\s*$",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            chat_id, token, message = match.groups()
+            self._run_tool_bridge_action(
+                {
+                    "action": "send_telegram",
+                    "chat_id": chat_id.strip(),
+                    "bot_token": token.strip(),
+                    "message": message.strip(),
+                }
+            )
+            return True
+
+        match = re.fullmatch(
+            r"telegram\s+file\s+(.+?)\s+to\s+(.+?)\s+token\s+(.+?)(?:\s+caption\s+(.+))?\s*$",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            file_hint, chat_id, token, caption = match.groups()
+            self._run_tool_bridge_action(
+                {
+                    "action": "send_telegram",
+                    "chat_id": chat_id.strip(),
+                    "bot_token": token.strip(),
+                    "file_hint": file_hint.strip(),
+                    "message": (caption or "").strip(),
+                }
+            )
+            return True
+
+        match = re.fullmatch(r"whatsapp\s+send\s+to\s+(.+?)\s+message\s+(.+)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            to_number, message = match.groups()
+            self._run_tool_bridge_action(
+                {
+                    "action": "send_whatsapp",
+                    "to": to_number.strip(),
+                    "message": message.strip(),
+                }
+            )
+            return True
+
+        return False
+
     def _execute_json_action(self, action_obj):
         action = action_obj.get("action", "")
         target = (action_obj.get("target") or "").strip()
@@ -1071,6 +1558,9 @@ class ActionHandler:
         structured_action = self._extract_json_action(raw_text)
         if structured_action:
             self._execute_json_action(structured_action)
+            return
+
+        if self._handle_extended_tool_commands(raw_text):
             return
 
         # =========================================================
@@ -1224,7 +1714,27 @@ class ActionHandler:
             app_name = raw_name.replace("please", "").replace("now", "").strip()
             app_name = re.sub(r'[^\w\s]', '', app_name)
 
-            self._open_app_name(app_name)
+            if self._looks_like_file_hint(raw_name):
+                self._run_tool_bridge_action(
+                    {
+                        "action": "open_file",
+                        "path": raw_name,
+                        "resolve_by_hint": True,
+                        "include_content": True,
+                    }
+                )
+                return
+
+            opened = self._open_app_name(app_name)
+            if not opened and len(app_name.split()) >= 3:
+                self._run_tool_bridge_action(
+                    {
+                        "action": "open_file",
+                        "path": raw_name,
+                        "resolve_by_hint": True,
+                        "include_content": True,
+                    }
+                )
             return
 
         # =========================================================

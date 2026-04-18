@@ -4,6 +4,8 @@ import json
 import sys
 import requests  
 import os
+import re
+import subprocess
 import threading
 import pygame
 import math
@@ -68,6 +70,75 @@ def clear_auto_login_user():
             os.remove(AUTO_LOGIN_FILE)
         except Exception as e:
             print(f"[LOGIN] Failed to clear one-time login token: {e}")
+
+
+def run_action_command_isolated(text, timeout_sec=50):
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return True, ""
+
+    command = [
+        sys.executable,
+        "-m",
+        "aiassistant.tools.action_runner",
+        "--text",
+        clean_text,
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(5, int(timeout_sec)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "[ACTION] Command timed out in isolated runner."
+    except Exception as exc:
+        return False, f"[ACTION] Isolated runner failed to start: {exc}"
+
+    chunks = []
+    if completed.stdout:
+        chunks.append(completed.stdout.strip())
+    if completed.stderr:
+        chunks.append(completed.stderr.strip())
+    output = "\n".join(part for part in chunks if part).strip()
+
+    if completed.returncode == 0:
+        return True, output
+
+    if not output:
+        output = f"[ACTION] Isolated runner exited with code {completed.returncode}."
+    return False, output
+
+
+def _looks_like_high_risk_action_command(text):
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+
+    if lowered.startswith(
+        (
+            "open ",
+            "close ",
+            "software ",
+            "service ",
+            "files open ",
+            "search file ",
+            "find file ",
+            "locate file ",
+        )
+    ):
+        return True
+
+    if re.search(r"\b(?:open|search|find|locate|look\s+for)\b.*\b(?:file|files|folder|folders|document|documents|path)\b", lowered):
+        return True
+
+    if re.search(r"\b(?:open|close)\b\s+[a-z0-9]", lowered):
+        return True
+
+    return bool(re.search(r'"action"\s*:\s*"(open|close|open_file|search_file|semantic_search_file|deep_search|deep_search_paths)"', lowered))
 
 from aiassistant.infra.db.database import MarieDB
 from aiassistant.infra.voice.voice_db import CHARACTERS
@@ -896,7 +967,19 @@ class MainWindow(QMainWindow):
         self.chat_history.append(f"<b style='color: #ce9178'>MARIE:</b> ")
         self.input_field.clear()
 
-        action_result = self.actions.execute_and_collect(text)
+        if _looks_like_high_risk_action_command(text):
+            avatar_was_running = bool(
+                hasattr(self, "anim_timer") and self.anim_timer is not None and self.anim_timer.isActive()
+            )
+            if avatar_was_running:
+                self.anim_timer.stop()
+            try:
+                _, action_result = run_action_command_isolated(text)
+            finally:
+                if avatar_was_running:
+                    self.anim_timer.start(16)
+        else:
+            action_result = self.actions.execute_and_collect(text)
         self.latest_action_result = action_result
         if action_result:
             pretty = html.escape(action_result).replace("\n", "<br>")
@@ -1085,7 +1168,20 @@ class MainWindow(QMainWindow):
         self.latest_action_result = ""
         
         self.chat_history.append("<hr style='background-color: #444; height: 1px; border: 0;'>")
-        threading.Thread(target=self.actions.execute_from_assistant, args=(full_text,), daemon=True).start()
+        threading.Thread(target=self._execute_assistant_actions_background, args=(full_text,), daemon=True).start()
+
+    def _execute_assistant_actions_background(self, full_text):
+        if _looks_like_high_risk_action_command(full_text):
+            ok, output = run_action_command_isolated(full_text, timeout_sec=35)
+            if output:
+                prefix = "[ACTION][ASSISTANT]" if ok else "[ACTION][ASSISTANT][ERROR]"
+                print(f"{prefix} {output}")
+            return
+
+        try:
+            self.actions.execute_from_assistant(full_text)
+        except Exception as exc:
+            print(f"[ACTION][ASSISTANT][ERROR] {exc}")
 
     def closeEvent(self, event):
         self.db.logout_user(self.current_user_id, self.current_session_id)

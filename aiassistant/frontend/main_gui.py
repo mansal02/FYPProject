@@ -14,11 +14,13 @@ agent flow:
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import html
 import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -53,34 +55,317 @@ from PyQt5.QtWidgets import (
 from aiassistant.core.agent_core import AgentConfig, OfflineAgentCore
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.db.database_manager import DatabaseManager
-from aiassistant.infra.vision.screen_vision import PYAUTOGUI_AVAILABLE, capture_screen_snapshot
-from aiassistant.infra.vision.vision_audio import CameraTracker, SpeechListener, TextToSpeechEngine
-from aiassistant.tools.action import ActionHandler
+
+
+def _bootstrap_env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _bootstrap_env_int(name: str, default: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return int(default)
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return int(default)
+
+
+_BOOT_STABILITY_MODE_LEVEL = max(0, _bootstrap_env_int("MARIE_STABILITY_MODE_LEVEL", 0))
+_BOOT_DISABLE_LIVE2D = _bootstrap_env_bool("MARIE_DISABLE_LIVE2D", False)
+_BOOT_DISABLE_VOICE_INPUT = _bootstrap_env_bool("MARIE_DISABLE_VOICE_INPUT", False)
+_BOOT_DISABLE_TTS = _bootstrap_env_bool("MARIE_DISABLE_TTS", False)
+_BOOT_DISABLE_SCREEN_CAPTURE = _bootstrap_env_bool("MARIE_DISABLE_SCREEN_CAPTURE", False)
+_BOOT_DISABLE_SCREEN_PREVIEW = _bootstrap_env_bool("MARIE_DISABLE_SCREEN_PREVIEW", False)
+_BOOT_DISABLE_LEGACY_ACTIONS = _bootstrap_env_bool("MARIE_DISABLE_LEGACY_ACTIONS", False)
+_BOOT_SAFE_MINIMAL = _bootstrap_env_bool("MARIE_SAFE_MINIMAL", False)
+_BOOT_SKIP_MEDIA_STACK = _BOOT_SAFE_MINIMAL or (
+    _BOOT_STABILITY_MODE_LEVEL >= 2
+    or (
+        _BOOT_DISABLE_VOICE_INPUT
+        and _BOOT_DISABLE_TTS
+        and _BOOT_DISABLE_SCREEN_CAPTURE
+        and _BOOT_DISABLE_SCREEN_PREVIEW
+    )
+)
+
+_DEFAULT_BOOT_LOG = str(
+    (
+        Path(str(CONFIG.get("paths", {}).get("db_path", "./cache/assistant_sessions.db"))).resolve().parent
+        / "main_gui_boot.log"
+    ).resolve()
+)
+_BOOT_TRACE_PATH = str(
+    os.environ.get(
+        "MARIE_GUI_BOOT_LOG",
+        _DEFAULT_BOOT_LOG if _BOOT_STABILITY_MODE_LEVEL > 0 else "",
+    )
+    or ""
+).strip()
+_FAULT_HANDLER_STREAM = None
+
+
+def _write_boot_trace(step: str) -> None:
+    if not _BOOT_TRACE_PATH:
+        return
+    try:
+        trace_path = Path(_BOOT_TRACE_PATH)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} pid={os.getpid()} step={step}\n")
+    except Exception:
+        pass
+
+
+def _enable_native_fault_tracing() -> None:
+    global _FAULT_HANDLER_STREAM
+    if not _bootstrap_env_bool("MARIE_FAULTHANDLER", True):
+        return
+    if not _BOOT_TRACE_PATH:
+        return
+    try:
+        trace_path = Path(_BOOT_TRACE_PATH)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        if _FAULT_HANDLER_STREAM is None:
+            _FAULT_HANDLER_STREAM = trace_path.open("a", encoding="utf-8")
+        faulthandler.enable(_FAULT_HANDLER_STREAM, all_threads=True)
+    except Exception:
+        pass
+
+
+_enable_native_fault_tracing()
+_write_boot_trace(
+    f"module:loaded stability={_BOOT_STABILITY_MODE_LEVEL} safe_minimal={int(_BOOT_SAFE_MINIMAL)} "
+    f"skip_media={int(_BOOT_SKIP_MEDIA_STACK)}"
+)
+
+
+class _NullCameraState:
+    def __init__(self) -> None:
+        self.emotion = "unavailable"
+        self.finger_x = None
+        self.finger_y = None
+        self.tracking_ok = False
+
+
+class _NullCameraTracker:
+    def __init__(self, camera_index: int = 0) -> None:
+        self.camera_index = camera_index
+
+    def start(self) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+    def set_mouse_control(self, enabled: bool) -> None:
+        _ = enabled
+
+    def set_emotion_detection(self, enabled: bool) -> None:
+        _ = enabled
+
+    def get_state(self) -> _NullCameraState:
+        return _NullCameraState()
+
+
+class _NullSpeechListener:
+    def __init__(self, energy_threshold: int = 300, pause_threshold: float = 0.8) -> None:
+        _ = energy_threshold
+        _ = pause_threshold
+        self.available = False
+        self.last_error = "Speech listener disabled in stability mode."
+
+    def get_status(self) -> Dict[str, object]:
+        return {
+            "available": False,
+            "offline_backend": "none",
+            "last_error": self.last_error,
+        }
+
+    def listen_once(
+        self,
+        timeout: float = 2.0,
+        phrase_time_limit: float = 6.0,
+        wake_words: Optional[list[str]] = None,
+        allow_online_fallback: bool = False,
+    ) -> Optional[str]:
+        _ = timeout
+        _ = phrase_time_limit
+        _ = wake_words
+        _ = allow_online_fallback
+        return None
+
+    def start_background_listening(
+        self,
+        callback,
+        wake_words: Optional[list[str]] = None,
+        allow_online_fallback: bool = False,
+    ) -> None:
+        _ = callback
+        _ = wake_words
+        _ = allow_online_fallback
+
+    def stop_background_listening(self) -> None:
+        return
+
+    def start_wake_word_listener(
+        self,
+        callback,
+        wake_phrase: str = "hey agent",
+        access_key: Optional[str] = None,
+        keyword_path: Optional[str] = None,
+    ) -> bool:
+        _ = callback
+        _ = wake_phrase
+        _ = access_key
+        _ = keyword_path
+        return False
+
+    def stop_wake_word_listener(self) -> None:
+        return
+
+
+class _NullTextToSpeechEngine:
+    def __init__(
+        self,
+        mode: str = "silent",
+        piper_exe: Optional[str] = None,
+        piper_model_path: Optional[str] = None,
+        speaking_speed: float = 1.0,
+    ) -> None:
+        _ = mode
+        _ = piper_exe
+        _ = piper_model_path
+        self.speaking_speed = float(speaking_speed)
+
+    @staticmethod
+    def list_system_voices() -> List[Dict[str, str]]:
+        return []
+
+    def is_available(self) -> bool:
+        return False
+
+    def get_active_mode(self) -> str:
+        return "silent"
+
+    def set_mode(
+        self,
+        mode: str,
+        piper_exe: Optional[str] = None,
+        piper_model_path: Optional[str] = None,
+    ) -> None:
+        _ = mode
+        _ = piper_exe
+        _ = piper_model_path
+
+    def set_pyttsx3_voice(self, voice_id: str) -> None:
+        _ = voice_id
+
+    def set_speaking_speed(self, speaking_speed: float) -> None:
+        self.speaking_speed = float(speaking_speed)
+
+    def start(self) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+    def interrupt(self) -> None:
+        return
+
+    def speak(self, text: str) -> None:
+        _ = text
+
+
+PYAUTOGUI_AVAILABLE = False
+
+
+def capture_screen_snapshot() -> Dict[str, object]:
+    return {"error": "Screen capture is disabled in stability mode."}
+
+
+CameraTracker = _NullCameraTracker
+SpeechListener = _NullSpeechListener
+TextToSpeechEngine = _NullTextToSpeechEngine
+
+if not _BOOT_SKIP_MEDIA_STACK:
+    try:
+        from aiassistant.infra.vision.screen_vision import (
+            PYAUTOGUI_AVAILABLE as _PYAUTOGUI_AVAILABLE,
+            capture_screen_snapshot as _capture_screen_snapshot,
+        )
+        from aiassistant.infra.vision.vision_audio import (
+            CameraTracker as _CameraTracker,
+            SpeechListener as _SpeechListener,
+            TextToSpeechEngine as _TextToSpeechEngine,
+        )
+
+        PYAUTOGUI_AVAILABLE = _PYAUTOGUI_AVAILABLE
+        capture_screen_snapshot = _capture_screen_snapshot
+        CameraTracker = _CameraTracker
+        SpeechListener = _SpeechListener
+        TextToSpeechEngine = _TextToSpeechEngine
+        _write_boot_trace("module:media_stack_loaded")
+    except Exception:
+        _write_boot_trace("module:media_stack_load_failed")
+        pass
+
+
+def _get_action_handler_sections() -> Dict[str, List[str]]:
+    if _BOOT_DISABLE_LEGACY_ACTIONS or _BOOT_SAFE_MINIMAL:
+        return {}
+    try:
+        from aiassistant.tools.action import ActionHandler
+
+        return ActionHandler.get_supported_command_sections()
+    except Exception:
+        return {}
 
 try:
     from aiassistant.infra.voice.voice_db import CHARACTERS, get_character_data
+    _write_boot_trace("module:voice_db_loaded")
 except Exception:
     CHARACTERS = {}
+    _write_boot_trace("module:voice_db_failed")
 
     def get_character_data(_char_id):
         raise RuntimeError("voice_db is unavailable")
 
 
-try:
-    import pygame
-    from pygame.locals import DOUBLEBUF, NOFRAME, OPENGL
-    from live2d import v3 as live2d
-    import win32con
-    import win32gui
+pygame = None
+live2d = None
+win32con = None
+win32gui = None
+DOUBLEBUF = NOFRAME = OPENGL = 0
+LIVE2D_AVAILABLE = False
 
-    LIVE2D_AVAILABLE = True
-except Exception:
-    pygame = None
-    live2d = None
-    win32con = None
-    win32gui = None
-    DOUBLEBUF = NOFRAME = OPENGL = 0
-    LIVE2D_AVAILABLE = False
+if not (_BOOT_DISABLE_LIVE2D or _BOOT_SAFE_MINIMAL):
+    try:
+        import pygame
+        from pygame.locals import DOUBLEBUF, NOFRAME, OPENGL
+        from live2d import v3 as live2d
+        import win32con
+        import win32gui
+
+        LIVE2D_AVAILABLE = True
+        _write_boot_trace("module:live2d_stack_loaded")
+    except Exception:
+        pygame = None
+        live2d = None
+        win32con = None
+        win32gui = None
+        DOUBLEBUF = NOFRAME = OPENGL = 0
+        LIVE2D_AVAILABLE = False
+        _write_boot_trace("module:live2d_stack_failed")
 
 
 AUTO_LOGIN_FILE = str(CONFIG.get("paths", {}).get("auto_login_file", "./.marie_autologin.json"))
@@ -94,6 +379,22 @@ VOICE_PROFILE_LABELS = {
     "jalter": "English US - Warm",
     "miku": "English US - Clear",
 }
+
+PROMPT_BEHAVIOR_OPTIONS = [
+    ("Balanced (default)", "default"),
+    ("Concise replies", "concise"),
+    ("Detailed replies", "detailed"),
+    ("Action-first", "action_first"),
+    ("Custom guidance", "custom"),
+]
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    return _bootstrap_env_bool(name, default)
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    return _bootstrap_env_int(name, default)
 
 
 def save_auto_login_user(user_id: int) -> None:
@@ -129,6 +430,138 @@ def clear_auto_login_user() -> None:
             auto_path.unlink()
     except Exception:
         pass
+
+
+def run_action_command_isolated(text: str, timeout_sec: int = 50) -> tuple[bool, str]:
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return True, ""
+
+    command = [
+        sys.executable,
+        "-m",
+        "aiassistant.tools.action_runner",
+        "--text",
+        clean_text,
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(5, int(timeout_sec)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "[ACTION] Command timed out in isolated runner."
+    except Exception as exc:
+        return False, f"[ACTION] Isolated runner failed to start: {exc}"
+
+    chunks = []
+    if completed.stdout:
+        chunks.append(completed.stdout.strip())
+    if completed.stderr:
+        chunks.append(completed.stderr.strip())
+    output = "\n".join(part for part in chunks if part).strip()
+
+    if completed.returncode == 0:
+        return True, output
+
+    if not output:
+        output = f"[ACTION] Isolated runner exited with code {completed.returncode}."
+    return False, output
+
+
+def _looks_like_legacy_action_command(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+
+    prefixes = (
+        "files ",
+        "software ",
+        "service ",
+        "launch ",
+        "start ",
+        "quit ",
+        "exit ",
+        "email ",
+        "telegram ",
+        "whatsapp ",
+        "search file ",
+        "find file ",
+        "locate file ",
+        "open file ",
+        "open folder ",
+        "open document ",
+        "open ",
+        "close ",
+        "play ",
+        "write ",
+        "note ",
+        "type ",
+        "take a note ",
+        "search web ",
+        "open website ",
+        "browse ",
+        "research ",
+        "web research ",
+        "research web ",
+        "excel ",
+        "word ",
+        "powerpoint ",
+        "copy selected text",
+        "copy now",
+        "paste clipboard",
+        "paste now",
+        "save clipboard to rad as ",
+        "scan apps",
+        "update apps",
+        "system check",
+        "check system",
+        "malware scan",
+        "scan for malware",
+        "run malware scan",
+        "security quick scan",
+    )
+    if lowered.startswith(prefixes):
+        return True
+
+    if re.search(r"\b(?:open|close|launch|start|quit|exit)\b\s+[a-z0-9]", lowered):
+        return True
+
+    if re.search(r"\b(?:open|search|find|locate|look\s+for)\b.*\b(?:file|files|folder|folders|document|documents|path)\b", lowered):
+        return True
+
+    return any(token in lowered for token in ("volume up", "volume down", "mute", "unmute"))
+
+
+def _looks_like_stability_safe_action_command(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+
+    safe_prefixes = (
+        "open ",
+        "close ",
+        "software open ",
+        "software close ",
+        "service open ",
+        "open website ",
+        "browse ",
+        "play ",
+    )
+    if lowered.startswith(safe_prefixes):
+        return True
+
+    if re.search(r"\b(?:open|close|launch|start|quit|exit)\b\s+[a-z0-9]", lowered):
+        return True
+
+    if re.search(r"\b(?:open|launch|start|close|quit|exit)\b.*\b(?:youtube|discord|chrome|browser|spotify|steam|telegram|whatsapp|outlook|notepad|word|excel|powerpoint)\b", lowered):
+        return True
+
+    return False
 
 
 class LoginDialog(QDialog):
@@ -221,14 +654,44 @@ class SpeechBridge(QObject):
 class AssistantMainWindow(QMainWindow):
     def __init__(self, db: DatabaseManager, user_id: int, username: str) -> None:
         super().__init__()
+        _write_boot_trace("window:init:start")
 
         self.db = db
         self.current_user_id = int(user_id)
         self.current_username = str(username)
         self.preferences = self.db.get_user_preference(self.current_user_id)
+        self.stability_mode_level = max(0, _env_int("MARIE_STABILITY_MODE_LEVEL", 0))
+        self.force_disable_voice_input = _env_bool("MARIE_DISABLE_VOICE_INPUT", False)
+        self.force_disable_tts = _env_bool("MARIE_DISABLE_TTS", False)
+        self.force_disable_screen_capture = _env_bool("MARIE_DISABLE_SCREEN_CAPTURE", False)
+        self.force_disable_screen_preview = _env_bool("MARIE_DISABLE_SCREEN_PREVIEW", False)
+        self.force_disable_legacy_actions = _env_bool("MARIE_DISABLE_LEGACY_ACTIONS", False)
+        self.force_disable_rag = _env_bool("MARIE_DISABLE_RAG", False)
+        self.allow_stability_safe_actions = _env_bool("MARIE_ALLOW_STABILITY_APP_ACTIONS", True)
+
+        if self.force_disable_voice_input:
+            self.preferences["voice_input_enabled"] = False
+        if self.force_disable_tts:
+            self.preferences["tts_enabled"] = False
+        if self.force_disable_screen_capture:
+            self.preferences["screen_capture_enabled"] = False
+        if self.force_disable_screen_preview:
+            self.preferences["screen_preview_enabled"] = False
+        if self.force_disable_rag:
+            self.preferences["rag_enabled"] = False
+
         self.logout_requested = False
         self._status_core = "Ready"
         self._tts_unavailable_notified = False
+        self._latest_user_text = ""
+        self._discard_next_agent_reply = False
+        self._cancel_pending_reset = False
+        self.chat_view_mode = "full"
+        self.avatar_hidden = False
+        self.system_prompt_behavior = str(
+            self.preferences.get("system_prompt_behavior", "default")
+        ).strip().lower() or "default"
+        self.system_prompt_custom = str(self.preferences.get("system_prompt_custom", ""))
 
         self.reasoning_model = DEFAULT_REASONING_MODEL
         self.vision_model = DEFAULT_VISION_MODEL
@@ -248,8 +711,15 @@ class AssistantMainWindow(QMainWindow):
                 external_model=str(CONFIG.get("runtime", {}).get("external_model", "gemini-2.0-flash")),
             ),
         )
+        _write_boot_trace("window:init:agent_ready")
+        self.agent.set_system_prompt_behavior(
+            self.system_prompt_behavior,
+            self.system_prompt_custom,
+        )
         self.allow_legacy_text_actions = bool(CONFIG.get("actions", {}).get("allow_legacy_text_commands", True))
-        self.actions: Optional[ActionHandler] = None
+        if self.force_disable_legacy_actions:
+            self.allow_legacy_text_actions = False
+        self.actions: Optional[object] = None
 
         self.camera = CameraTracker(camera_index=0)
         self.speech = SpeechListener()
@@ -261,7 +731,9 @@ class AssistantMainWindow(QMainWindow):
 
         self.tts = self._create_tts_engine(self.voice_profile, self.speaking_speed)
         self.tts.start()
+        _write_boot_trace("window:init:audio_ready")
 
+        self.live2d_enabled = bool(CONFIG.get("ui", {}).get("enable_live2d", False))
         self.transparent_face = bool(CONFIG.get("ui", {}).get("transparent_face", False))
         self.model = None
         self.screen = None
@@ -281,18 +753,50 @@ class AssistantMainWindow(QMainWindow):
         self._build_ui()
         self._apply_styles()
         self._load_preferences_into_ui()
+        _write_boot_trace("window:init:ui_ready")
 
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self._update_status_strip)
         self.status_timer.start(1000)
 
-        QTimer.singleShot(150, self.init_live2d_embedding)
+        if self.live2d_enabled:
+            QTimer.singleShot(150, self.init_live2d_embedding)
+        else:
+            self._set_avatar_status("Avatar disabled for stability mode.")
 
-        if not self.tts.is_available():
+        if not self.force_disable_tts and not self.tts.is_available():
             self._append_chat(
                 "System",
                 "Voice output is unavailable. Install pyttsx3 or add piper.exe to the piper folder.",
             )
+
+        if self.stability_mode_level > 0:
+            active_limits: List[str] = []
+            if not self.live2d_enabled:
+                active_limits.append("Live2D OFF")
+            if self.force_disable_voice_input:
+                active_limits.append("Voice input OFF")
+            if self.force_disable_tts:
+                active_limits.append("TTS OFF")
+            if self.force_disable_screen_capture:
+                active_limits.append("Screen input OFF")
+            if self.force_disable_screen_preview:
+                active_limits.append("Screen preview OFF")
+            if self.force_disable_legacy_actions:
+                if self.allow_stability_safe_actions:
+                    active_limits.append("Legacy actions LIMITED (app/site control only)")
+                else:
+                    active_limits.append("Legacy actions OFF")
+            if self.force_disable_rag:
+                active_limits.append("RAG OFF")
+
+            suffix = ", ".join(active_limits) if active_limits else "minimal limits"
+            self._append_chat(
+                "System",
+                f"Stability mode {self.stability_mode_level} active: {suffix}.",
+            )
+
+        _write_boot_trace("window:init:done")
 
     # --- UI construction ---
     def _build_ui(self) -> None:
@@ -374,6 +878,27 @@ class AssistantMainWindow(QMainWindow):
         safety_row.addWidget(self.resume_btn)
         right_layout.addLayout(safety_row)
 
+        view_row = QHBoxLayout()
+        full_view_btn = QPushButton("Full View")
+        full_view_btn.clicked.connect(lambda: self._apply_chat_view_mode("full"))
+        view_row.addWidget(full_view_btn)
+
+        chat_only_btn = QPushButton("Just Chat")
+        chat_only_btn.clicked.connect(lambda: self._apply_chat_view_mode("chat_only"))
+        view_row.addWidget(chat_only_btn)
+
+        mini_btn = QPushButton("Mini Box")
+        mini_btn.clicked.connect(lambda: self._apply_chat_view_mode("mini"))
+        view_row.addWidget(mini_btn)
+
+        self.avatar_toggle_btn = QPushButton("Hide Character")
+        self.avatar_toggle_btn.clicked.connect(
+            lambda: self._set_avatar_hidden(not self.avatar_hidden)
+        )
+        view_row.addWidget(self.avatar_toggle_btn)
+
+        right_layout.addLayout(view_row)
+
         toggles = QHBoxLayout()
         self.screen_toggle = QCheckBox("Use live screen as input")
         self.screen_toggle.stateChanged.connect(self.on_screen_toggle_changed)
@@ -416,6 +941,18 @@ class AssistantMainWindow(QMainWindow):
 
         right_layout.addLayout(toggles2)
 
+        self._chat_optional_controls = [
+            self.screen_toggle,
+            self.screen_preview_toggle,
+            self.camera_toggle,
+            self.finger_toggle,
+            self.voice_toggle,
+            self.voice_mode_btn,
+            self.rag_toggle,
+            self.tts_toggle,
+            self.desktop_mate_toggle,
+        ]
+
         self.screen_preview_label = QLabel("Live screen preview is disabled.")
         self.screen_preview_label.setObjectName("previewFrame")
         self.screen_preview_label.setAlignment(Qt.AlignCenter)
@@ -443,6 +980,10 @@ class AssistantMainWindow(QMainWindow):
         load_btn = QPushButton("Load Selected")
         load_btn.clicked.connect(self._load_selected_session_history)
         top_row.addWidget(load_btn)
+
+        delete_btn = QPushButton("Delete Selected Session")
+        delete_btn.clicked.connect(self.on_delete_selected_history_session)
+        top_row.addWidget(delete_btn)
 
         layout.addLayout(top_row)
 
@@ -493,6 +1034,18 @@ class AssistantMainWindow(QMainWindow):
         model_wrap = QWidget()
         model_wrap.setLayout(model_row)
         form.addRow("Live2D model", model_wrap)
+
+        self.prompt_behavior_combo = QComboBox()
+        for label, value in PROMPT_BEHAVIOR_OPTIONS:
+            self.prompt_behavior_combo.addItem(label, value)
+        form.addRow("System prompt behavior", self.prompt_behavior_combo)
+
+        self.prompt_custom_input = QTextEdit()
+        self.prompt_custom_input.setPlaceholderText(
+            "Optional custom instructions for assistant behavior."
+        )
+        self.prompt_custom_input.setMinimumHeight(90)
+        form.addRow("Custom prompt notes", self.prompt_custom_input)
 
         self.pref_tts_cb = QCheckBox("Enable voice output")
         self.pref_voice_input_cb = QCheckBox("Enable voice command input")
@@ -610,13 +1163,41 @@ class AssistantMainWindow(QMainWindow):
         )
         for sample in voice_samples:
             section_html.append(f"<li>Example: <code>{html.escape(sample)}</code></li>")
+        section_html.append(
+            "<li>UI quick commands: <code>hide character</code>, <code>show character</code>, "
+            "<code>just chat</code>/<code>chat only</code>, <code>mini box</code>/<code>mini mode</code>, "
+            "<code>full mode</code>/<code>full view</code>/<code>normal mode</code>/<code>show all</code>.</li>"
+        )
+        section_html.append(
+            "<li>Safety commands: <code>stop</code>, <code>cancel</code>, <code>stop process</code>, "
+            "<code>cancel process</code>, <code>stop response</code>, <code>cancel response</code>.</li>"
+        )
         section_html.append("</ul>")
 
-        for title, commands in ActionHandler.get_supported_command_sections().items():
+        supported_sections = _get_action_handler_sections()
+        for title, commands in supported_sections.items():
             section_html.append(f"<h3>{html.escape(title)}</h3><ul>")
             for command in commands:
                 section_html.append(f"<li><code>{html.escape(str(command))}</code></li>")
             section_html.append("</ul>")
+        if not supported_sections:
+            section_html.append(
+                "<p>Extended command list is hidden in the current stability profile.</p>"
+            )
+
+        section_html.append("<h3>Communication Setup Notes</h3><ul>")
+        section_html.append(
+            "<li>Email: <code>provider outlook</code> can use installed Outlook desktop on Windows. "
+            "For SMTP send-now, use assistant tool action <code>send_email</code> with SMTP credentials.</li>"
+        )
+        section_html.append(
+            "<li>Telegram: requires bot token and chat_id in command.</li>"
+        )
+        section_html.append(
+            "<li>WhatsApp text command uses WhatsApp Web mode. For API mode, use tool action "
+            "<code>send_whatsapp</code> with Twilio fields.</li>"
+        )
+        section_html.append("</ul>")
 
         section_html.append("<h3>Memory Agent Commands</h3><ul>")
         section_html.append("<li><code>python -m aiassistant.infra.memory_agent --once</code></li>")
@@ -682,6 +1263,36 @@ class AssistantMainWindow(QMainWindow):
             parts.append(f"<p><b>[{ts}] {role}</b> <i>({cat})</i><br>{msg}</p>")
 
         self.history_box.setHtml("".join(parts))
+
+    def on_delete_selected_history_session(self) -> None:
+        session_id = str(self.history_session_combo.currentData() or "").strip()
+        if not session_id:
+            return
+
+        if session_id == self.agent.session_id:
+            QMessageBox.information(
+                self,
+                "History",
+                "Current active session cannot be deleted. Select a past session.",
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Delete Session",
+            "Delete this past session and all its messages? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        if self.db.delete_session_history(session_id):
+            self._refresh_history_sessions()
+            self._select_current_session_in_history()
+            self._load_selected_session_history()
+            self._append_chat("System", f"Deleted history session {session_id}.")
+        else:
+            QMessageBox.warning(self, "History", "Selected session could not be deleted.")
 
     # --- styles ---
     def _apply_styles(self) -> None:
@@ -757,12 +1368,41 @@ class AssistantMainWindow(QMainWindow):
         self._set_checkbox_checked(self.tts_toggle, bool(self.preferences.get("tts_enabled", True)))
         self._set_checkbox_checked(self.desktop_mate_toggle, bool(self.preferences.get("desktop_mate_enabled", False)))
 
+        if self.force_disable_screen_capture:
+            self._set_checkbox_checked(self.screen_toggle, False)
+            self.screen_toggle.setEnabled(False)
+        if self.force_disable_screen_preview:
+            self._set_checkbox_checked(self.screen_preview_toggle, False)
+            self.screen_preview_toggle.setEnabled(False)
+        if self.force_disable_voice_input:
+            self._set_checkbox_checked(self.voice_toggle, False)
+            self.voice_toggle.setEnabled(False)
+            self.voice_mode_btn.setEnabled(False)
+        if self.force_disable_tts:
+            self._set_checkbox_checked(self.tts_toggle, False)
+            self.tts_toggle.setEnabled(False)
+        if self.force_disable_rag:
+            self._set_checkbox_checked(self.rag_toggle, False)
+            self.rag_toggle.setEnabled(False)
+
+        behavior_index = self.prompt_behavior_combo.findData(self.system_prompt_behavior)
+        if behavior_index < 0:
+            behavior_index = self.prompt_behavior_combo.findData("default")
+        if behavior_index >= 0:
+            self.prompt_behavior_combo.setCurrentIndex(behavior_index)
+        self.prompt_custom_input.setPlainText(self.system_prompt_custom)
+        self.agent.set_system_prompt_behavior(
+            self.system_prompt_behavior,
+            self.system_prompt_custom,
+        )
+
         self.agent.set_screen_capture_enabled(self.screen_toggle.isChecked())
         self.agent.set_rag_enabled(self.rag_toggle.isChecked())
 
         self._set_voice_input_enabled(self.voice_toggle.isChecked(), announce=False)
         self._set_screen_preview_enabled(self.screen_preview_toggle.isChecked(), announce=False)
         self._set_desktop_mate_enabled(self.desktop_mate_toggle.isChecked(), announce=False)
+        self._refresh_chat_view_visibility()
         self._sync_preference_checkbox_states()
         self._refresh_tts_status_label()
 
@@ -797,7 +1437,10 @@ class AssistantMainWindow(QMainWindow):
                 return str(candidate.resolve())
         return None
 
-    def _create_tts_engine(self, profile: str, speaking_speed: float) -> TextToSpeechEngine:
+    def _create_tts_engine(self, profile: str, speaking_speed: float) -> object:
+        if self.force_disable_tts:
+            return TextToSpeechEngine(mode="silent", speaking_speed=speaking_speed)
+
         piper_exe = self._detect_piper_executable()
         clean_profile = (profile or "system_default").strip()
 
@@ -843,14 +1486,15 @@ class AssistantMainWindow(QMainWindow):
                 f"character:{char_id}",
             )
 
-        for voice in TextToSpeechEngine.list_system_voices():
-            voice_id = str(voice.get("id", "")).strip()
-            voice_name = str(voice.get("name", voice_id)).strip()
-            if voice_id:
-                self.voice_profile_combo.addItem(
-                    f"System voice: {voice_name}",
-                    f"pyttsx3:{voice_id}",
-                )
+        if not self.force_disable_tts and not _BOOT_SKIP_MEDIA_STACK:
+            for voice in TextToSpeechEngine.list_system_voices():
+                voice_id = str(voice.get("id", "")).strip()
+                voice_name = str(voice.get("name", voice_id)).strip()
+                if voice_id:
+                    self.voice_profile_combo.addItem(
+                        f"System voice: {voice_name}",
+                        f"pyttsx3:{voice_id}",
+                    )
 
         index = self.voice_profile_combo.findData(self.voice_profile)
         if index < 0:
@@ -898,6 +1542,8 @@ class AssistantMainWindow(QMainWindow):
             "rag_enabled": self.rag_toggle.isChecked(),
             "desktop_mate_enabled": self.desktop_mate_toggle.isChecked(),
             "speaking_speed": self.speaking_speed,
+            "system_prompt_behavior": self.system_prompt_behavior,
+            "system_prompt_custom": self.system_prompt_custom,
         }
         if extra:
             payload.update(extra)
@@ -911,7 +1557,23 @@ class AssistantMainWindow(QMainWindow):
             self.face_placeholder.setText(message)
             self.face_placeholder.show()
 
+    def _set_live2d_rendering_enabled(self, enabled: bool) -> None:
+        if self.anim_timer is None:
+            return
+
+        if enabled and self.model is not None:
+            if not self.anim_timer.isActive():
+                self.anim_timer.start(16)
+            return
+
+        if self.anim_timer.isActive():
+            self.anim_timer.stop()
+
     def init_live2d_embedding(self) -> None:
+        if not self.live2d_enabled:
+            self._set_avatar_status("Avatar disabled for stability mode.")
+            return
+
         if not LIVE2D_AVAILABLE:
             self._set_avatar_status("Avatar unavailable: missing live2d/pygame/win32 dependencies.")
             self._append_chat("System", "Live2D runtime is unavailable in this environment.")
@@ -968,7 +1630,7 @@ class AssistantMainWindow(QMainWindow):
             if self.anim_timer is None:
                 self.anim_timer = QTimer(self)
                 self.anim_timer.timeout.connect(self.update_live2d_frame)
-            self.anim_timer.start(16)
+            self._set_live2d_rendering_enabled(True)
 
             self._append_chat("System", "Avatar loaded.")
         except Exception as exc:
@@ -1031,29 +1693,155 @@ class AssistantMainWindow(QMainWindow):
             suffix = " | " + " | ".join(extra)
         self.status_label.setText(f"Status: {self._status_core}{suffix}")
 
+    @staticmethod
+    def _normalize_command_text(text: str) -> str:
+        lowered = str(text or "").lower()
+        lowered = re.sub(r"[^a-z0-9\s]", " ", lowered)
+        return re.sub(r"\s+", " ", lowered).strip()
+
+    def _is_cancel_command(self, normalized: str) -> bool:
+        if not normalized:
+            return False
+        cancel_phrases = {
+            "stop",
+            "cancel",
+            "stop process",
+            "cancel process",
+            "stop response",
+            "cancel response",
+            "stop now",
+            "cancel now",
+        }
+        if normalized in cancel_phrases:
+            return True
+        return bool(re.fullmatch(r"(stop|cancel)(\s+the)?(\s+current)?(\s+voice|\s+process|\s+response)?", normalized))
+
+    def _try_handle_local_ui_command(self, raw_text: str, source: str) -> bool:
+        normalized = self._normalize_command_text(raw_text)
+        if not normalized:
+            return False
+
+        if self._is_cancel_command(normalized):
+            self._cancel_all_processing(source=f"{source} command")
+            return True
+
+        if (
+            "hide character" in normalized
+            or "hide chara" in normalized
+            or "hide avatar" in normalized
+        ):
+            self._set_avatar_hidden(True)
+            return True
+
+        if (
+            "show character" in normalized
+            or "show chara" in normalized
+            or "show avatar" in normalized
+        ):
+            self._set_avatar_hidden(False)
+            return True
+
+        if "just chat" in normalized or "chat only" in normalized:
+            self._apply_chat_view_mode("chat_only")
+            return True
+
+        if "mini box" in normalized or "mini mode" in normalized or normalized == "mini":
+            self._apply_chat_view_mode("mini")
+            return True
+
+        if (
+            "full mode" in normalized
+            or "normal mode" in normalized
+            or "show all" in normalized
+            or "full view" in normalized
+        ):
+            self._apply_chat_view_mode("full")
+            return True
+
+        return False
+
+    def _cancel_all_processing(self, source: str) -> None:
+        worker_running = bool(self.worker and self.worker.isRunning())
+
+        self.agent.stop()
+        self._cancel_pending_reset = worker_running
+        self._discard_next_agent_reply = worker_running
+        self._latest_user_text = ""
+
+        try:
+            self.tts.interrupt()
+        except Exception:
+            pass
+
+        self.speech.stop_background_listening()
+        self.speech.stop_wake_word_listener()
+        if self.voice_toggle.isChecked():
+            QTimer.singleShot(180, self._restart_voice_listeners_if_enabled)
+
+        if not worker_running:
+            self.agent.reset_stop()
+            self._cancel_pending_reset = False
+
+        self._set_status_core("Cancellation requested")
+        self._append_chat("System", f"Cancelled current process ({source}).")
+
+    def _restart_voice_listeners_if_enabled(self) -> None:
+        if not self.voice_toggle.isChecked():
+            return
+        self._start_voice_listener_backend()
+
     # --- chat actions ---
     def on_send_clicked(self) -> None:
-        if self.worker and self.worker.isRunning():
-            self._set_status_core("Busy processing current request")
-            return
-
         message = self.input_line.text().strip()
         if not message:
             return
 
-        self.agent.reset_stop()
         self.input_line.clear()
         self._append_chat("You", message)
 
-        if self.allow_legacy_text_actions:
+        if self._try_handle_local_ui_command(message, source="text"):
+            return
+
+        if self.worker and self.worker.isRunning():
+            self._set_status_core("Busy processing current request")
+            return
+
+        self.agent.reset_stop()
+        self._discard_next_agent_reply = False
+        self._cancel_pending_reset = False
+        self._latest_user_text = message
+
+        legacy_candidate = _looks_like_legacy_action_command(message)
+        allow_isolated_action = False
+        if legacy_candidate:
+            if self.allow_legacy_text_actions:
+                allow_isolated_action = True
+            elif (
+                self.force_disable_legacy_actions
+                and self.allow_stability_safe_actions
+                and _looks_like_stability_safe_action_command(message)
+            ):
+                allow_isolated_action = True
+
+        if allow_isolated_action:
+            avatar_was_running = bool(
+                self.anim_timer is not None and self.anim_timer.isActive()
+            )
+            if avatar_was_running:
+                self._set_live2d_rendering_enabled(False)
             try:
-                if self.actions is None:
-                    self.actions = ActionHandler()
-                action_result = self.actions.execute_and_collect(message)
-                if action_result:
-                    self._append_chat("Action", action_result)
-            except Exception as exc:
-                self._append_chat("System", f"Action module error: {exc}")
+                ok, action_result = run_action_command_isolated(message)
+            finally:
+                if avatar_was_running:
+                    self._set_live2d_rendering_enabled(True)
+
+            if action_result:
+                self._append_chat("Action" if ok else "Action Error", action_result)
+                # Keep software-control commands isolated from in-process tool execution.
+                self._set_status_core("Ready")
+                return
+
+            # No meaningful action output: continue with reasoning path as fallback.
 
         self.worker = AgentWorker(self.agent, message)
         self.worker.finished_text.connect(self._on_agent_reply)
@@ -1064,17 +1852,22 @@ class AssistantMainWindow(QMainWindow):
         self._set_status_core("Thinking")
 
     def on_stop_clicked(self) -> None:
-        self.agent.stop()
-        self._set_status_core("STOP signal sent")
-        self._append_chat("System", "Stop signal delivered. Current process will halt safely.")
+        self._cancel_all_processing(source="stop button")
 
     def on_resume_clicked(self) -> None:
+        if self.worker and self.worker.isRunning():
+            self._append_chat("System", "Wait for the current worker to finish cancelling.")
+            return
         self.agent.reset_stop()
+        self._cancel_pending_reset = False
+        self._discard_next_agent_reply = False
         self._set_status_core("Ready")
         self._append_chat("System", "Processing resumed.")
 
     # --- toggle handlers ---
     def _set_screen_input_enabled(self, enabled: bool, announce: bool = True) -> None:
+        if self.force_disable_screen_capture:
+            enabled = False
         enabled = bool(enabled)
         self._set_checkbox_checked(self.screen_toggle, enabled)
         self.agent.set_screen_capture_enabled(enabled)
@@ -1087,6 +1880,8 @@ class AssistantMainWindow(QMainWindow):
         self._set_screen_input_enabled(state == Qt.Checked)
 
     def _set_screen_preview_enabled(self, enabled: bool, announce: bool = True) -> None:
+        if self.force_disable_screen_preview:
+            enabled = False
         enabled = bool(enabled)
         if enabled and not PYAUTOGUI_AVAILABLE:
             QMessageBox.warning(
@@ -1114,7 +1909,31 @@ class AssistantMainWindow(QMainWindow):
     def on_screen_preview_toggle_changed(self, state: int) -> None:
         self._set_screen_preview_enabled(state == Qt.Checked)
 
+    def _start_voice_listener_backend(self) -> str:
+        # Ensure listener backends are not duplicated.
+        self.speech.stop_background_listening()
+        self.speech.stop_wake_word_listener()
+
+        wake_backend = "none"
+        wake_backend = "pvporcupine"
+        started = self.speech.start_wake_word_listener(
+            callback=self._on_wake_word_detected,
+            wake_phrase="hey agent",
+        )
+        if not started:
+            wake_backend = "speech-fallback"
+            self.speech.start_background_listening(
+                callback=lambda text: self.speech_bridge.transcribed.emit(text),
+                wake_words=self.wake_words,
+                allow_online_fallback=self.voice_allow_online_fallback,
+            )
+
+        return wake_backend
+
     def _set_voice_input_enabled(self, enabled: bool, announce: bool = True) -> None:
+        if self.force_disable_voice_input:
+            enabled = False
+
         enabled = bool(enabled)
         if enabled and not self.speech.available:
             speech_status = self.speech.get_status()
@@ -1127,24 +1946,12 @@ class AssistantMainWindow(QMainWindow):
 
         self._set_checkbox_checked(self.voice_toggle, enabled)
 
-        # Ensure listener backends are not duplicated.
-        self.speech.stop_background_listening()
-        self.speech.stop_wake_word_listener()
-
         wake_backend = "none"
         if enabled:
-            wake_backend = "pvporcupine"
-            started = self.speech.start_wake_word_listener(
-                callback=self._on_wake_word_detected,
-                wake_phrase="hey agent",
-            )
-            if not started:
-                wake_backend = "speech-fallback"
-                self.speech.start_background_listening(
-                    callback=lambda text: self.speech_bridge.transcribed.emit(text),
-                    wake_words=self.wake_words,
-                    allow_online_fallback=self.voice_allow_online_fallback,
-                )
+            wake_backend = self._start_voice_listener_backend()
+        else:
+            self.speech.stop_background_listening()
+            self.speech.stop_wake_word_listener()
 
         self.voice_mode = "Voice-Active" if enabled else "Silent-Command"
         self._update_voice_mode_button()
@@ -1170,22 +1977,29 @@ class AssistantMainWindow(QMainWindow):
         self._append_chat("System", f"Voice mode switched to {mode}.")
 
     def _on_wake_word_detected(self) -> None:
-        if self.worker and self.worker.isRunning():
-            return
-
         heard = self.speech.listen_once(
             timeout=3.0,
             phrase_time_limit=8.0,
             wake_words=None,
             allow_online_fallback=self.voice_allow_online_fallback,
         )
-        if heard:
-            self.speech_bridge.transcribed.emit(heard)
+        if not heard:
+            return
+
+        if self.worker and self.worker.isRunning():
+            candidate = self._strip_wake_word_prefix(heard)
+            if self._is_cancel_command(self._normalize_command_text(candidate)):
+                self.speech_bridge.transcribed.emit(heard)
+            return
+
+        self.speech_bridge.transcribed.emit(heard)
 
     def on_voice_toggle_changed(self, state: int) -> None:
         self._set_voice_input_enabled(state == Qt.Checked)
 
     def _set_rag_enabled(self, enabled: bool, announce: bool = True) -> None:
+        if self.force_disable_rag:
+            enabled = False
         enabled = bool(enabled)
         self._set_checkbox_checked(self.rag_toggle, enabled)
         self.agent.set_rag_enabled(enabled)
@@ -1198,6 +2012,9 @@ class AssistantMainWindow(QMainWindow):
         self._set_rag_enabled(state == Qt.Checked)
 
     def _set_tts_enabled(self, enabled: bool, announce: bool = True) -> None:
+        if self.force_disable_tts:
+            enabled = False
+
         enabled = bool(enabled)
         self._set_checkbox_checked(self.tts_toggle, enabled)
         self._sync_preference_checkbox_states()
@@ -1207,6 +2024,78 @@ class AssistantMainWindow(QMainWindow):
 
     def on_tts_toggle_changed(self, state: int) -> None:
         self._set_tts_enabled(state == Qt.Checked)
+
+    def _refresh_chat_view_visibility(self) -> None:
+        mode = self.chat_view_mode
+        show_full_controls = mode == "full"
+        show_avatar = (
+            show_full_controls
+            and (not self.avatar_hidden)
+            and (not self.desktop_mate_toggle.isChecked())
+        )
+
+        if hasattr(self, "tabs"):
+            self.tabs.setCurrentWidget(self.chat_tab)
+            self.tabs.tabBar().setVisible(show_full_controls)
+
+        if hasattr(self, "face_container"):
+            self.face_container.setVisible(show_avatar)
+        self._set_live2d_rendering_enabled(self.live2d_enabled and show_avatar)
+
+        for widget in getattr(self, "_chat_optional_controls", []):
+            widget.setVisible(show_full_controls)
+
+        if hasattr(self, "screen_preview_label"):
+            self.screen_preview_label.setVisible(show_full_controls)
+
+        if show_full_controls and self.screen_preview_toggle.isChecked():
+            self.screen_preview_timer.start()
+            self._refresh_screen_preview()
+        else:
+            self.screen_preview_timer.stop()
+            if hasattr(self, "screen_preview_label"):
+                self.screen_preview_label.setPixmap(QPixmap())
+                self.screen_preview_label.setText("Live screen preview is disabled.")
+
+        if hasattr(self, "status_label"):
+            self.status_label.setVisible(mode != "mini")
+
+    def _apply_chat_view_mode(self, mode: str, announce: bool = True) -> None:
+        normalized = str(mode or "").strip().lower()
+        if normalized not in {"full", "chat_only", "mini"}:
+            normalized = "full"
+
+        self.chat_view_mode = normalized
+        self._refresh_chat_view_visibility()
+
+        if not self.desktop_mate_toggle.isChecked():
+            if normalized == "mini":
+                self.resize(560, 420)
+            elif normalized == "chat_only":
+                self.resize(920, 700)
+            else:
+                self.resize(1180, 780)
+
+        if normalized == "mini":
+            self.raise_()
+            self.activateWindow()
+
+        if announce:
+            labels = {
+                "full": "Full view mode enabled.",
+                "chat_only": "Chat-only mode enabled.",
+                "mini": "Mini box mode enabled.",
+            }
+            self._append_chat("System", labels.get(normalized, "View mode updated."))
+
+    def _set_avatar_hidden(self, hidden: bool, announce: bool = True) -> None:
+        self.avatar_hidden = bool(hidden)
+        if hasattr(self, "avatar_toggle_btn"):
+            self.avatar_toggle_btn.setText("Show Character" if self.avatar_hidden else "Hide Character")
+        self._refresh_chat_view_visibility()
+        if announce:
+            state = "hidden" if self.avatar_hidden else "visible"
+            self._append_chat("System", f"Character is now {state}.")
 
     def _set_desktop_mate_enabled(self, enabled: bool, announce: bool = True) -> None:
         enabled = bool(enabled)
@@ -1272,8 +2161,27 @@ class AssistantMainWindow(QMainWindow):
 
     # --- worker callbacks ---
     def _on_agent_reply(self, text: str) -> None:
+        if self._discard_next_agent_reply:
+            self._discard_next_agent_reply = False
+            self._append_chat("System", "Response cancelled.")
+            self._latest_user_text = ""
+            return
+
         safe_text = self.agent.clean_output_for_ui(text)
-        self._append_chat("Assistant", safe_text)
+        if safe_text:
+            self._append_chat("Assistant", safe_text)
+
+        auto_saved = self.db.auto_store_important_conversation_data(
+            user_id=self.current_user_id,
+            user_text=self._latest_user_text,
+            assistant_text=safe_text,
+        )
+        if auto_saved:
+            preview_items = [f"{item.get('key')}={item.get('value')}" for item in auto_saved[:3]]
+            preview = "; ".join(preview_items)
+            self._append_chat("System", f"[RAD auto-saved] {preview}")
+            self._load_rad_table()
+        self._latest_user_text = ""
 
         self._refresh_history_sessions()
         self._select_current_session_in_history()
@@ -1290,9 +2198,18 @@ class AssistantMainWindow(QMainWindow):
                 self._tts_unavailable_notified = True
 
     def _on_agent_error(self, err: str) -> None:
+        if self._discard_next_agent_reply:
+            self._discard_next_agent_reply = False
+            self._latest_user_text = ""
+            return
+
+        self._latest_user_text = ""
         self._append_chat("System", err)
 
     def _on_worker_finished(self) -> None:
+        if self._cancel_pending_reset:
+            self.agent.reset_stop()
+            self._cancel_pending_reset = False
         self._set_status_core("Ready")
 
     def _strip_wake_word_prefix(self, text: str) -> str:
@@ -1315,6 +2232,9 @@ class AssistantMainWindow(QMainWindow):
             return
 
         self._append_chat("Mic", cleaned)
+        if self._try_handle_local_ui_command(cleaned, source="voice"):
+            return
+
         if self.worker and self.worker.isRunning():
             return
 
@@ -1333,9 +2253,21 @@ class AssistantMainWindow(QMainWindow):
             self.model_path_input.setText(file_name)
 
     def on_test_voice_clicked(self) -> None:
+        if self.force_disable_tts:
+            self._append_chat("System", "Voice test is disabled in stability mode.")
+            return
+
         self.tts.speak("Voice test successful. Settings were applied.")
 
     def on_reload_avatar_clicked(self) -> None:
+        if not self.live2d_enabled:
+            QMessageBox.information(
+                self,
+                "Avatar",
+                "Avatar is disabled for stability. Set ui.enable_live2d: true in config.yaml and restart to enable.",
+            )
+            return
+
         if self.anim_timer is not None:
             self.anim_timer.stop()
         if LIVE2D_AVAILABLE:
@@ -1362,6 +2294,15 @@ class AssistantMainWindow(QMainWindow):
 
         self.agent.set_reasoning_model(self.reasoning_model)
         self.agent.set_vision_model(self.vision_model)
+
+        self.system_prompt_behavior = str(
+            self.prompt_behavior_combo.currentData() or "default"
+        ).strip().lower() or "default"
+        self.system_prompt_custom = self.prompt_custom_input.toPlainText().strip()
+        self.agent.set_system_prompt_behavior(
+            self.system_prompt_behavior,
+            self.system_prompt_custom,
+        )
 
         new_voice_profile = str(self.voice_profile_combo.currentData() or "system_default")
         voice_changed = new_voice_profile != self.voice_profile
@@ -1390,6 +2331,8 @@ class AssistantMainWindow(QMainWindow):
                 "preferred_vision_model": self.vision_model,
                 "preferred_live2d_model": self.model_path,
                 "speaking_speed": self.speaking_speed,
+                "system_prompt_behavior": self.system_prompt_behavior,
+                "system_prompt_custom": self.system_prompt_custom,
             }
         )
         self._refresh_tts_status_label()
@@ -1468,21 +2411,25 @@ class AssistantMainWindow(QMainWindow):
             self.setAttribute(Qt.WA_TranslucentBackground, True)
             self.setWindowOpacity(0.93)
             self.resize(760, 560)
-            if hasattr(self, "face_container"):
-                self.face_container.hide()
         else:
             flags = Qt.Window
             self.setWindowFlags(flags)
             self.setAttribute(Qt.WA_TranslucentBackground, False)
             self.setWindowOpacity(1.0)
-            self.resize(1180, 780)
-            if hasattr(self, "face_container"):
-                self.face_container.show()
+            if self.chat_view_mode == "mini":
+                self.resize(560, 420)
+            elif self.chat_view_mode == "chat_only":
+                self.resize(920, 700)
+            else:
+                self.resize(1180, 780)
+
+        self._refresh_chat_view_visibility()
 
         self.show()
 
     # --- lifecycle ---
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        _write_boot_trace("window:close_event")
         try:
             self.agent.stop()
             self.camera.stop()
@@ -1518,15 +2465,20 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    _write_boot_trace("main:start")
     args = _parse_args()
+    _write_boot_trace("main:args_parsed")
 
     if args.reset_login:
         clear_auto_login_user()
+        _write_boot_trace("main:reset_login_exit")
         print("[LOGIN] Remembered auto-login cleared.")
         return
 
     app = QApplication(sys.argv)
+    _write_boot_trace("main:qapplication_created")
     db = DatabaseManager(db_path=str(CONFIG.get("paths", {}).get("db_path", "cache/assistant_sessions.db")))
+    _write_boot_trace("main:database_ready")
 
     auth_data: Optional[Dict[str, object]] = None
 
@@ -1538,12 +2490,15 @@ def main() -> None:
                 clear_auto_login_user()
 
     if auth_data is None:
+        _write_boot_trace("main:login_dialog_open")
         login = LoginDialog(db)
         if login.exec_() != QDialog.Accepted or not login.auth_result:
+            _write_boot_trace("main:login_cancelled")
             db.close()
             return
 
         auth_data = login.auth_result
+        _write_boot_trace("main:login_success")
         if login.remember_cb.isChecked():
             save_auto_login_user(int(auth_data.get("user_id", 0)))
         else:
@@ -1552,10 +2507,14 @@ def main() -> None:
     user_id = int(auth_data.get("user_id", 0))
     username = str(auth_data.get("username", "user"))
 
+    _write_boot_trace("main:window_init_start")
     window = AssistantMainWindow(db=db, user_id=user_id, username=username)
     window.show()
+    _write_boot_trace("main:window_shown")
 
+    _write_boot_trace("main:event_loop_enter")
     exit_code = app.exec_()
+    _write_boot_trace(f"main:event_loop_exit code={exit_code}")
     db.close()
     sys.exit(exit_code)
 

@@ -72,6 +72,7 @@ voice:
 ui:
   theme: dark
   transparent_face: false
+  enable_live2d: true
 
 vision:
   screen_share_enabled: false

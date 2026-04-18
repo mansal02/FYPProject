@@ -1,0 +1,9 @@
+2026-04-18 09:14:35 pid=16928 step=module:loaded stability=2 safe_minimal=1 skip_media=1
+2026-04-18 09:14:35 pid=16928 step=module:voice_db_loaded
+2026-04-18 09:14:35 pid=16928 step=main:start
+2026-04-18 09:14:35 pid=16928 step=main:args_parsed
+2026-04-18 09:14:35 pid=16928 step=main:qapplication_created
+2026-04-18 09:14:35 pid=16928 step=main:database_ready
+2026-04-18 09:14:35 pid=16928 step=main:login_dialog_open
+2026-04-18 09:28:04 pid=14092 step=module:loaded stability=2 safe_minimal=1 skip_media=1
+2026-04-18 09:28:04 pid=14092 step=module:voice_db_loaded

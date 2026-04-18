@@ -94,6 +94,7 @@ _DEFAULT_CONFIG = {
     "ui": {
         "theme": "dark",
         "transparent_face": False,
+        "enable_live2d": False,
     },
     "vision": {
         "screen_share_enabled": False,
@@ -200,6 +201,12 @@ def load_config():
         config["voice"].get("speaking_speed", 1.0),
     )
     config["ui"]["theme"] = os.environ.get("MARIE_UI_THEME", config["ui"].get("theme", "dark"))
+    config["ui"]["enable_live2d"] = _as_bool(
+        os.environ.get("MARIE_ENABLE_LIVE2D"),
+        config["ui"].get("enable_live2d", False),
+    )
+    if _as_bool(os.environ.get("MARIE_DISABLE_LIVE2D"), False):
+        config["ui"]["enable_live2d"] = False
 
     config["voice"]["enable_openwakeword"] = _as_bool(
         os.environ.get("MARIE_ENABLE_OPENWAKEWORD"),

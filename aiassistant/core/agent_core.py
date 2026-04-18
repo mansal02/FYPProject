@@ -13,10 +13,40 @@ import gc
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+
+def _bootstrap_env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _bootstrap_env_int(name: str, default: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return int(default)
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return int(default)
+
+
+_BOOT_STABILITY_MODE_LEVEL = max(0, _bootstrap_env_int("MARIE_STABILITY_MODE_LEVEL", 0))
+_BOOT_DISABLE_SCREEN_CAPTURE = _bootstrap_env_bool("MARIE_DISABLE_SCREEN_CAPTURE", False)
+_BOOT_DISABLE_RAG = _bootstrap_env_bool("MARIE_DISABLE_RAG", False)
+_BOOT_SAFE_MINIMAL = _bootstrap_env_bool("MARIE_SAFE_MINIMAL", False)
 
 try:
     import ollama
@@ -28,20 +58,38 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     requests = None
 
-try:
-    import torch
-except Exception:  # pragma: no cover - optional dependency
-    torch = None
+torch = None
+if _BOOT_STABILITY_MODE_LEVEL < 2 and not _BOOT_SAFE_MINIMAL:
+    try:
+        import torch
+    except Exception:  # pragma: no cover - optional dependency
+        torch = None
 
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.db.database_manager import DatabaseManager
-try:
-    from aiassistant.infra.rag_memory import get_rag_context
-except Exception:  # pragma: no cover - optional dependency path
-    get_rag_context = None
 
-from aiassistant.infra.vision.vision_audio import capture_screen_base64_jpeg
-from aiassistant.tools.tools_os import run_tool_action
+get_rag_context = None
+if not (_BOOT_DISABLE_RAG or _BOOT_SAFE_MINIMAL):
+    try:
+        from aiassistant.infra.rag_memory import get_rag_context
+    except Exception:  # pragma: no cover - optional dependency path
+        get_rag_context = None
+
+
+def capture_screen_base64_jpeg(quality: int = 65):
+    _ = quality
+    return None
+
+
+if not (_BOOT_DISABLE_SCREEN_CAPTURE or _BOOT_SAFE_MINIMAL or _BOOT_STABILITY_MODE_LEVEL >= 2):
+    try:
+        from aiassistant.infra.vision.vision_audio import (
+            capture_screen_base64_jpeg as _capture_screen_base64_jpeg,
+        )
+
+        capture_screen_base64_jpeg = _capture_screen_base64_jpeg
+    except Exception:
+        pass
 
 
 # Process-level defaults. Launcher also injects these into child processes.
@@ -63,12 +111,97 @@ SYSTEM_PROMPT = (
     "For analysis or execution requests, perform the task and report outcomes. "
     "If asked to analyze files, folders, or the PC, provide practical findings. "
     "Use tools only when needed. If you need a tool, emit JSON inside <tool>...</tool> with one action object. "
-    "Supported actions: search_file, semantic_search_file, read_file, open_file, move_mouse, click, "
-    "type_text, press_key, hotkey, run_command, toggle_dark_mode, draft_email_attachment, online_query. "
+    "Supported actions: list_system_roots, list_directory, deep_search, analyze_path, create_path, move_path, "
+    "copy_path, delete_path, search_file, semantic_search_file, read_file, open_file, launch_application, "
+    "close_application, list_running_apps, open_service, move_mouse, click, type_text, press_key, hotkey, "
+    "run_command, toggle_dark_mode, send_email, draft_email_attachment, send_telegram, send_whatsapp, "
+    "online_query. "
     "Do not include JSON or tool syntax in normal user-facing replies. "
     "For simple requests, answer in easy plain language and keep it direct. "
     "For complex requests, provide enough detail to be useful without over-explaining."
 )
+
+PROMPT_BEHAVIOR_HINTS = {
+    "default": "",
+    "concise": (
+        "Prefer concise answers by default. Keep most responses to a few short sentences unless the user asks for detail."
+    ),
+    "detailed": (
+        "Provide richer explanations and rationale when useful. Include structured steps for complex requests."
+    ),
+    "action_first": (
+        "Prioritize concrete actions and outcomes before explanation. Lead with what was done or what should be done next."
+    ),
+    "custom": "",
+}
+
+
+def _run_tool_action_isolated(action: Dict[str, object], timeout_sec: int = 55) -> Dict[str, object]:
+    try:
+        payload = json.dumps(action, ensure_ascii=True)
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": "Failed to serialize tool action.",
+            "error": str(exc),
+        }
+
+    command = [
+        sys.executable,
+        "-m",
+        "aiassistant.tools.tool_action_runner",
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=max(5, int(timeout_sec)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "message": "Tool action timed out in isolated runner.",
+            "error": "runner_timeout",
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": "Tool action runner failed to start.",
+            "error": str(exc),
+        }
+
+    stdout_text = (completed.stdout or "").strip()
+    stderr_text = (completed.stderr or "").strip()
+
+    candidates = [line.strip() for line in stdout_text.splitlines() if line.strip()]
+    if stdout_text:
+        candidates.append(stdout_text)
+
+    for candidate in reversed(candidates):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and "success" in parsed:
+            return parsed
+
+    if completed.returncode == 0 and not stderr_text:
+        return {
+            "success": True,
+            "message": "Tool action completed in isolated runner.",
+            "data": {"output": stdout_text[:1200]},
+        }
+
+    details = "\n".join(part for part in [stdout_text, stderr_text] if part).strip()[:1800]
+    return {
+        "success": False,
+        "message": "Tool action failed in isolated runner.",
+        "error": details or f"runner_exit_code={completed.returncode}",
+    }
 
 
 class LocalContext:
@@ -200,7 +333,9 @@ class OfflineAgentCore:
         self.session_id = self.db.create_session(label="offline_desktop_assistant")
         self.stop_event = threading.Event()
         self.screen_capture_enabled = False
-        self.rag_enabled = bool(self.config.rag_enabled)
+        self.rag_enabled = bool(self.config.rag_enabled) and not (_BOOT_DISABLE_RAG or _BOOT_SAFE_MINIMAL)
+        self.system_prompt_behavior = "default"
+        self.system_prompt_custom = ""
         self.local_context = LocalContext(
             str(CONFIG.get("memory", {}).get("local_context_file", "./cache/memory.json"))
         )
@@ -216,10 +351,24 @@ class OfflineAgentCore:
                 self._client = None
 
     def set_screen_capture_enabled(self, enabled: bool) -> None:
+        if _BOOT_DISABLE_SCREEN_CAPTURE or _BOOT_SAFE_MINIMAL or _BOOT_STABILITY_MODE_LEVEL >= 2:
+            self.screen_capture_enabled = False
+            return
         self.screen_capture_enabled = bool(enabled)
 
     def set_rag_enabled(self, enabled: bool) -> None:
+        if _BOOT_DISABLE_RAG or _BOOT_SAFE_MINIMAL:
+            self.rag_enabled = False
+            return
         self.rag_enabled = bool(enabled)
+
+    def set_system_prompt_behavior(self, behavior: str, custom_prompt: str = "") -> None:
+        clean_behavior = _collapse_ws(behavior).lower()
+        if clean_behavior not in PROMPT_BEHAVIOR_HINTS:
+            clean_behavior = "default"
+
+        self.system_prompt_behavior = clean_behavior
+        self.system_prompt_custom = str(custom_prompt or "").strip()
 
     def set_reasoning_model(self, model_name: str) -> None:
         # Enforced for VRAM safety.
@@ -273,6 +422,9 @@ class OfflineAgentCore:
             rag_context = self._retrieve_rag_context(text)
 
         base_reply = self._reason_over_input(text, recent_history, screen_context, rag_context)
+        if self.stop_event.is_set():
+            return "Request cancelled."
+
         if not base_reply:
             safe_reply = "I could not generate a response right now."
             self.db.log_interaction(self.session_id, role="assistant", message=safe_reply, category="chat")
@@ -350,8 +502,11 @@ class OfflineAgentCore:
         screen_context: str,
         rag_context: str,
     ) -> str:
+        if self.stop_event.is_set():
+            return ""
+
         ltm_text = self.local_context.get_long_term_memory_text()
-        system_prompt = SYSTEM_PROMPT
+        system_prompt = self._build_system_prompt()
         if ltm_text:
             system_prompt += "\n\nLong-Term Memory:\n" + ltm_text
 
@@ -406,11 +561,27 @@ class OfflineAgentCore:
                     },
                     keep_alive=0,
                 )
+            if self.stop_event.is_set():
+                return ""
             return (response.get("message", {}) or {}).get("content", "").strip()
         except Exception as exc:
             return f"I hit a local model error: {exc}"
         finally:
             self._release_vram()
+
+    def _build_system_prompt(self) -> str:
+        base = SYSTEM_PROMPT
+        behavior = (self.system_prompt_behavior or "default").strip().lower()
+        behavior_hint = PROMPT_BEHAVIOR_HINTS.get(behavior, "")
+        custom = self.system_prompt_custom.strip()
+
+        parts = [base]
+        if behavior_hint:
+            parts.append(behavior_hint)
+        if custom:
+            parts.append("Additional behavior override:\n" + custom)
+
+        return "\n\n".join(part for part in parts if part).strip()
 
     def _reason_with_external(self, messages: List[Dict[str, str]]) -> str:
         if requests is None:
@@ -516,7 +687,7 @@ class OfflineAgentCore:
         for action in actions:
             if self.stop_event.is_set():
                 break
-            result = run_tool_action(action)
+            result = _run_tool_action_isolated(action)
             results.append({"action": action, "result": result})
 
             if isinstance(result, dict) and result.get("success"):
