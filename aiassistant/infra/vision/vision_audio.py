@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from difflib import get_close_matches
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
@@ -82,6 +83,83 @@ except Exception:  # pragma: no cover - optional dependency
 
 def _clean_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+VOICE_COMMAND_KEYWORDS: List[str] = [
+    "open",
+    "close",
+    "launch",
+    "start",
+    "run",
+    "search",
+    "find",
+    "locate",
+    "browse",
+    "play",
+    "pause",
+    "stop",
+    "volume",
+    "mute",
+    "unmute",
+    "files",
+    "software",
+    "service",
+]
+
+VOICE_COMMAND_LEAD_CORRECTIONS: Dict[str, str] = {
+    "oven": "open",
+    "openn": "open",
+    "oppen": "open",
+    "opan": "open",
+    "cloze": "close",
+    "clos": "close",
+    "clothes": "close",
+    "lunch": "launch",
+    "serch": "search",
+    "seach": "search",
+    "mutee": "mute",
+    "unmutee": "unmute",
+}
+
+
+def _normalize_command_phrase(text: str) -> str:
+    compact = _clean_whitespace(str(text or ""))
+    if not compact:
+        return ""
+
+    parts = compact.split(" ")
+    lead = re.sub(r"[^a-z0-9]", "", parts[0].lower())
+    if not lead:
+        return compact
+
+    corrected = VOICE_COMMAND_LEAD_CORRECTIONS.get(lead, lead)
+    if corrected not in VOICE_COMMAND_KEYWORDS:
+        match = get_close_matches(corrected, VOICE_COMMAND_KEYWORDS, n=1, cutoff=0.87)
+        if match:
+            corrected = match[0]
+
+    if corrected != lead:
+        parts[0] = corrected
+        return " ".join(parts).strip()
+
+    return compact
+
+
+def _looks_like_command_phrase(text: str) -> bool:
+    normalized = _normalize_command_phrase(text).lower()
+    if not normalized:
+        return False
+
+    lead = normalized.split(" ", 1)[0]
+    if lead in VOICE_COMMAND_KEYWORDS:
+        return True
+
+    return bool(
+        re.search(
+            r"\b(?:open|close|launch|start|run|search|find|locate|browse|play|pause|stop|volume|mute|unmute|files|software|service)\b",
+            normalized,
+        )
+    )
 
 
 def filter_tts_text(text: str) -> str:
@@ -293,12 +371,17 @@ class CameraTracker:
 class SpeechListener:
     """Reliable microphone listener with timeout-guarded loops."""
 
-    def __init__(self, energy_threshold: int = 300, pause_threshold: float = 0.8) -> None:
+    def __init__(self, energy_threshold: int = 650, pause_threshold: float = 0.8) -> None:
         self.available = sr is not None
         self.recognizer = sr.Recognizer() if self.available else None
         self.microphone = None
         self.last_error = ""
         self.offline_backend = "sphinx" if POCKETSPHINX_AVAILABLE else "none"
+        self.energy_threshold_floor = max(600, int(energy_threshold))
+        self._sphinx_keyword_entries = [
+            (word, 1e-20)
+            for word in sorted(set(VOICE_COMMAND_KEYWORDS + ["hey", "agent", "assistant", "marie"]))
+        ]
 
         if self.available:
             try:
@@ -310,7 +393,7 @@ class SpeechListener:
                 self.last_error = f"Microphone initialization failed: {exc}"
 
         if self.recognizer is not None:
-            self.recognizer.energy_threshold = energy_threshold
+            self.recognizer.energy_threshold = self.energy_threshold_floor
             self.recognizer.pause_threshold = pause_threshold
             self.recognizer.dynamic_energy_threshold = True
 
@@ -332,6 +415,7 @@ class SpeechListener:
         phrase_time_limit: float = 6.0,
         wake_words: Optional[list[str]] = None,
         allow_online_fallback: bool = False,
+        allow_commands_without_wake: bool = False,
     ) -> Optional[str]:
         if not self.available or self.recognizer is None or self.microphone is None:
             return None
@@ -340,6 +424,10 @@ class SpeechListener:
             with self.microphone as source:
                 # Short ambient adjustment each call keeps behavior stable in noisy rooms.
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.2)
+                self.recognizer.energy_threshold = max(
+                    self.energy_threshold_floor,
+                    int(float(self.recognizer.energy_threshold)),
+                )
                 audio = self.recognizer.listen(
                     source,
                     timeout=max(0.5, timeout),
@@ -354,11 +442,12 @@ class SpeechListener:
         if not transcript:
             return None
 
-        transcript = transcript.strip().lower()
+        transcript = _normalize_command_phrase(transcript.strip().lower())
         if wake_words:
             normalized = [w.strip().lower() for w in wake_words if w and w.strip()]
             if normalized and not any(w in transcript for w in normalized):
-                return None
+                if not (allow_commands_without_wake and _looks_like_command_phrase(transcript)):
+                    return None
 
         return transcript
 
@@ -367,6 +456,7 @@ class SpeechListener:
         callback: Callable[[str], None],
         wake_words: Optional[list[str]] = None,
         allow_online_fallback: bool = False,
+        allow_commands_without_wake: bool = False,
     ) -> None:
         if not self.available:
             return
@@ -376,7 +466,7 @@ class SpeechListener:
         self._running.set()
         self._thread = threading.Thread(
             target=self._listen_loop,
-            args=(callback, wake_words, allow_online_fallback),
+            args=(callback, wake_words, allow_online_fallback, allow_commands_without_wake),
             daemon=True,
         )
         self._thread.start()
@@ -504,6 +594,7 @@ class SpeechListener:
         callback: Callable[[str], None],
         wake_words: Optional[list[str]],
         allow_online_fallback: bool,
+        allow_commands_without_wake: bool,
     ) -> None:
         while self._running.is_set():
             text = self.listen_once(
@@ -511,6 +602,7 @@ class SpeechListener:
                 phrase_time_limit=6.0,
                 wake_words=wake_words,
                 allow_online_fallback=allow_online_fallback,
+                allow_commands_without_wake=allow_commands_without_wake,
             )
             if text:
                 try:
@@ -523,10 +615,28 @@ class SpeechListener:
         if self.recognizer is None or sr is None:
             return None
 
+        if allow_online_fallback:
+            try:
+                text = self.recognizer.recognize_google(audio)
+                if text:
+                    return text
+            except Exception:
+                pass
+
         # Offline-first path.
         if POCKETSPHINX_AVAILABLE:
             try:
+                if self._sphinx_keyword_entries:
+                    return self.recognizer.recognize_sphinx(
+                        audio,
+                        keyword_entries=self._sphinx_keyword_entries,
+                    )
                 return self.recognizer.recognize_sphinx(audio)
+            except TypeError:
+                try:
+                    return self.recognizer.recognize_sphinx(audio)
+                except Exception:
+                    pass
             except Exception:
                 pass
 

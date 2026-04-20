@@ -82,12 +82,16 @@ _DEFAULT_CONFIG = {
     "voice": {
         "default_character": "tachyon",
         "speaking_speed": 1.0,
+        "whisper_model_size": "base",
+        "energy_threshold": 650,
         "whisper_device": "cpu",
         "enable_faster_whisper": False,
         "wake_word": "hey",
         "always_listen_wake_word_only": True,
         "microphone_hotkey": "F4",
         "summon_hotkey": "ctrl+space",
+        "allow_commands_without_wake_word": True,
+        "allow_online_fallback": True,
         "enable_openwakeword": False,
         "enable_silero_vad": True,
     },
@@ -199,6 +203,27 @@ def load_config():
     config["voice"]["speaking_speed"] = _as_float(
         os.environ.get("MARIE_SPEAKING_SPEED"),
         config["voice"].get("speaking_speed", 1.0),
+    )
+    config["voice"]["energy_threshold"] = max(
+        600,
+        _as_int(
+            os.environ.get("MARIE_VOICE_ENERGY_THRESHOLD"),
+            config["voice"].get("energy_threshold", 650),
+        ),
+    )
+    whisper_size = str(
+        os.environ.get("MARIE_WHISPER_MODEL_SIZE", config["voice"].get("whisper_model_size", "base"))
+    ).strip().lower()
+    if whisper_size not in {"base", "small"}:
+        whisper_size = "base"
+    config["voice"]["whisper_model_size"] = whisper_size
+    config["voice"]["allow_online_fallback"] = _as_bool(
+        os.environ.get("MARIE_ALLOW_ONLINE_FALLBACK"),
+        config["voice"].get("allow_online_fallback", True),
+    )
+    config["voice"]["allow_commands_without_wake_word"] = _as_bool(
+        os.environ.get("MARIE_ALLOW_COMMANDS_WITHOUT_WAKE_WORD"),
+        config["voice"].get("allow_commands_without_wake_word", True),
     )
     config["ui"]["theme"] = os.environ.get("MARIE_UI_THEME", config["ui"].get("theme", "dark"))
     config["ui"]["enable_live2d"] = _as_bool(

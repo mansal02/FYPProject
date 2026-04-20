@@ -59,12 +59,15 @@ memory_agent:
 voice:
   default_character: tachyon
   speaking_speed: 1.0
+  whisper_model_size: base
+  energy_threshold: 650
   whisper_device: cpu
   enable_faster_whisper: false
   wake_word: hey
   always_listen_wake_word_only: true
   microphone_hotkey: F4
   summon_hotkey: ctrl+space
+  allow_commands_without_wake_word: true
   enable_openwakeword: false
   enable_silero_vad: true
   allow_online_fallback: true

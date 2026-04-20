@@ -2,6 +2,7 @@ import os
 import re
 import time
 import speech_recognition as sr
+from difflib import get_close_matches
 from collections import deque
 from PyQt5.QtCore import QThread, pyqtSignal
 from aiassistant.infra.config.app_config import CONFIG
@@ -74,6 +75,89 @@ def _resolve_whisper_device():
 
 
 DEVICE = _resolve_whisper_device()
+ALLOWED_WHISPER_MODEL_SIZES = {"base", "small"}
+DEFAULT_WHISPER_MODEL_SIZE = "base"
+DEFAULT_ENERGY_THRESHOLD = 650
+MIN_ENERGY_THRESHOLD = 600
+DEFAULT_BEAM_SIZE = 5
+DEFAULT_COMMAND_HINT = "open close launch start run search find locate files software service open website volume mute unmute"
+VOICE_COMMAND_KEYWORDS = [
+    "open",
+    "close",
+    "launch",
+    "start",
+    "run",
+    "search",
+    "find",
+    "locate",
+    "browse",
+    "play",
+    "pause",
+    "stop",
+    "volume",
+    "mute",
+    "unmute",
+    "software",
+    "service",
+    "files",
+    "email",
+    "telegram",
+    "whatsapp",
+]
+VOICE_COMMAND_LEAD_CORRECTIONS = {
+    "oven": "open",
+    "openn": "open",
+    "oppen": "open",
+    "opan": "open",
+    "cloze": "close",
+    "clos": "close",
+    "clothes": "close",
+    "lunch": "launch",
+    "serch": "search",
+    "seach": "search",
+    "mutee": "mute",
+    "unmutee": "unmute",
+}
+
+
+def _normalize_transcribed_command(text):
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not compact:
+        return ""
+
+    parts = compact.split(" ")
+    lead = re.sub(r"[^a-z0-9]", "", parts[0].lower())
+    if not lead:
+        return compact
+
+    corrected = VOICE_COMMAND_LEAD_CORRECTIONS.get(lead, lead)
+    if corrected not in VOICE_COMMAND_KEYWORDS:
+        match = get_close_matches(corrected, VOICE_COMMAND_KEYWORDS, n=1, cutoff=0.87)
+        if match:
+            corrected = match[0]
+
+    if corrected != lead:
+        parts[0] = corrected
+        return " ".join(parts).strip()
+
+    return compact
+
+
+def _looks_like_voice_command(text):
+    normalized = _normalize_transcribed_command(text).lower()
+    if not normalized:
+        return False
+
+    lead = normalized.split(" ", 1)[0]
+    if lead in VOICE_COMMAND_KEYWORDS:
+        return True
+
+    return bool(
+        re.search(
+            r"\b(?:open|close|launch|start|run|search|find|locate|browse|play|pause|stop|volume|mute|unmute|files|software|service)\b",
+            normalized,
+        )
+    )
 
 load_silero_vad = None
 read_audio = None
@@ -153,13 +237,30 @@ class VoiceWorker(QThread):
         self.keyword_mode = self.always_listen_wake_word_only
         self.running = True
         self.auto_paused = False
-        self.model_size = model_size
+        configured_model_size = str(voice_cfg.get("whisper_model_size", model_size)).strip().lower()
+        self.model_size = (
+            configured_model_size
+            if configured_model_size in ALLOWED_WHISPER_MODEL_SIZES
+            else DEFAULT_WHISPER_MODEL_SIZE
+        )
+        raw_energy_threshold = voice_cfg.get("energy_threshold", DEFAULT_ENERGY_THRESHOLD)
+        try:
+            configured_energy_threshold = int(float(raw_energy_threshold))
+        except (TypeError, ValueError):
+            configured_energy_threshold = DEFAULT_ENERGY_THRESHOLD
+        self.energy_threshold = max(MIN_ENERGY_THRESHOLD, configured_energy_threshold)
+        # Keep Whisper beam size fixed for predictable latency and quality.
+        self.beam_size = DEFAULT_BEAM_SIZE
         self.whisper_device = DEVICE
         self.compute_type = "float16" if self.whisper_device == "cuda" else "int8"
         self.enable_faster_whisper = bool(voice_cfg.get("enable_faster_whisper", False))
         self.enable_silero_vad = bool(voice_cfg.get("enable_silero_vad", True))
         self.enable_openwakeword = bool(voice_cfg.get("enable_openwakeword", False))
+        self.allow_online_fallback = bool(voice_cfg.get("allow_online_fallback", True))
+        self.allow_commands_without_wake_word = bool(voice_cfg.get("allow_commands_without_wake_word", True))
+        self.command_hint = str(voice_cfg.get("command_hint", DEFAULT_COMMAND_HINT)).strip()
         self.wakeword_threshold = float(voice_cfg.get("wakeword_threshold", 0.35))
+        self._sphinx_keyword_entries = self._build_sphinx_keyword_entries()
 
         self._silero_model = None
         if self.enable_silero_vad:
@@ -214,6 +315,55 @@ class VoiceWorker(QThread):
             if candidate != stripped_text:
                 return candidate
         return stripped_text
+
+    def _build_sphinx_keyword_entries(self):
+        entries = []
+        for phrase in sorted(set(self.wake_aliases + VOICE_COMMAND_KEYWORDS)):
+            if phrase:
+                entries.append((phrase, 1e-20))
+        return entries
+
+    def _normalize_for_emit(self, text):
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not compact:
+            return ""
+        if _looks_like_voice_command(compact):
+            return _normalize_transcribed_command(compact)
+        return compact
+
+    def _transcribe_with_speech_recognition(self, recognizer, audio):
+        text = ""
+
+        if self.allow_online_fallback:
+            try:
+                text = recognizer.recognize_google(audio).strip()
+            except Exception:
+                text = ""
+
+        if not text:
+            try:
+                if self._sphinx_keyword_entries:
+                    text = recognizer.recognize_sphinx(
+                        audio,
+                        keyword_entries=self._sphinx_keyword_entries,
+                    ).strip()
+                else:
+                    text = recognizer.recognize_sphinx(audio).strip()
+            except TypeError:
+                try:
+                    text = recognizer.recognize_sphinx(audio).strip()
+                except Exception:
+                    text = ""
+            except Exception:
+                text = ""
+
+        if not text and not self.allow_online_fallback:
+            try:
+                text = recognizer.recognize_google(audio).strip()
+            except Exception:
+                text = ""
+
+        return text
 
     def _has_speech_silero(self, wav_path):
         if not self.enable_silero_vad or not self._silero_model:
@@ -270,7 +420,8 @@ class VoiceWorker(QThread):
         
         r = sr.Recognizer()
         r.pause_threshold = 0.8
-        r.dynamic_energy_threshold = True
+        r.dynamic_energy_threshold = False
+        r.energy_threshold = self.energy_threshold
         r.dynamic_energy_adjustment_damping = 0.15
         r.non_speaking_duration = 0.25
         r.phrase_threshold = 0.2
@@ -330,6 +481,7 @@ class VoiceWorker(QThread):
 
             try:
                 current_prompt = brain.get_prompt()
+                command_prompt = f"{current_prompt} Commands: {self.command_hint}."
                 
                 with mic as source:
                     if time.time() - last_noise_calibration > 20:
@@ -364,8 +516,8 @@ class VoiceWorker(QThread):
                     try:
                         segments, _ = model.transcribe(
                             "temp_audio.wav", 
-                            beam_size=5, 
-                            initial_prompt=current_prompt,
+                            beam_size=self.beam_size,
+                            initial_prompt=command_prompt,
                             vad_filter=True,
                             vad_parameters={
                                 "min_silence_duration_ms": 250,
@@ -376,20 +528,13 @@ class VoiceWorker(QThread):
                         # Fallback for older faster-whisper builds that do not accept vad_parameters.
                         segments, _ = model.transcribe(
                             "temp_audio.wav", 
-                            beam_size=5, 
-                            initial_prompt=current_prompt,
+                            beam_size=self.beam_size,
+                            initial_prompt=command_prompt,
                             vad_filter=True,
                         )
                     text = "".join([s.text for s in segments]).strip()
                 else:
-                    text = ""
-                    try:
-                        text = r.recognize_sphinx(audio).strip()
-                    except Exception:
-                        try:
-                            text = r.recognize_google(audio).strip()
-                        except Exception:
-                            text = ""
+                    text = self._transcribe_with_speech_recognition(r, audio)
 
                 text = re.sub(r"\s+", " ", text)
                 
@@ -414,18 +559,25 @@ class VoiceWorker(QThread):
 
     def process_text(self, text):
         clean_text = text.lower().strip()
+        prepared_text = self._normalize_for_emit(text)
 
         # Keyword mode takes priority so open-mic state cannot bypass wake-word checks.
         if self.keyword_mode:
             if self._match_wake_alias(clean_text):
-                command_text = self._strip_wake_prefix(text)
+                command_text = self._normalize_for_emit(self._strip_wake_prefix(prepared_text))
                 if command_text:
                     self.text_received.emit(command_text)
                 self.status_update.emit("Wake Word Detected!")
+                return
+
+            if self.allow_commands_without_wake_word and _looks_like_voice_command(clean_text):
+                if prepared_text:
+                    self.text_received.emit(prepared_text)
+                self.status_update.emit("Command Detected")
             return
 
         if self.is_active:
-            self.text_received.emit(text)
+            self.text_received.emit(prepared_text or text)
 
     def pause_for_processing(self):
         self.auto_paused = True

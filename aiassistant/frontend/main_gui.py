@@ -178,7 +178,7 @@ class _NullCameraTracker:
 
 
 class _NullSpeechListener:
-    def __init__(self, energy_threshold: int = 300, pause_threshold: float = 0.8) -> None:
+    def __init__(self, energy_threshold: int = 650, pause_threshold: float = 0.8) -> None:
         _ = energy_threshold
         _ = pause_threshold
         self.available = False
@@ -197,11 +197,13 @@ class _NullSpeechListener:
         phrase_time_limit: float = 6.0,
         wake_words: Optional[list[str]] = None,
         allow_online_fallback: bool = False,
+        allow_commands_without_wake: bool = False,
     ) -> Optional[str]:
         _ = timeout
         _ = phrase_time_limit
         _ = wake_words
         _ = allow_online_fallback
+        _ = allow_commands_without_wake
         return None
 
     def start_background_listening(
@@ -209,10 +211,12 @@ class _NullSpeechListener:
         callback,
         wake_words: Optional[list[str]] = None,
         allow_online_fallback: bool = False,
+        allow_commands_without_wake: bool = False,
     ) -> None:
         _ = callback
         _ = wake_words
         _ = allow_online_fallback
+        _ = allow_commands_without_wake
 
     def stop_background_listening(self) -> None:
         return
@@ -722,8 +726,18 @@ class AssistantMainWindow(QMainWindow):
         self.actions: Optional[object] = None
 
         self.camera = CameraTracker(camera_index=0)
-        self.speech = SpeechListener()
-        self.voice_allow_online_fallback = bool(CONFIG.get("voice", {}).get("allow_online_fallback", True))
+        voice_cfg = CONFIG.get("voice", {})
+        raw_voice_energy_threshold = voice_cfg.get("energy_threshold", 650)
+        try:
+            voice_energy_threshold = max(600, int(float(raw_voice_energy_threshold)))
+        except (TypeError, ValueError):
+            voice_energy_threshold = 650
+
+        self.speech = SpeechListener(energy_threshold=voice_energy_threshold)
+        self.voice_allow_online_fallback = bool(voice_cfg.get("allow_online_fallback", True))
+        self.voice_allow_commands_without_wake_word = bool(
+            voice_cfg.get("allow_commands_without_wake_word", True)
+        )
         self.voice_mode = "Silent-Command"
         self.speech_bridge = SpeechBridge()
         self.speech_bridge.transcribed.connect(self._on_speech_transcribed)
@@ -1926,6 +1940,7 @@ class AssistantMainWindow(QMainWindow):
                 callback=lambda text: self.speech_bridge.transcribed.emit(text),
                 wake_words=self.wake_words,
                 allow_online_fallback=self.voice_allow_online_fallback,
+                allow_commands_without_wake=self.voice_allow_commands_without_wake_word,
             )
 
         return wake_backend
