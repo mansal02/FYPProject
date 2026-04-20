@@ -59,6 +59,12 @@ except ImportError:
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME.startswith("win")
+TOOL_BRIDGE_VERBOSE = str(os.environ.get("MARIE_TOOL_BRIDGE_VERBOSE", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 GENERAL_TASK_COMMANDS = [
     "open <app>",
@@ -1132,11 +1138,14 @@ class ActionHandler:
         ok = bool(result.get("success", False))
         prefix = "[ACTION][TOOLS]" if ok else "[ACTION][TOOLS][ERROR]"
         message = str(result.get("message", "")).strip()
-        if message:
+        low_message = message.lower()
+        hide_zero_match = "found 0 lexical file match" in low_message
+        if message and not hide_zero_match:
             print(f"{prefix} {message}")
 
         payload = result.get("data")
-        if payload is not None:
+        payload_has_value = payload not in (None, [], {}, "")
+        if TOOL_BRIDGE_VERBOSE and payload_has_value:
             try:
                 text = json.dumps(payload, ensure_ascii=True)
             except Exception:

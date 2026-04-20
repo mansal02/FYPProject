@@ -72,6 +72,73 @@ def clear_auto_login_user():
             print(f"[LOGIN] Failed to clear one-time login token: {e}")
 
 
+_VOICE_NOISE_KEYWORDS = {
+    "agent",
+    "assistant",
+    "browse",
+    "close",
+    "files",
+    "find",
+    "hey",
+    "launch",
+    "locate",
+    "marie",
+    "mute",
+    "open",
+    "pause",
+    "play",
+    "run",
+    "search",
+    "service",
+    "start",
+    "stop",
+    "unmute",
+    "volume",
+}
+
+
+def _sanitize_action_output_for_chat(output):
+    raw = str(output or "").replace("\r\n", "\n")
+    if not raw:
+        return ""
+
+    cleaned_lines = []
+    for line in raw.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[ACTION][TOOLS] Data:"):
+            continue
+        if stripped.startswith("[ACTION][TOOLS][ERROR] Data:"):
+            continue
+        if stripped.startswith("[ACTION][TOOLS] Found 0 lexical file match(es)."):
+            continue
+        cleaned_lines.append(stripped)
+
+    deduped = []
+    for line in cleaned_lines:
+        if not deduped or deduped[-1] != line:
+            deduped.append(line)
+
+    return "\n".join(deduped).strip()
+
+
+def _is_noisy_voice_transcript(text):
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower())
+    tokens = [token for token in normalized.split() if token]
+    if len(tokens) < 20:
+        return False
+
+    unique_ratio = len(set(tokens)) / float(len(tokens))
+    keyword_ratio = sum(1 for token in tokens if token in _VOICE_NOISE_KEYWORDS) / float(len(tokens))
+
+    if len(tokens) >= 45 and keyword_ratio >= 0.72 and unique_ratio <= 0.56:
+        return True
+    if len(tokens) >= 80 and unique_ratio <= 0.50:
+        return True
+    return False
+
+
 def run_action_command_isolated(text, timeout_sec=50):
     clean_text = str(text or "").strip()
     if not clean_text:
@@ -104,6 +171,7 @@ def run_action_command_isolated(text, timeout_sec=50):
     if completed.stderr:
         chunks.append(completed.stderr.strip())
     output = "\n".join(part for part in chunks if part).strip()
+    output = _sanitize_action_output_for_chat(output)
 
     if completed.returncode == 0:
         return True, output
@@ -730,11 +798,15 @@ class MainWindow(QMainWindow):
         if not text or not self.voice_input_enabled:
             return
 
+        cleaned = re.sub(r"\s+", " ", str(text)).strip()
+        if _is_noisy_voice_transcript(cleaned):
+            return
+
         if self.is_processing_response or self.waiting_for_voice_finish:
             self.event_bus.emit(Events.BARGE_IN, {"source": "voice_input"})
 
-        self.input_field.setText(text)
-        self.submit_user_text(text)
+        self.input_field.setText(cleaned)
+        self.submit_user_text(cleaned)
 
     def handle_speech_activity(self):
         if self.is_processing_response or self.waiting_for_voice_finish:
@@ -980,6 +1052,7 @@ class MainWindow(QMainWindow):
                     self.anim_timer.start(16)
         else:
             action_result = self.actions.execute_and_collect(text)
+        action_result = _sanitize_action_output_for_chat(action_result)
         self.latest_action_result = action_result
         if action_result:
             pretty = html.escape(action_result).replace("\n", "<br>")

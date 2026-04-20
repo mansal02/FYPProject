@@ -436,6 +436,73 @@ def clear_auto_login_user() -> None:
         pass
 
 
+_VOICE_NOISE_KEYWORDS = {
+    "agent",
+    "assistant",
+    "browse",
+    "close",
+    "files",
+    "find",
+    "hey",
+    "launch",
+    "locate",
+    "marie",
+    "mute",
+    "open",
+    "pause",
+    "play",
+    "run",
+    "search",
+    "service",
+    "start",
+    "stop",
+    "unmute",
+    "volume",
+}
+
+
+def _sanitize_action_output_for_chat(output: str) -> str:
+    raw = str(output or "").replace("\r\n", "\n")
+    if not raw:
+        return ""
+
+    cleaned_lines: List[str] = []
+    for line in raw.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[ACTION][TOOLS] Data:"):
+            continue
+        if stripped.startswith("[ACTION][TOOLS][ERROR] Data:"):
+            continue
+        if stripped.startswith("[ACTION][TOOLS] Found 0 lexical file match(es)."):
+            continue
+        cleaned_lines.append(stripped)
+
+    deduped: List[str] = []
+    for line in cleaned_lines:
+        if not deduped or deduped[-1] != line:
+            deduped.append(line)
+
+    return "\n".join(deduped).strip()
+
+
+def _is_noisy_voice_transcript(text: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", str(text or "").lower())
+    tokens = [token for token in normalized.split() if token]
+    if len(tokens) < 20:
+        return False
+
+    unique_ratio = len(set(tokens)) / float(len(tokens))
+    keyword_ratio = sum(1 for token in tokens if token in _VOICE_NOISE_KEYWORDS) / float(len(tokens))
+
+    if len(tokens) >= 45 and keyword_ratio >= 0.72 and unique_ratio <= 0.56:
+        return True
+    if len(tokens) >= 80 and unique_ratio <= 0.50:
+        return True
+    return False
+
+
 def run_action_command_isolated(text: str, timeout_sec: int = 50) -> tuple[bool, str]:
     clean_text = str(text or "").strip()
     if not clean_text:
@@ -468,6 +535,7 @@ def run_action_command_isolated(text: str, timeout_sec: int = 50) -> tuple[bool,
     if completed.stderr:
         chunks.append(completed.stderr.strip())
     output = "\n".join(part for part in chunks if part).strip()
+    output = _sanitize_action_output_for_chat(output)
 
     if completed.returncode == 0:
         return True, output
@@ -1855,6 +1923,11 @@ class AssistantMainWindow(QMainWindow):
                 self._set_status_core("Ready")
                 return
 
+            if ok:
+                # Action command finished with only filtered debug output.
+                self._set_status_core("Ready")
+                return
+
             # No meaningful action output: continue with reasoning path as fallback.
 
         self.worker = AgentWorker(self.agent, message)
@@ -2244,6 +2317,10 @@ class AssistantMainWindow(QMainWindow):
 
         cleaned = self._strip_wake_word_prefix(text)
         if not cleaned:
+            return
+
+        if _is_noisy_voice_transcript(cleaned):
+            self._set_status_core("Ignored noisy voice transcript")
             return
 
         self._append_chat("Mic", cleaned)
