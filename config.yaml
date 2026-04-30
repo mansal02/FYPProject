@@ -76,6 +76,16 @@ ui:
   theme: dark
   transparent_face: false
   enable_live2d: true
+  response_only_mode: false
+  response_only_opacity: 0.88
+
+crew:
+  enabled: false
+  mode: assist
+  router: complex_only
+  provider: fallback
+  context_max_chars: 900
+  verbose: false
 
 vision:
   screen_share_enabled: false
@@ -87,6 +97,7 @@ vision:
 runtime:
   hybrid_mode: false
   external_model: gemini-2.0-flash
+  online_mode: auto
 
 actions:
   safe_mode: true

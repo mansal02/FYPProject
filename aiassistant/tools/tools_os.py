@@ -284,6 +284,15 @@ def default_search_roots() -> List[Path]:
     cwd = Path.cwd()
     roots = [cwd]
 
+    if os.name == "nt":
+        for drive in ("C:/", "D:/"):
+            drive_path = Path(drive)
+            try:
+                if drive_path.exists():
+                    roots.append(drive_path)
+            except Exception:
+                continue
+
     # Only add broad user folders when the current working directory is home itself.
     try:
         if cwd.resolve() == Path.home().resolve():

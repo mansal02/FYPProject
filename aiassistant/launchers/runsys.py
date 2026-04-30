@@ -220,6 +220,7 @@ def run_script(script_name):
 def main():
     args = _parse_args()
     scripts = _resolve_modules(args.mode)
+    threads = []
 
     print(f"Launch mode: {args.mode}")
     for script in scripts:
@@ -247,9 +248,6 @@ def main():
         sys.exit(1)
 
     print("All scripts completed.")
-
-
-threads = []
 
 
 if __name__ == "__main__":

@@ -65,6 +65,7 @@ if _BOOT_STABILITY_MODE_LEVEL < 2 and not _BOOT_SAFE_MINIMAL:
     except Exception:  # pragma: no cover - optional dependency
         torch = None
 
+from aiassistant.core.crew_orchestrator import run_crew_assist
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.db.database_manager import DatabaseManager
 
@@ -105,6 +106,7 @@ HYBRID_MODE = bool(CONFIG.get("runtime", {}).get("hybrid_mode", False))
 SYSTEM_PROMPT = (
     "You are an offline desktop assistant. "
     "Prioritize action over explanation. "
+    "When office tasks are involved, prioritize Excel workflows and formulas first. "
     "Default to concise, direct replies focused on what the user needs now. "
     "Do not teach or explain internal process unless the user asks. "
     "If user intent is vague, break it into a short numbered plan and choose the first safe step. "
@@ -314,7 +316,12 @@ class AgentConfig:
     rag_top_k: int = 4
     hybrid_mode: bool = HYBRID_MODE
     external_model: str = str(CONFIG.get("runtime", {}).get("external_model", "gemini-2.0-flash"))
-    external_api_key_env: str = "GEMINI_API_KEY"
+    online_mode: str = str(CONFIG.get("runtime", {}).get("online_mode", "auto"))
+    external_api_key_env: str = "GOOGLE_API_KEY"
+    crew_enabled: bool = bool(CONFIG.get("crew", {}).get("enabled", False))
+    crew_mode: str = str(CONFIG.get("crew", {}).get("mode", "assist"))
+    crew_router: str = str(CONFIG.get("crew", {}).get("router", "complex_only"))
+    crew_context_max_chars: int = int(CONFIG.get("crew", {}).get("context_max_chars", 900))
 
 
 class OfflineAgentCore:
@@ -336,9 +343,14 @@ class OfflineAgentCore:
         self.rag_enabled = bool(self.config.rag_enabled) and not (_BOOT_DISABLE_RAG or _BOOT_SAFE_MINIMAL)
         self.system_prompt_behavior = "default"
         self.system_prompt_custom = ""
+        self.online_mode = self._normalize_online_mode(self.config.online_mode)
         self.local_context = LocalContext(
             str(CONFIG.get("memory", {}).get("local_context_file", "./cache/memory.json"))
         )
+        self.crew_enabled = bool(self.config.crew_enabled)
+        self.crew_mode = str(self.config.crew_mode or "assist").strip().lower()
+        self.crew_router = str(self.config.crew_router or "complex_only").strip().lower()
+        self.crew_context_max_chars = max(120, int(self.config.crew_context_max_chars or 900))
 
         # Single lock ensures model calls happen one-at-a-time.
         self._model_lock = threading.Lock()
@@ -361,6 +373,9 @@ class OfflineAgentCore:
             self.rag_enabled = False
             return
         self.rag_enabled = bool(enabled)
+
+    def set_online_mode(self, mode: str) -> None:
+        self.online_mode = self._normalize_online_mode(mode)
 
     def set_system_prompt_behavior(self, behavior: str, custom_prompt: str = "") -> None:
         clean_behavior = _collapse_ws(behavior).lower()
@@ -421,7 +436,24 @@ class OfflineAgentCore:
         if self.rag_enabled and not self.stop_event.is_set():
             rag_context = self._retrieve_rag_context(text)
 
-        base_reply = self._reason_over_input(text, recent_history, screen_context, rag_context)
+        crew_context, crew_final = self._get_crew_context(text, rag_context)
+        if crew_final:
+            cleaned = self.clean_output_for_ui(crew_final) or crew_final
+            self.db.log_interaction(
+                self.session_id,
+                role="assistant",
+                message=cleaned,
+                category="chat",
+            )
+            return cleaned
+
+        base_reply = self._reason_over_input(
+            text,
+            recent_history,
+            screen_context,
+            rag_context,
+            crew_context,
+        )
         if self.stop_event.is_set():
             return "Request cancelled."
 
@@ -501,6 +533,7 @@ class OfflineAgentCore:
         recent_history: List[Dict[str, str]],
         screen_context: str,
         rag_context: str,
+        crew_context: str,
     ) -> str:
         if self.stop_event.is_set():
             return ""
@@ -534,6 +567,13 @@ class OfflineAgentCore:
                 "Use only if relevant and do not invent citations."
             )
 
+        if crew_context:
+            context_sections.append(
+                "CrewAI notes (advisory):\n"
+                f"{crew_context}\n"
+                "Treat this as optional guidance; verify against local context."
+            )
+
         if len(context_sections) == 1:
             user_payload = user_text
         else:
@@ -541,7 +581,12 @@ class OfflineAgentCore:
 
         messages.append({"role": "user", "content": user_payload})
 
-        if self.config.hybrid_mode and self._is_complex_reasoning_request(user_text):
+        online_mode = self._normalize_online_mode(self.online_mode)
+        if online_mode == "online":
+            external = self._reason_with_external(messages)
+            if external:
+                return external
+        elif online_mode == "auto" and self.config.hybrid_mode and self._is_complex_reasoning_request(user_text):
             external = self._reason_with_external(messages)
             if external:
                 return external
@@ -589,6 +634,8 @@ class OfflineAgentCore:
 
         api_key = (
             os.environ.get(self.config.external_api_key_env, "").strip()
+            or os.environ.get("GOOGLE_API_KEY", "").strip()
+            or os.environ.get("GEMINI_API_KEY", "").strip()
             or os.environ.get("MARIE_GEMINI_API_KEY", "").strip()
         )
         if not api_key:
@@ -659,6 +706,13 @@ class OfflineAgentCore:
         }
         hits = sum(1 for token in triggers if token in lowered)
         return hits >= 2
+
+    @staticmethod
+    def _normalize_online_mode(mode: str) -> str:
+        clean = str(mode or "").strip().lower()
+        if clean not in {"auto", "online", "offline"}:
+            return "auto"
+        return clean
 
     def _retrieve_rag_context(self, user_text: str) -> str:
         if get_rag_context is None:
@@ -776,6 +830,47 @@ class OfflineAgentCore:
                 continue
 
         return actions, _collapse_ws(text)
+
+    def _get_crew_context(self, user_text: str, rag_context: str) -> Tuple[str, str]:
+        if not self.crew_enabled:
+            return "", ""
+
+        mode = str(self.crew_mode or "assist").strip().lower()
+        if mode not in {"assist", "replace"}:
+            mode = "assist"
+
+        router = str(self.crew_router or "complex_only").strip().lower()
+        if router == "complex_only" and not self._is_complex_reasoning_request(user_text):
+            return "", ""
+
+        memory_context = rag_context or ""
+        if memory_context:
+            memory_context = memory_context[: self.crew_context_max_chars]
+
+        crew_result = run_crew_assist(
+            user_text,
+            memory_context=memory_context,
+            config=CONFIG.get("crew", {}),
+        )
+        if not crew_result or not isinstance(crew_result, dict):
+            return "", ""
+
+        if not crew_result.get("ok"):
+            error = str(crew_result.get("error", "CrewAI unavailable")).strip()
+            if error:
+                self.db.log_interaction(
+                    self.session_id,
+                    role="system",
+                    message=error,
+                    category="crew",
+                )
+            return "", ""
+
+        summary = str(crew_result.get("summary", "") or "").strip()
+        final = str(crew_result.get("final", "") or "").strip()
+        if mode == "replace" and final:
+            return "", final
+        return summary, ""
 
     @staticmethod
     def clean_output_for_ui(raw_text: str) -> str:

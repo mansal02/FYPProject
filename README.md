@@ -15,6 +15,8 @@ MARIE is a privacy-first desktop AI assistant that runs locally with:
 - Config-first runtime: `.env` + `config.yaml` replace hardcoded local paths.
 - Optional multimodal and multi-agent scaffolds are included for extension work.
 - Optional live screen context: attach desktop screenshots to prompts with a one-click UI toggle.
+- Optional CrewAI advisory mode (fallbacks to local multi-agent chain if CrewAI is unavailable).
+- Response-only mode for a transparent, minimal UI output view.
 
 ## Repository Hygiene & Security
 - Sensitive runtime files are ignored and untracked from Git:
@@ -86,6 +88,8 @@ Edit `.env` and `config.yaml` as needed:
 - DB path (`MARIE_DB_PATH`)
 - service URLs/ports
 - wake-word and voice options
+- online Gemini key (`GOOGLE_API_KEY`) when using online mode
+ - set `MARIE_ONLINE_MODE` to `offline`, `auto`, or `online`
 
 ### 4. Setup Piper Assets
 
@@ -168,6 +172,10 @@ aiassistant/
     launchers/   # launch orchestration
     legacy/      # backward-compatibility shims
 ```
+
+## System Documentation
+
+Full system overview and upgrade ideas are documented in [docs/SYSTEM_OVERVIEW.md](docs/SYSTEM_OVERVIEW.md).
 
 ## Run the Application
 

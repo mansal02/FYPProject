@@ -99,6 +99,16 @@ _DEFAULT_CONFIG = {
         "theme": "dark",
         "transparent_face": False,
         "enable_live2d": False,
+        "response_only_mode": False,
+        "response_only_opacity": 0.88,
+    },
+    "crew": {
+        "enabled": False,
+        "mode": "assist",
+        "router": "complex_only",
+        "provider": "fallback",
+        "context_max_chars": 900,
+        "verbose": False,
     },
     "vision": {
         "screen_share_enabled": False,
@@ -110,6 +120,7 @@ _DEFAULT_CONFIG = {
     "runtime": {
         "hybrid_mode": False,
         "external_model": "gemini-2.0-flash",
+        "online_mode": "auto",
     },
     "actions": {
         "safe_mode": True,
@@ -230,6 +241,14 @@ def load_config():
         os.environ.get("MARIE_ENABLE_LIVE2D"),
         config["ui"].get("enable_live2d", False),
     )
+    config["ui"]["response_only_mode"] = _as_bool(
+        os.environ.get("MARIE_RESPONSE_ONLY_MODE"),
+        config["ui"].get("response_only_mode", False),
+    )
+    config["ui"]["response_only_opacity"] = _as_float(
+        os.environ.get("MARIE_RESPONSE_ONLY_OPACITY"),
+        config["ui"].get("response_only_opacity", 0.88),
+    )
     if _as_bool(os.environ.get("MARIE_DISABLE_LIVE2D"), False):
         config["ui"]["enable_live2d"] = False
 
@@ -270,6 +289,37 @@ def load_config():
     config["runtime"]["external_model"] = os.environ.get(
         "MARIE_EXTERNAL_MODEL",
         config["runtime"].get("external_model", "gemini-2.0-flash"),
+    )
+    online_mode = str(
+        os.environ.get("MARIE_ONLINE_MODE", config["runtime"].get("online_mode", "auto"))
+    ).strip().lower()
+    if online_mode not in {"auto", "online", "offline"}:
+        online_mode = "auto"
+    config["runtime"]["online_mode"] = online_mode
+
+    config["crew"]["enabled"] = _as_bool(
+        os.environ.get("MARIE_CREW_ENABLED"),
+        config["crew"].get("enabled", False),
+    )
+    config["crew"]["mode"] = os.environ.get(
+        "MARIE_CREW_MODE",
+        config["crew"].get("mode", "assist"),
+    )
+    config["crew"]["router"] = os.environ.get(
+        "MARIE_CREW_ROUTER",
+        config["crew"].get("router", "complex_only"),
+    )
+    config["crew"]["provider"] = os.environ.get(
+        "MARIE_CREW_PROVIDER",
+        config["crew"].get("provider", "fallback"),
+    )
+    config["crew"]["context_max_chars"] = _as_int(
+        os.environ.get("MARIE_CREW_CONTEXT_MAX_CHARS"),
+        config["crew"].get("context_max_chars", 900),
+    )
+    config["crew"]["verbose"] = _as_bool(
+        os.environ.get("MARIE_CREW_VERBOSE"),
+        config["crew"].get("verbose", False),
     )
 
     config["memory"]["local_context_file"] = os.environ.get(
