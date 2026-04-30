@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import threading
 import uuid
 
@@ -15,6 +16,11 @@ from aiassistant.infra.db.database import MarieDB
 from aiassistant.infra.rag_memory import get_rag_context
 from aiassistant.infra.vision.screen_vision import describe_screen_snapshot
 
+try:
+    import requests
+except Exception:  # pragma: no cover - optional dependency
+    requests = None
+
 app = FastAPI()
 db = MarieDB()
 
@@ -27,6 +33,9 @@ OLLAMA_NUM_PREDICT = int(CONFIG["ollama"]["num_predict"])
 OLLAMA_NUM_CTX = int(CONFIG["ollama"]["num_ctx"])
 OLLAMA_TEMPERATURE = float(CONFIG["ollama"].get("temperature", 0.2))
 OLLAMA_SYSTEM_PROMPT = CONFIG["ollama"].get("system_prompt", "You are MARIE, a friendly assistant.")
+RUNTIME_ONLINE_MODE = str(CONFIG.get("runtime", {}).get("online_mode", "auto")).strip().lower()
+RUNTIME_HYBRID_MODE = bool(CONFIG.get("runtime", {}).get("hybrid_mode", False))
+EXTERNAL_MODEL = str(CONFIG.get("runtime", {}).get("external_model", "gemini-2.0-flash")).strip()
 
 _cancel_map = {}
 _cancel_lock = threading.RLock()
@@ -44,7 +53,98 @@ def _truncate_memory_context(memory_context, max_lines=60, max_chars=7000):
     return joined[-max_chars:]
 
 
-def get_marie_response_stream(prompt, memory_context=""):
+def _normalize_online_mode(mode: str) -> str:
+    clean = str(mode or "").strip().lower()
+    if clean not in {"auto", "online", "offline"}:
+        return "auto"
+    return clean
+
+
+def _resolve_online_mode(payload: dict) -> str:
+    if isinstance(payload, dict):
+        if "online_mode" in payload:
+            return _normalize_online_mode(payload.get("online_mode"))
+        if "use_online" in payload:
+            return "online" if bool(payload.get("use_online")) else "offline"
+    return _normalize_online_mode(RUNTIME_ONLINE_MODE)
+
+
+def _is_complex_reasoning_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    words = re.findall(r"[a-zA-Z0-9_]+", lowered)
+    if len(words) >= 36:
+        return True
+
+    triggers = {
+        "analyze",
+        "compare",
+        "architecture",
+        "strategy",
+        "tradeoff",
+        "design",
+        "optimize",
+        "debug plan",
+        "step-by-step",
+        "root cause",
+    }
+    hits = sum(1 for token in triggers if token in lowered)
+    return hits >= 2
+
+
+def _chunk_text(text: str, size: int = 24):
+    if not text:
+        return []
+    return [text[idx : idx + size] for idx in range(0, len(text), size)]
+
+
+def _gemini_generate_text(prompt: str, temperature: float) -> str:
+    if requests is None:
+        return ""
+
+    api_key = (
+        os.environ.get("GOOGLE_API_KEY", "").strip()
+        or os.environ.get("GEMINI_API_KEY", "").strip()
+        or os.environ.get("MARIE_GEMINI_API_KEY", "").strip()
+    )
+    if not api_key:
+        return ""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{EXTERNAL_MODEL}:generateContent"
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": float(temperature),
+            "maxOutputTokens": 640,
+        },
+    }
+
+    try:
+        response = requests.post(
+            url,
+            params={"key": api_key},
+            json=payload,
+            timeout=28,
+        )
+        if response.status_code >= 400:
+            return ""
+        data = response.json()
+        for candidate in data.get("candidates", []):
+            parts = (candidate.get("content") or {}).get("parts", [])
+            text_chunks = [str(part.get("text", "")) for part in parts if part.get("text")]
+            merged = " ".join(text_chunks).strip()
+            if merged:
+                return merged
+        return ""
+    except Exception:
+        return ""
+
+
+def get_marie_response_stream(prompt, memory_context="", online_mode="auto"):
     """Streams responses from Ollama with memory context injected."""
     try:
         if not prompt:
@@ -61,6 +161,21 @@ def get_marie_response_stream(prompt, memory_context=""):
         if memory_context:
             recent_facts = _truncate_memory_context(memory_context)
             system_instructions += f"\nFacts about the user you remember:\n{recent_facts}"
+
+        resolved_mode = _normalize_online_mode(online_mode)
+        use_online = False
+        if resolved_mode == "online":
+            use_online = True
+        elif resolved_mode == "auto" and RUNTIME_HYBRID_MODE and _is_complex_reasoning_request(prompt):
+            use_online = True
+
+        if use_online:
+            merged_prompt = f"System:\n{system_instructions}\n\nUser:\n{prompt}".strip()
+            external_text = _gemini_generate_text(merged_prompt, temperature=OLLAMA_TEMPERATURE)
+            if external_text:
+                for chunk in _chunk_text(external_text):
+                    yield chunk
+                return
 
         stream = ollama.chat(
             model=OLLAMA_MODEL,
@@ -143,9 +258,10 @@ def _resolve_request_context(payload):
 @app.post("/chat")
 def chat_endpoint(payload: dict = Body(...)):
     user_text, rag_context = _resolve_request_context(payload)
+    online_mode = _resolve_online_mode(payload)
 
     full_response = ""
-    for token in get_marie_response_stream(user_text, memory_context=rag_context):
+    for token in get_marie_response_stream(user_text, memory_context=rag_context, online_mode=online_mode):
         full_response += token
 
     return {"response": full_response}
@@ -170,6 +286,7 @@ def chat_multi_agent_endpoint(payload: dict = Body(...)):
 @app.post("/chat/stream")
 def chat_stream_endpoint(payload: dict = Body(...)):
     user_text, rag_context = _resolve_request_context(payload)
+    online_mode = _resolve_online_mode(payload)
     request_id = payload.get("request_id") or str(uuid.uuid4())
     cancel_event = _register_cancel_event(request_id)
 
@@ -177,7 +294,7 @@ def chat_stream_endpoint(payload: dict = Body(...)):
         full_response = ""
         sentence_buffer = ""
         try:
-            for token in get_marie_response_stream(user_text, memory_context=rag_context):
+            for token in get_marie_response_stream(user_text, memory_context=rag_context, online_mode=online_mode):
                 if cancel_event.is_set():
                     break
 

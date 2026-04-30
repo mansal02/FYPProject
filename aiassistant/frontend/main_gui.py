@@ -760,6 +760,15 @@ class AssistantMainWindow(QMainWindow):
         self._cancel_pending_reset = False
         self.chat_view_mode = "full"
         self.avatar_hidden = False
+        self.response_only_mode = bool(
+            self.preferences.get(
+                "response_only_mode",
+                CONFIG.get("ui", {}).get("response_only_mode", False),
+            )
+        )
+        self.response_only_opacity = float(
+            CONFIG.get("ui", {}).get("response_only_opacity", 0.88)
+        )
         self.system_prompt_behavior = str(
             self.preferences.get("system_prompt_behavior", "default")
         ).strip().lower() or "default"
@@ -772,6 +781,12 @@ class AssistantMainWindow(QMainWindow):
         )
         self.voice_profile = str(self.preferences.get("preferred_voice") or "system_default")
         self.speaking_speed = float(self.preferences.get("speaking_speed", DEFAULT_TTS_SPEED))
+        self.online_mode = str(
+            self.preferences.get("online_mode")
+            or CONFIG.get("runtime", {}).get("online_mode", "auto")
+        ).strip().lower() or "auto"
+        if self.online_mode not in {"auto", "online", "offline"}:
+            self.online_mode = "auto"
 
         self.agent = OfflineAgentCore(
             db=self.db,
@@ -781,6 +796,7 @@ class AssistantMainWindow(QMainWindow):
                 rag_enabled=bool(self.preferences.get("rag_enabled", True)),
                 hybrid_mode=bool(CONFIG.get("runtime", {}).get("hybrid_mode", False)),
                 external_model=str(CONFIG.get("runtime", {}).get("external_model", "gemini-2.0-flash")),
+                online_mode=self.online_mode,
             ),
         )
         _write_boot_trace("window:init:agent_ready")
@@ -933,6 +949,7 @@ class AssistantMainWindow(QMainWindow):
         right_layout.addWidget(title)
 
         self.chat_box = QTextEdit()
+        self.chat_box.setObjectName("chatBox")
         self.chat_box.setReadOnly(True)
         self.chat_box.setPlaceholderText("Chat history appears here...")
         right_layout.addWidget(self.chat_box, stretch=1)
@@ -1129,12 +1146,20 @@ class AssistantMainWindow(QMainWindow):
         self.prompt_custom_input.setMinimumHeight(90)
         form.addRow("Custom prompt notes", self.prompt_custom_input)
 
+        self.online_mode_combo = QComboBox()
+        self.online_mode_combo.addItem("Offline only", "offline")
+        self.online_mode_combo.addItem("Hybrid (auto)", "auto")
+        self.online_mode_combo.addItem("Online only (Gemini)", "online")
+        form.addRow("Online model usage", self.online_mode_combo)
+
         self.pref_tts_cb = QCheckBox("Enable voice output")
         self.pref_voice_input_cb = QCheckBox("Enable voice command input")
         self.pref_screen_input_cb = QCheckBox("Use live screen as model input")
         self.pref_screen_preview_cb = QCheckBox("Show live screen preview")
         self.pref_rag_cb = QCheckBox("Enable local RAG memory")
         self.pref_desktop_cb = QCheckBox("Desktop mate mode")
+        self.pref_response_only_cb = QCheckBox("Response-only mode (transparent)")
+        self.pref_response_only_cb.stateChanged.connect(self.on_response_only_toggle_changed)
 
         prefs_wrap = QWidget()
         prefs_layout = QVBoxLayout(prefs_wrap)
@@ -1145,6 +1170,7 @@ class AssistantMainWindow(QMainWindow):
         prefs_layout.addWidget(self.pref_screen_preview_cb)
         prefs_layout.addWidget(self.pref_rag_cb)
         prefs_layout.addWidget(self.pref_desktop_cb)
+        prefs_layout.addWidget(self.pref_response_only_cb)
         form.addRow("Feature toggles", prefs_wrap)
 
         layout.addLayout(form)
@@ -1382,58 +1408,72 @@ class AssistantMainWindow(QMainWindow):
             """
             QMainWindow {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                    stop:0 #e9f1fa, stop:1 #f9fcff);
+                    stop:0 #0b0f16, stop:0.6 #0f1724, stop:1 #101a2b);
             }
             QWidget {
-                color: #1a2430;
-                font-family: Segoe UI;
+                color: #e6eefb;
+                font-family: Bahnschrift;
                 font-size: 14px;
             }
             QTabWidget::pane {
-                border: 1px solid #cdd9e8;
-                border-radius: 10px;
-                background: #ffffff;
+                border: 1px solid #1d2a3d;
+                border-radius: 12px;
+                background: #101a2b;
             }
             QTabBar::tab {
-                background: #dce7f5;
+                background: #182437;
+                color: #92a4be;
                 padding: 10px 16px;
-                margin-right: 4px;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
+                margin-right: 6px;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
             }
             QTabBar::tab:selected {
-                background: #ffffff;
-                border: 1px solid #cdd9e8;
+                background: #0f1b2e;
+                color: #e6eefb;
+                border: 1px solid #2a3a52;
                 border-bottom: none;
             }
             QTextEdit, QLineEdit, QComboBox, QDoubleSpinBox, QTableWidget {
-                background: #ffffff;
-                border: 1px solid #c7d4e4;
-                border-radius: 8px;
+                background: #0f1726;
+                border: 1px solid #23324a;
+                border-radius: 10px;
                 padding: 8px;
+                selection-background-color: #00d1ff;
+                selection-color: #0b0f16;
+            }
+            QTextEdit#chatBox[responseOnly="true"] {
+                background: rgba(12, 18, 28, 0.42);
+                border: 1px solid #2c3c55;
             }
             QPushButton {
-                background: #1f77d8;
-                color: white;
-                border: none;
-                border-radius: 8px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00b0ff, stop:1 #5ee7ff);
+                color: #0b0f16;
+                border: 1px solid #1b6f82;
+                border-radius: 10px;
                 padding: 10px 14px;
-                font-weight: 600;
+                font-weight: 700;
             }
             QPushButton:hover {
-                background: #1b69bf;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00c5ff, stop:1 #7cf1ff);
             }
             QPushButton#danger {
-                background: #d83d45;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ff4d6d, stop:1 #ff7a8f);
+                color: #0b0f16;
+                border: 1px solid #6f1d2c;
             }
             QPushButton#danger:hover {
-                background: #c2363e;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #ff5b78, stop:1 #ff90a3);
             }
             QFrame#previewFrame, QLabel#previewFrame {
-                border: 1px dashed #b8c7da;
-                border-radius: 10px;
-                background: #f6f9fd;
-                color: #6c7a8f;
+                border: 1px dashed #2a3a52;
+                border-radius: 12px;
+                background: #0c1422;
+                color: #7b8ba7;
             }
             """
         )
@@ -1449,6 +1489,7 @@ class AssistantMainWindow(QMainWindow):
         self._set_checkbox_checked(self.rag_toggle, bool(self.preferences.get("rag_enabled", True)))
         self._set_checkbox_checked(self.tts_toggle, bool(self.preferences.get("tts_enabled", True)))
         self._set_checkbox_checked(self.desktop_mate_toggle, bool(self.preferences.get("desktop_mate_enabled", False)))
+        self._set_checkbox_checked(self.pref_response_only_cb, bool(self.response_only_mode))
 
         if self.force_disable_screen_capture:
             self._set_checkbox_checked(self.screen_toggle, False)
@@ -1478,12 +1519,22 @@ class AssistantMainWindow(QMainWindow):
             self.system_prompt_custom,
         )
 
+        if hasattr(self, "online_mode_combo"):
+            online_index = self.online_mode_combo.findData(self.online_mode)
+            if online_index < 0:
+                online_index = self.online_mode_combo.findData("auto")
+            if online_index >= 0:
+                self.online_mode_combo.setCurrentIndex(online_index)
+
+        self.agent.set_online_mode(self.online_mode)
+
         self.agent.set_screen_capture_enabled(self.screen_toggle.isChecked())
         self.agent.set_rag_enabled(self.rag_toggle.isChecked())
 
         self._set_voice_input_enabled(self.voice_toggle.isChecked(), announce=False)
         self._set_screen_preview_enabled(self.screen_preview_toggle.isChecked(), announce=False)
         self._set_desktop_mate_enabled(self.desktop_mate_toggle.isChecked(), announce=False)
+        self._apply_response_only_mode(announce=False, persist=False)
         self._refresh_chat_view_visibility()
         self._sync_preference_checkbox_states()
         self._refresh_tts_status_label()
@@ -1610,6 +1661,8 @@ class AssistantMainWindow(QMainWindow):
             self._set_checkbox_checked(self.pref_rag_cb, self.rag_toggle.isChecked())
         if hasattr(self, "pref_desktop_cb"):
             self._set_checkbox_checked(self.pref_desktop_cb, self.desktop_mate_toggle.isChecked())
+        if hasattr(self, "pref_response_only_cb"):
+            self._set_checkbox_checked(self.pref_response_only_cb, self.response_only_mode)
 
     def _persist_runtime_preferences(self, extra: Optional[Dict[str, object]] = None) -> None:
         payload: Dict[str, object] = {
@@ -1623,9 +1676,11 @@ class AssistantMainWindow(QMainWindow):
             "screen_preview_enabled": self.screen_preview_toggle.isChecked(),
             "rag_enabled": self.rag_toggle.isChecked(),
             "desktop_mate_enabled": self.desktop_mate_toggle.isChecked(),
+            "response_only_mode": self.response_only_mode,
             "speaking_speed": self.speaking_speed,
             "system_prompt_behavior": self.system_prompt_behavior,
             "system_prompt_custom": self.system_prompt_custom,
+            "online_mode": self.online_mode,
         }
         if extra:
             payload.update(extra)
@@ -1750,9 +1805,22 @@ class AssistantMainWindow(QMainWindow):
 
     # --- interaction helpers ---
     def _append_chat(self, speaker: str, text: str) -> None:
+        if not self._should_show_chat_message(speaker, text):
+            return
         safe_speaker = html.escape(str(speaker))
         safe_text = html.escape(str(text)).replace("\n", "<br>")
         self.chat_box.append(f"<b>{safe_speaker}:</b> {safe_text}")
+
+    def _should_show_chat_message(self, speaker: str, text: str) -> bool:
+        if not self.response_only_mode:
+            return True
+        normalized = str(speaker or "").strip().lower()
+        if normalized == "assistant":
+            return True
+        if normalized == "system":
+            lowered = str(text or "").lower()
+            return any(token in lowered for token in ("error", "failed", "unavailable", "warning"))
+        return False
 
     def _set_status_core(self, status: str) -> None:
         self._status_core = status
@@ -1769,6 +1837,13 @@ class AssistantMainWindow(QMainWindow):
             extra.append("Screen input ON")
         if self.voice_toggle.isChecked():
             extra.append("Voice cmd ON")
+        if hasattr(self, "online_mode"):
+            mode_label = {
+                "online": "Online ON",
+                "offline": "Online OFF",
+                "auto": "Online AUTO",
+            }.get(self.online_mode, "Online AUTO")
+            extra.append(mode_label)
 
         suffix = ""
         if extra:
@@ -1838,6 +1913,18 @@ class AssistantMainWindow(QMainWindow):
             or "full view" in normalized
         ):
             self._apply_chat_view_mode("full")
+            return True
+
+        if normalized in {"online mode", "use online", "use gemini", "online only"}:
+            self._set_online_mode("online")
+            return True
+
+        if normalized in {"offline mode", "use offline", "offline only"}:
+            self._set_online_mode("offline")
+            return True
+
+        if normalized in {"hybrid mode", "auto mode", "online auto"}:
+            self._set_online_mode("auto")
             return True
 
         return False
@@ -2099,6 +2186,23 @@ class AssistantMainWindow(QMainWindow):
     def on_rag_toggle_changed(self, state: int) -> None:
         self._set_rag_enabled(state == Qt.Checked)
 
+    def _set_online_mode(self, mode: str, announce: bool = True) -> None:
+        clean = str(mode or "").strip().lower()
+        if clean not in {"auto", "online", "offline"}:
+            clean = "auto"
+        self.online_mode = clean
+        self.agent.set_online_mode(clean)
+
+        if hasattr(self, "online_mode_combo"):
+            index = self.online_mode_combo.findData(clean)
+            if index >= 0:
+                self.online_mode_combo.setCurrentIndex(index)
+
+        self._persist_runtime_preferences({"online_mode": clean})
+        if announce:
+            label = {"auto": "Hybrid (auto)", "online": "Online only", "offline": "Offline only"}[clean]
+            self._append_chat("System", f"Online mode set to {label}.")
+
     def _set_tts_enabled(self, enabled: bool, announce: bool = True) -> None:
         if self.force_disable_tts:
             enabled = False
@@ -2193,6 +2297,32 @@ class AssistantMainWindow(QMainWindow):
         self._persist_runtime_preferences()
         if announce:
             self._append_chat("System", f"Desktop mate mode {'enabled' if enabled else 'disabled'}.")
+
+    def _apply_response_only_mode(self, announce: bool = True, persist: bool = True) -> None:
+        if hasattr(self, "chat_box"):
+            self.chat_box.setProperty("responseOnly", "true" if self.response_only_mode else "false")
+            self.chat_box.style().unpolish(self.chat_box)
+            self.chat_box.style().polish(self.chat_box)
+
+        self._update_window_opacity()
+        if self.response_only_mode and hasattr(self, "chat_box"):
+            self.chat_box.clear()
+
+        if persist:
+            self._persist_runtime_preferences()
+            self._sync_preference_checkbox_states()
+
+        if announce:
+            label = "enabled" if self.response_only_mode else "disabled"
+            self._append_chat("System", f"Response-only mode {label}.")
+
+    def _set_response_only_mode(self, enabled: bool, announce: bool = True) -> None:
+        self.response_only_mode = bool(enabled)
+        self._set_checkbox_checked(self.pref_response_only_cb, self.response_only_mode)
+        self._apply_response_only_mode(announce=announce, persist=True)
+
+    def on_response_only_toggle_changed(self, state: int) -> None:
+        self._set_response_only_mode(state == Qt.Checked)
 
     def on_desktop_mate_toggle(self, state: int) -> None:
         self._set_desktop_mate_enabled(state == Qt.Checked)
@@ -2501,13 +2631,11 @@ class AssistantMainWindow(QMainWindow):
             flags = Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
             self.setWindowFlags(flags)
             self.setAttribute(Qt.WA_TranslucentBackground, True)
-            self.setWindowOpacity(0.93)
             self.resize(760, 560)
         else:
             flags = Qt.Window
             self.setWindowFlags(flags)
             self.setAttribute(Qt.WA_TranslucentBackground, False)
-            self.setWindowOpacity(1.0)
             if self.chat_view_mode == "mini":
                 self.resize(560, 420)
             elif self.chat_view_mode == "chat_only":
@@ -2515,9 +2643,17 @@ class AssistantMainWindow(QMainWindow):
             else:
                 self.resize(1180, 780)
 
+        self._update_window_opacity()
+
         self._refresh_chat_view_visibility()
 
         self.show()
+
+    def _update_window_opacity(self) -> None:
+        base_opacity = 0.93 if self.desktop_mate_toggle.isChecked() else 1.0
+        if self.response_only_mode:
+            base_opacity = min(base_opacity, float(self.response_only_opacity))
+        self.setWindowOpacity(base_opacity)
 
     # --- lifecycle ---
     def closeEvent(self, event) -> None:  # type: ignore[override]
