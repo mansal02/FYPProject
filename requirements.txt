@@ -20,6 +20,7 @@ requests==2.32.5
 SpeechRecognition==3.14.5
 spacy==3.8.11
 uvicorn==0.40.0
+crewai==0.95.0
 pvporcupine==3.0.2
 sentence-transformers==3.0.1
 duckduckgo-search==6.3.4

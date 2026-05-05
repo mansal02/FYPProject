@@ -18,6 +18,7 @@ servers:
   voice_port: 8001
 
 ollama:
+  host: http://127.0.0.1:11434
   model: llama3.2:3b
   num_predict: 360
   num_ctx: 2048
@@ -80,12 +81,16 @@ ui:
   response_only_opacity: 0.88
 
 crew:
-  enabled: false
+  enabled: true
   mode: assist
-  router: complex_only
-  provider: fallback
+  router: always
+  provider: crewai
   context_max_chars: 900
   verbose: false
+  models:
+    researcher: qwen2.5:7b
+    coder: qwen2.5:7b
+    synthesizer: llama3.1:8b
 
 vision:
   screen_share_enabled: false

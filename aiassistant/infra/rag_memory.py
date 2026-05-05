@@ -1,5 +1,7 @@
 import os
+import shutil
 import threading
+import time
 from pathlib import Path
 
 from aiassistant.infra.config.app_config import CONFIG
@@ -34,9 +36,31 @@ class LocalRAG:
 
         self.collection = None
         if CHROMA_AVAILABLE:
+            try:
+                self.persist_dir.mkdir(parents=True, exist_ok=True)
+                client = chromadb.PersistentClient(path=str(self.persist_dir))
+                self.collection = client.get_or_create_collection("marie_knowledge")
+            except BaseException as exc:
+                self.collection = None
+                print(f"[RAG] Chroma init failed, disabling local RAG: {exc}")
+                self._attempt_reset()
+
+    def _attempt_reset(self):
+        if not self.persist_dir.exists():
+            return
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        backup_dir = self.persist_dir.parent / f"chroma_corrupt_{timestamp}"
+        try:
+            shutil.move(str(self.persist_dir), str(backup_dir))
             self.persist_dir.mkdir(parents=True, exist_ok=True)
+            if not CHROMA_AVAILABLE:
+                return
             client = chromadb.PersistentClient(path=str(self.persist_dir))
             self.collection = client.get_or_create_collection("marie_knowledge")
+            print(f"[RAG] Reset corrupt Chroma store to {backup_dir}")
+        except Exception as exc:
+            self.collection = None
+            print(f"[RAG] Chroma reset failed: {exc}")
 
     def _iter_docs(self):
         if not self.knowledge_dir.exists():

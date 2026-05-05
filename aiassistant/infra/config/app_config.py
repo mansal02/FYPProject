@@ -39,6 +39,7 @@ _DEFAULT_CONFIG = {
         "voice_port": 8001,
     },
     "ollama": {
+        "host": "http://127.0.0.1:11434",
         "model": "llama3.2:3b",
         "num_predict": 360,
         "num_ctx": 2048,
@@ -103,9 +104,9 @@ _DEFAULT_CONFIG = {
         "response_only_opacity": 0.88,
     },
     "crew": {
-        "enabled": False,
-        "mode": "assist",
-        "router": "complex_only",
+            "researcher": "qwen2.5:7b",
+            "coder": "qwen2.5:7b",
+            "synthesizer": "llama3.1:8b",
         "provider": "fallback",
         "context_max_chars": 900,
         "verbose": False,

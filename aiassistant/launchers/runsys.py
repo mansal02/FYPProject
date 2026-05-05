@@ -29,6 +29,7 @@ failures_lock = threading.Lock()
 processes = {}
 processes_lock = threading.Lock()
 shutdown_requested = threading.Event()
+LOG_DIR = BASE_DIR / "cache" / "launch_logs"
 
 
 def _build_child_env():
@@ -152,16 +153,24 @@ def run_script(script_name):
             if script_name == "aiassistant.frontend.main_gui":
                 _apply_main_gui_stability_profile(env, stability_level)
 
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = LOG_DIR / f"{script_name.replace('.', '_')}.log"
+            log_file = open(log_path, "a", encoding="utf-8")
+
             process = subprocess.Popen(
                 [PYTHON_EXE, "-m", script_name],
                 cwd=str(BASE_DIR),
                 creationflags=_creation_flags(),
                 env=env,
+                stdout=log_file,
+                stderr=log_file,
             )
             with processes_lock:
                 processes[script_name] = process
 
             return_code = process.wait()
+            log_file.flush()
+            log_file.close()
 
             if return_code == 0:
                 print(f"--- Finished {script_name} ---\n", flush=True)
@@ -202,12 +211,18 @@ def run_script(script_name):
             print(f"ERROR: {script_name} failed with exit code {return_code}.", flush=True)
             if script_name == "aiassistant.frontend.main_gui":
                 print(f"Diagnostic boot log: {_main_gui_boot_log_path()}", flush=True)
+                print(f"Process log: {log_path}", flush=True)
 
             if not shutdown_requested.is_set():
                 shutdown_requested.set()
                 _terminate_running_processes("another script failed", exclude_script=script_name)
             return
         except OSError as exc:
+            try:
+                log_file.flush()
+                log_file.close()
+            except Exception:
+                pass
             with failures_lock:
                 failures.append((script_name, f"launch error: {exc}"))
             print(f"ERROR: {script_name} failed to launch ({exc}).", flush=True)

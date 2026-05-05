@@ -9,6 +9,7 @@ import uvicorn
 from fastapi import Body, FastAPI
 from fastapi.responses import StreamingResponse
 
+from aiassistant.core.crew_orchestrator import run_crew_assist
 from aiassistant.core.multi_agent_orchestrator import run_multi_agent_round
 from aiassistant.backend.streaming_utils import drain_complete_sentences
 from aiassistant.infra.config.app_config import CONFIG
@@ -67,6 +68,21 @@ def _resolve_online_mode(payload: dict) -> str:
         if "use_online" in payload:
             return "online" if bool(payload.get("use_online")) else "offline"
     return _normalize_online_mode(RUNTIME_ONLINE_MODE)
+
+
+def _should_use_crew(prompt: str, settings: dict) -> bool:
+    if not isinstance(settings, dict) or not settings.get("enabled", False):
+        return False
+
+    router = str(settings.get("router", "complex_only")).strip().lower()
+    if router == "always":
+        return True
+    if router == "never":
+        return False
+    words = re.findall(r"[a-zA-Z0-9_]+", str(prompt or ""))
+    if len(words) < 6:
+        return False
+    return _is_complex_reasoning_request(prompt)
 
 
 def _is_complex_reasoning_request(text: str) -> bool:
@@ -260,6 +276,13 @@ def chat_endpoint(payload: dict = Body(...)):
     user_text, rag_context = _resolve_request_context(payload)
     online_mode = _resolve_online_mode(payload)
 
+    crew_config = CONFIG.get("crew", {})
+    if _should_use_crew(user_text, crew_config):
+        crew_result = run_crew_assist(user_text, memory_context=rag_context, config=crew_config)
+        summary = str(crew_result.get("summary") or "").strip()
+        if crew_result.get("ok") and summary:
+            return {"response": summary}
+
     full_response = ""
     for token in get_marie_response_stream(user_text, memory_context=rag_context, online_mode=online_mode):
         full_response += token
@@ -287,6 +310,42 @@ def chat_multi_agent_endpoint(payload: dict = Body(...)):
 def chat_stream_endpoint(payload: dict = Body(...)):
     user_text, rag_context = _resolve_request_context(payload)
     online_mode = _resolve_online_mode(payload)
+    crew_config = CONFIG.get("crew", {})
+
+    if _should_use_crew(user_text, crew_config):
+        crew_result = run_crew_assist(user_text, memory_context=rag_context, config=crew_config)
+        summary = str(crew_result.get("summary") or "").strip()
+        request_id = payload.get("request_id") or str(uuid.uuid4())
+
+        def generate_crew_events():
+            if not summary:
+                yield json.dumps(
+                    {
+                        "type": "error",
+                        "content": str(crew_result.get("error") or "Crew processing failed."),
+                        "request_id": request_id,
+                    }
+                ) + "\n"
+                return
+
+            for chunk in _chunk_text(summary):
+                yield json.dumps({"type": "token", "content": chunk}) + "\n"
+
+            yield json.dumps(
+                {
+                    "type": "done",
+                    "full_response": summary,
+                    "request_id": request_id,
+                    "cancelled": False,
+                }
+            ) + "\n"
+
+        return StreamingResponse(
+            generate_crew_events(),
+            media_type="application/x-ndjson",
+            headers={"X-MARIE-REQUEST-ID": request_id},
+        )
+
     request_id = payload.get("request_id") or str(uuid.uuid4())
     cancel_event = _register_cancel_event(request_id)
 

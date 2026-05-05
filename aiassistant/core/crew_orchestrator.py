@@ -19,6 +19,15 @@ def _normalize_mode(value: str) -> str:
     return mode
 
 
+def _truncate_context(text: str, max_chars: int) -> str:
+    if not text:
+        return ""
+    limit = max(200, int(max_chars))
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
 def run_crew_assist(
     question: str,
     memory_context: str = "",
@@ -27,6 +36,8 @@ def run_crew_assist(
     """Run CrewAI if available, otherwise fallback to local multi-agent chain."""
     settings = config or {}
     provider = str(settings.get("provider", "fallback")).strip().lower()
+    context_max_chars = int(settings.get("context_max_chars", 900) or 900)
+    memory_context = _truncate_context(str(memory_context or ""), context_max_chars)
 
     if provider not in {"crewai", "fallback"}:
         provider = "fallback"
