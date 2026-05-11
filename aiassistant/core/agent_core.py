@@ -98,8 +98,8 @@ os.environ.setdefault("OLLAMA_FLASH_ATTENTION", "1")
 os.environ.setdefault("OLLAMA_KV_CACHE_TYPE", "q4_0")
 os.environ.setdefault("OLLAMA_KEEP_ALIVE", "0")
 
-FORCED_REASONING_MODEL = "llama3.2:3b"
-FORCED_VISION_MODEL = "moondream"
+FORCED_REASONING_MODEL = "qwen2.5-coder:7b"
+FORCED_VISION_MODEL = "qwen2.5vl:7b"
 HYBRID_MODE = bool(CONFIG.get("runtime", {}).get("hybrid_mode", False))
 
 
@@ -117,10 +117,31 @@ SYSTEM_PROMPT = (
     "copy_path, delete_path, search_file, semantic_search_file, read_file, open_file, launch_application, "
     "close_application, list_running_apps, open_service, move_mouse, click, type_text, press_key, hotkey, "
     "run_command, toggle_dark_mode, send_email, draft_email_attachment, send_telegram, send_whatsapp, "
-    "online_query. "
+    "online_query, open_interpreter. "
     "Do not include JSON or tool syntax in normal user-facing replies. "
     "For simple requests, answer in easy plain language and keep it direct. "
     "For complex requests, provide enough detail to be useful without over-explaining."
+)
+
+
+def _toggle_voice_rvc(enabled: bool) -> None:
+    if requests is None:
+        return
+
+    host = str(CONFIG.get("servers", {}).get("voice_host", "127.0.0.1")).strip()
+    port = int(CONFIG.get("servers", {}).get("voice_port", 8001))
+    action = "load" if enabled else "unload"
+    url = f"http://{host}:{port}/rvc/{action}"
+
+    try:
+        requests.post(url, json={}, timeout=2)
+    except Exception:
+        pass
+
+FILE_RESPONSE_GUARD = (
+    "When working with office files (.doc, .docx, .xlsx, .xls, .csv, .pdf), "
+    "do not echo full file contents. Provide a brief response and refer to the file path. "
+    "Apply the user's writing style profile to new documentation content."
 )
 
 PROMPT_BEHAVIOR_HINTS = {
@@ -513,6 +534,7 @@ class OfflineAgentCore:
             }
         ]
 
+        _toggle_voice_rvc(False)
         try:
             with self._model_lock:
                 response = self._client.chat(
@@ -525,6 +547,7 @@ class OfflineAgentCore:
         except Exception:
             return ""
         finally:
+            _toggle_voice_rvc(True)
             self._release_vram()
 
     def _reason_over_input(
@@ -620,11 +643,31 @@ class OfflineAgentCore:
         behavior_hint = PROMPT_BEHAVIOR_HINTS.get(behavior, "")
         custom = self.system_prompt_custom.strip()
 
-        parts = [base]
+        style_profile = None
+        try:
+            style_profile = self.db.get_style_profile("train_root")
+        except Exception:
+            style_profile = None
+
+        style_hint = ""
+        if isinstance(style_profile, dict):
+            formal = str(style_profile.get("formal", "")).strip()
+            casual = str(style_profile.get("casual", "")).strip()
+            if formal or casual:
+                style_hint = (
+                    "Writing style profile (use for documentation outputs):\n"
+                    f"Formal baseline: {formal}\n"
+                    f"Casual baseline: {casual}\n"
+                    "Default to formal unless the user requests casual."
+                )
+
+        parts = [base, FILE_RESPONSE_GUARD]
         if behavior_hint:
             parts.append(behavior_hint)
         if custom:
             parts.append("Additional behavior override:\n" + custom)
+        if style_hint:
+            parts.append(style_hint)
 
         return "\n\n".join(part for part in parts if part).strip()
 
@@ -742,6 +785,14 @@ class OfflineAgentCore:
             if self.stop_event.is_set():
                 break
             result = _run_tool_action_isolated(action)
+
+            action_name = str(action.get("action", ""))
+            if action_name == "read_file":
+                path_value = str(action.get("path") or "")
+                ext = Path(path_value).suffix.lower()
+                if ext in {".doc", ".docx", ".xlsx", ".xls", ".csv", ".pdf"}:
+                    if isinstance(result, dict) and "data" in result:
+                        result["data"] = {"path": path_value, "note": "content_hidden"}
             results.append({"action": action, "result": result})
 
             if isinstance(result, dict) and result.get("success"):

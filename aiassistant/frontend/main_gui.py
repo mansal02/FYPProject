@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -55,6 +56,7 @@ from PyQt5.QtWidgets import (
 from aiassistant.core.agent_core import AgentConfig, OfflineAgentCore
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.db.database_manager import DatabaseManager
+from aiassistant.infra.doc_indexer import build_default_indexer
 
 
 def _bootstrap_env_bool(name: str, default: bool = False) -> bool:
@@ -373,8 +375,8 @@ if not (_BOOT_DISABLE_LIVE2D or _BOOT_SAFE_MINIMAL):
 
 
 AUTO_LOGIN_FILE = str(CONFIG.get("paths", {}).get("auto_login_file", "./.marie_autologin.json"))
-DEFAULT_REASONING_MODEL = str(CONFIG.get("ollama", {}).get("model", "llama3.2:3b"))
-DEFAULT_VISION_MODEL = str(CONFIG.get("vision", {}).get("vision_model", "moondream") or "moondream")
+DEFAULT_REASONING_MODEL = str(CONFIG.get("ollama", {}).get("model", "qwen2.5-coder:7b"))
+DEFAULT_VISION_MODEL = str(CONFIG.get("vision", {}).get("vision_model", "qwen2.5vl:7b") or "qwen2.5vl:7b")
 DEFAULT_LIVE2D_MODEL = str(CONFIG.get("paths", {}).get("default_live2d_model", ""))
 DEFAULT_TTS_SPEED = float(CONFIG.get("voice", {}).get("speaking_speed", 1.0))
 
@@ -758,6 +760,9 @@ class AssistantMainWindow(QMainWindow):
         self._latest_user_text = ""
         self._discard_next_agent_reply = False
         self._cancel_pending_reset = False
+        self.doc_indexer = None
+        self.idle_index_controller = None
+        self._idle_training_status = "Idle training: paused"
         self.chat_view_mode = "full"
         self.avatar_hidden = False
         self.response_only_mode = bool(
@@ -852,6 +857,8 @@ class AssistantMainWindow(QMainWindow):
         self._apply_styles()
         self._load_preferences_into_ui()
         _write_boot_trace("window:init:ui_ready")
+
+        QTimer.singleShot(300, self._init_idle_training)
 
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self._update_status_strip)
@@ -1116,12 +1123,12 @@ class AssistantMainWindow(QMainWindow):
 
         self.reasoning_model_input = QLineEdit(self.reasoning_model)
         self.reasoning_model_input.setReadOnly(True)
-        self.reasoning_model_input.setToolTip("Enforced for low-VRAM runtime: llama3.2:3b")
+        self.reasoning_model_input.setToolTip("Enforced for low-VRAM runtime: qwen2.5-coder:7b")
         form.addRow("Reasoning model", self.reasoning_model_input)
 
         self.vision_model_input = QLineEdit(self.vision_model)
         self.vision_model_input.setReadOnly(True)
-        self.vision_model_input.setToolTip("Enforced for low-VRAM runtime: moondream")
+        self.vision_model_input.setToolTip("Enforced for low-VRAM runtime: qwen2.5vl:7b")
         form.addRow("Vision model", self.vision_model_input)
 
         model_row = QHBoxLayout()
@@ -1190,6 +1197,14 @@ class AssistantMainWindow(QMainWindow):
         reload_avatar_btn = QPushButton("Reload Avatar")
         reload_avatar_btn.clicked.connect(self.on_reload_avatar_clicked)
         button_row.addWidget(reload_avatar_btn)
+
+        analyze_btn = QPushButton("Analyze Training Docs")
+        analyze_btn.clicked.connect(lambda: self.run_document_indexing(full_scan=True))
+        button_row.addWidget(analyze_btn)
+
+        open_train_btn = QPushButton("Open Training Folder")
+        open_train_btn.clicked.connect(self.open_training_folder)
+        button_row.addWidget(open_train_btn)
 
         forget_btn = QPushButton("Forget Auto-Login")
         forget_btn.clicked.connect(self.on_forget_autologin_clicked)
@@ -1828,6 +1843,8 @@ class AssistantMainWindow(QMainWindow):
 
     def _update_status_strip(self) -> None:
         extra = []
+        if self._idle_training_status:
+            extra.append(self._idle_training_status)
         if self.camera_toggle.isChecked():
             cam_state = self.camera.get_state()
             extra.append(f"Camera {'ok' if cam_state.tracking_ok else 'off'}")
@@ -1849,6 +1866,62 @@ class AssistantMainWindow(QMainWindow):
         if extra:
             suffix = " | " + " | ".join(extra)
         self.status_label.setText(f"Status: {self._status_core}{suffix}")
+
+    def _update_idle_training_status(self, message: str) -> None:
+        self._idle_training_status = str(message or "Idle training: paused")
+        self._update_status_strip()
+
+    def _init_idle_training(self) -> None:
+        if self.doc_indexer or self.idle_index_controller:
+            return
+        self.doc_indexer, self.idle_index_controller = build_default_indexer(
+            db=self.db,
+            status_cb=self._update_idle_training_status,
+        )
+        if self.idle_index_controller:
+            self.idle_index_controller.start()
+        self._prompt_document_analysis()
+
+    def _prompt_document_analysis(self) -> None:
+        prompt = (
+            "Analyze training documents now?\n"
+            "This will scan supported files and store text into the local searchable mirror."
+        )
+        confirm = QMessageBox.question(
+            self,
+            "Document Analysis",
+            prompt,
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm == QMessageBox.Yes:
+            self.run_document_indexing(full_scan=True)
+
+    def open_training_folder(self) -> None:
+        train_root = CONFIG.get("paths", {}).get("train_root", "")
+        if not train_root:
+            return
+        try:
+            if os.name == "nt" and hasattr(os, "startfile"):
+                os.startfile(train_root)
+        except Exception:
+            pass
+
+    def run_document_indexing(self, full_scan: bool = False) -> None:
+        if not self.doc_indexer:
+            return
+
+        def _work() -> None:
+            self._update_idle_training_status("Idle training: manual scan running")
+            max_files = None if full_scan else 24
+            processed = self.doc_indexer.run_index_cycle(max_files=max_files, sleep_sec=0.02)
+            if full_scan and self.doc_indexer:
+                train_root = Path(CONFIG.get("paths", {}).get("train_root", "D:/Train"))
+                self.doc_indexer.build_style_profile(train_root)
+            self._update_idle_training_status(
+                f"Idle training: manual scan done ({processed} files)"
+            )
+
+        threading.Thread(target=_work, daemon=True).start()
 
     @staticmethod
     def _normalize_command_text(text: str) -> str:

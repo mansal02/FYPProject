@@ -11,7 +11,7 @@ class ReasoningStreamWorker(QThread):
 
     token_received = pyqtSignal(str)
     sentence_ready = pyqtSignal(str)
-    completed = pyqtSignal(str)
+    completed = pyqtSignal(str, str)
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
     stream_started = pyqtSignal(str)
@@ -26,6 +26,7 @@ class ReasoningStreamWorker(QThread):
         self.payload["request_id"] = self.request_id
         self._cancel_event = threading.Event()
         self._active_response = None
+        self._last_sentiment = "neutral"
 
     def cancel(self):
         self._cancel_event.set()
@@ -83,7 +84,8 @@ class ReasoningStreamWorker(QThread):
                         self.sentence_ready.emit(content)
                 elif packet_type == "done":
                     response_text = packet.get("full_response", full_text)
-                    self.completed.emit(response_text)
+                    self._last_sentiment = packet.get("sentiment") or self._last_sentiment
+                    self.completed.emit(response_text, self._last_sentiment)
                     return
                 elif packet_type == "error":
                     self.failed.emit(content or "Reasoning stream failed.")
@@ -93,7 +95,7 @@ class ReasoningStreamWorker(QThread):
             if self._cancel_event.is_set():
                 self.cancelled.emit()
             else:
-                self.completed.emit(full_text)
+                self.completed.emit(full_text, self._last_sentiment)
 
         except Exception as e:
             if self._cancel_event.is_set():

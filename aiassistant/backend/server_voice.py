@@ -1,4 +1,6 @@
+import gc
 import os
+import re
 import threading
 import wave
 import uvicorn
@@ -19,10 +21,38 @@ app = FastAPI()
 voice_engine = MarieVoice()
 rvc_engine = None
 
+
+def _resolve_rvc_device() -> str:
+    # NOTE: CPU conversion takes 5-10 seconds; GPU takes ~0.5s.
+    return "cuda:0" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+
+
+def _ensure_rvc_engine() -> None:
+    global rvc_engine
+    if not RVC_AVAILABLE:
+        rvc_engine = None
+        return
+    if rvc_engine is None:
+        rvc_engine = RVCInference(device=_resolve_rvc_device())
+
+
+def _release_rvc_engine() -> None:
+    global rvc_engine
+    rvc_engine = None
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
 if RVC_AVAILABLE:
-    # NOTE: CPU conversion takes 5-10 seconds! GPU takes 0.5s.
-    device = "cuda:0" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
-    rvc_engine = RVCInference(device=device)
+    _ensure_rvc_engine()
 
 
 def _get_wav_duration_ms(path):
@@ -38,6 +68,13 @@ def _get_wav_duration_ms(path):
     except Exception:
         return 0
 
+
+def _extract_emotion_tag(text):
+    match = re.search(r"\[([a-zA-Z]+)\]", str(text or ""))
+    if not match:
+        return ""
+    return match.group(1).strip().lower()
+
 @app.post("/speak")
 def speak_endpoint(payload: dict = Body(...)):
     text = payload.get("text")
@@ -50,6 +87,9 @@ def speak_endpoint(payload: dict = Body(...)):
 
     char_data, _ = get_character_data(char_id)
     use_rvc = char_data.get("rvc_enable", False) and RVC_AVAILABLE
+    emotion_tag = _extract_emotion_tag(text)
+    emotion_cfg = (char_data.get("emotions") or {}).get(emotion_tag, {})
+    emotion_pitch = emotion_cfg.get("pitch_shift", char_data.get("pitch_shift", 0))
     
     if voice_engine.current_name.lower() != char_data["name"].lower():
         voice_engine.set_voice(char_id)
@@ -60,9 +100,10 @@ def speak_endpoint(payload: dict = Body(...)):
     final_path = raw_audio_path
 
     if use_rvc and raw_audio_path:
+        _ensure_rvc_engine()
         model_name = char_data["rvc_model"]
         index_name = char_data.get("rvc_index", "")
-        pitch = char_data.get("pitch_shift", 0)
+        pitch = emotion_pitch
 
         model_path = os.path.join(RVC_DIR, model_name)
         index_path = os.path.join(RVC_DIR, index_name) if index_name else None
@@ -103,6 +144,24 @@ def speak_endpoint(payload: dict = Body(...)):
         "duration_ms": duration_ms,
         "async": bool(async_play),
     }
+
+
+@app.post("/rvc/unload")
+def rvc_unload_endpoint(payload: dict = Body(None)):
+    _ = payload or {}
+    if not RVC_AVAILABLE:
+        return {"status": "disabled"}
+    _release_rvc_engine()
+    return {"status": "unloaded"}
+
+
+@app.post("/rvc/load")
+def rvc_load_endpoint(payload: dict = Body(None)):
+    _ = payload or {}
+    if not RVC_AVAILABLE:
+        return {"status": "disabled"}
+    _ensure_rvc_engine()
+    return {"status": "loaded"}
 
 
 @app.post("/stop")

@@ -46,7 +46,7 @@ class CrewManager:
         self.mode = _normalize_mode(self.settings.get("mode", "assist"))
         self.router = _normalize_router(self.settings.get("router", "complex_only"))
         self.verbose = bool(self.settings.get("verbose", False))
-        self.base_model = str(CONFIG.get("ollama", {}).get("model", "llama3.2:3b")).strip()
+        self.base_model = str(CONFIG.get("ollama", {}).get("model", "qwen2.5-coder:7b")).strip()
         self.ollama_host = str(CONFIG.get("ollama", {}).get("host", "http://127.0.0.1:11434"))
         os.environ.setdefault("OLLAMA_HOST", self.ollama_host)
         self.available_models = self._list_ollama_models()

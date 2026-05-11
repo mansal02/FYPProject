@@ -12,6 +12,7 @@ import hashlib
 import re
 import sqlite3
 import threading
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -108,6 +109,26 @@ class DatabaseManager:
             created_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
+
+        CREATE TABLE IF NOT EXISTS searchable_mirror (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_path TEXT UNIQUE NOT NULL,
+            raw_text_or_data TEXT,
+            file_hash TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS style_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT UNIQUE NOT NULL,
+            profile_json TEXT,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_searchable_mirror_path
+            ON searchable_mirror(file_path);
+        CREATE INDEX IF NOT EXISTS idx_style_profiles_scope
+            ON style_profiles(scope);
         """
         with self._lock:
             self.conn.executescript(schema)
@@ -301,6 +322,99 @@ class DatabaseManager:
         with self._lock:
             self.conn.close()
 
+    # --- Searchable mirror ---
+    def save_searchable_mirror(self, file_path: str, raw_text: str, file_hash: str) -> None:
+        if not file_path or not raw_text:
+            return
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO searchable_mirror (file_path, raw_text_or_data, file_hash, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(file_path) DO UPDATE SET
+                    raw_text_or_data=excluded.raw_text_or_data,
+                    file_hash=excluded.file_hash,
+                    updated_at=excluded.updated_at
+                """,
+                (str(file_path), str(raw_text), str(file_hash or ""), now),
+            )
+            self.conn.commit()
+
+    def get_searchable_mirror_hash(self, file_path: str) -> str | None:
+        clean = str(file_path or "").strip()
+        if not clean:
+            return None
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT file_hash FROM searchable_mirror WHERE file_path = ?",
+                (clean,),
+            ).fetchone()
+        if not row:
+            return None
+        return str(row["file_hash"] or "")
+
+    def search_searchable_mirror(self, query: str, limit: int = 8) -> List[Dict[str, str]]:
+        clean = str(query or "").strip()
+        if not clean:
+            return []
+        wildcard = f"%{clean}%"
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT file_path, raw_text_or_data
+                FROM searchable_mirror
+                WHERE raw_text_or_data LIKE ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (wildcard, max(1, int(limit))),
+            ).fetchall()
+
+        results: List[Dict[str, str]] = []
+        for row in rows:
+            raw = str(row["raw_text_or_data"] or "")
+            idx = raw.lower().find(clean.lower())
+            snippet = ""
+            if idx >= 0:
+                start = max(0, idx - 120)
+                end = min(len(raw), idx + 240)
+                snippet = raw[start:end].strip()
+            results.append({"file_path": str(row["file_path"]), "snippet": snippet})
+        return results
+
+    # --- Style profile ---
+    def save_style_profile(self, scope: str, profile_json: Dict[str, object]) -> None:
+        clean_scope = str(scope or "default").strip() or "default"
+        now = datetime.now().isoformat(timespec="seconds")
+        payload = json.dumps(profile_json or {}, ensure_ascii=True)
+        with self._lock:
+            self.conn.execute(
+                """
+                INSERT INTO style_profiles (scope, profile_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(scope) DO UPDATE SET
+                    profile_json=excluded.profile_json,
+                    updated_at=excluded.updated_at
+                """,
+                (clean_scope, payload, now),
+            )
+            self.conn.commit()
+
+    def get_style_profile(self, scope: str = "default") -> Dict[str, object] | None:
+        clean_scope = str(scope or "default").strip() or "default"
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT profile_json FROM style_profiles WHERE scope = ?",
+                (clean_scope,),
+            ).fetchone()
+        if not row or not row["profile_json"]:
+            return None
+        try:
+            return json.loads(row["profile_json"])
+        except Exception:
+            return None
+
     # --- User auth + preferences ---
     def register_user(self, username: str, password: str) -> tuple[bool, str]:
         clean_username = (username or "").strip()
@@ -475,8 +589,8 @@ class DatabaseManager:
     def get_user_preference(self, user_id: int) -> Dict[str, object]:
         defaults = {
             "preferred_voice": "system_default",
-            "preferred_reasoning_model": str(CONFIG.get("ollama", {}).get("model", "llama3.2:3b")),
-            "preferred_vision_model": str(CONFIG.get("vision", {}).get("vision_model", "moondream")),
+            "preferred_reasoning_model": str(CONFIG.get("ollama", {}).get("model", "qwen2.5-coder:7b")),
+            "preferred_vision_model": str(CONFIG.get("vision", {}).get("vision_model", "qwen2.5vl:7b")),
             "preferred_live2d_model": str(CONFIG.get("paths", {}).get("default_live2d_model", "")),
             "tts_enabled": True,
             "voice_input_enabled": False,

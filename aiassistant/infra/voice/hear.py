@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import math
 import speech_recognition as sr
 from difflib import get_close_matches
 from collections import deque
@@ -225,6 +226,7 @@ class VoiceWorker(QThread):
     text_received = pyqtSignal(str)     
     status_update = pyqtSignal(str)     
     speech_detected = pyqtSignal()
+    clarification_needed = pyqtSignal(str, float)
 
     def __init__(self, model_size="base", wake_word="hey"):
         super().__init__()
@@ -258,6 +260,9 @@ class VoiceWorker(QThread):
         self.enable_openwakeword = bool(voice_cfg.get("enable_openwakeword", False))
         self.allow_online_fallback = bool(voice_cfg.get("allow_online_fallback", True))
         self.allow_commands_without_wake_word = bool(voice_cfg.get("allow_commands_without_wake_word", True))
+        self.transcription_confidence_threshold = float(
+            voice_cfg.get("transcription_confidence_threshold", 0.60)
+        )
         self.command_hint = str(voice_cfg.get("command_hint", DEFAULT_COMMAND_HINT)).strip()
         self.wakeword_threshold = float(voice_cfg.get("wakeword_threshold", 0.35))
         self._sphinx_keyword_entries = self._build_sphinx_keyword_entries()
@@ -398,6 +403,24 @@ class VoiceWorker(QThread):
             return best
         except Exception:
             return 0.0
+
+    @staticmethod
+    def _estimate_whisper_confidence(segments):
+        scores = []
+        for seg in segments or []:
+            avg_logprob = getattr(seg, "avg_logprob", None)
+            if avg_logprob is None:
+                continue
+            try:
+                scores.append(float(avg_logprob))
+            except Exception:
+                continue
+
+        if not scores:
+            return None
+
+        avg_logprob = sum(scores) / float(len(scores))
+        return max(0.0, min(1.0, math.exp(avg_logprob)))
         
     def run(self):
         model = None
@@ -533,14 +556,21 @@ class VoiceWorker(QThread):
                             vad_filter=True,
                         )
                     text = "".join([s.text for s in segments]).strip()
+                    confidence = self._estimate_whisper_confidence(segments)
                 else:
                     text = self._transcribe_with_speech_recognition(r, audio)
+                    confidence = None
 
                 text = re.sub(r"\s+", " ", text)
                 
                 if os.path.exists("temp_audio.wav"): os.remove("temp_audio.wav")
 
                 cleaned = re.sub(r"[^a-zA-Z0-9]", "", text)
+                if confidence is not None and confidence < self.transcription_confidence_threshold:
+                    self.clarification_needed.emit(text, confidence)
+                    self.status_update.emit("Low confidence - ask to repeat")
+                    continue
+
                 if text and len(cleaned) >= 2:
                     brain.update(text)
                     self.process_text(text)
