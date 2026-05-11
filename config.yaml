@@ -5,6 +5,8 @@ paths:
   piper_dir: ./piper
   rvc_dir: ./rvc_models
   knowledge_dir: ./knowledge
+  train_root: D:/Train
+  train_response_dir: D:/Train/response
 
 servers:
   reasoning_url: http://127.0.0.1:8000/chat
@@ -19,7 +21,7 @@ servers:
 
 ollama:
   host: http://127.0.0.1:11434
-  model: llama3.2:3b
+  model: qwen2.5-coder:7b
   num_predict: 360
   num_ctx: 2048
   temperature: 0.2
@@ -72,6 +74,7 @@ voice:
   enable_openwakeword: false
   enable_silero_vad: true
   allow_online_fallback: true
+  transcription_confidence_threshold: 0.60
 
 ui:
   theme: dark
@@ -88,13 +91,13 @@ crew:
   context_max_chars: 900
   verbose: false
   models:
-    researcher: qwen2.5:7b
-    coder: qwen2.5:7b
-    synthesizer: llama3.1:8b
+    researcher: qwen2.5-coder:7b
+    coder: qwen2.5-coder:7b
+    synthesizer: qwen2.5-coder:7b
 
 vision:
   screen_share_enabled: false
-  vision_model: moondream
+  vision_model: qwen2.5vl:7b
   screenshot_dir: ./cache/screens
   capture_interval_sec: 0.8
   max_width: 1280
@@ -107,3 +110,24 @@ runtime:
 actions:
   safe_mode: true
   allow_legacy_text_commands: true
+
+training:
+  idle_min_sec: 120
+  idle_max_sec: 300
+  max_files_per_cycle: 24
+  sleep_between_files_sec: 0.05
+  include_extensions:
+    - .txt
+    - .log
+    - .md
+    - .pdf
+    - .docx
+    - .csv
+    - .xlsx
+  skip_dirs:
+    - C:/Windows
+    - C:/Program Files
+    - C:/Program Files (x86)
+    - C:/$Recycle.Bin
+    - C:/System Volume Information
+    - .git

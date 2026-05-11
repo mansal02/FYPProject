@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 from aiassistant.infra.config.app_config import CONFIG
+from aiassistant.infra.db.database import MarieDB
 
 try:
     from aiassistant.infra.memory_agent import get_memory_agent_context, warm_memory_agent_index
@@ -186,15 +187,46 @@ def _query_memory_agent(question, top_k):
         return ""
 
 
+def _query_searchable_mirror(question, top_k):
+    clean = str(question or "").strip()
+    if not clean:
+        return ""
+    try:
+        db = MarieDB()
+        results = db.search_searchable_mirror(clean, limit=max(1, int(top_k)))
+    except Exception:
+        return ""
+
+    if not results:
+        return ""
+
+    lines = []
+    for item in results:
+        path = str(item.get("file_path", "")).strip()
+        snippet = str(item.get("snippet", "")).strip()
+        if not path:
+            continue
+        if snippet:
+            lines.append(f"- {path} :: {snippet[:240]}")
+        else:
+            lines.append(f"- {path}")
+
+    return "\n".join(lines)
+
+
 def get_rag_context(question, top_k=4):
     memory_snippets = _query_memory_agent(question, top_k=max(1, int(top_k)))
     local_snippets = RAG.query(question, top_k=top_k)
+    mirror_snippets = _query_searchable_mirror(question, top_k=max(1, int(top_k)))
 
-    if memory_snippets and local_snippets:
-        return (
-            "Memory agent snippets:\n"
-            f"{memory_snippets}\n\n"
-            "Knowledge folder snippets:\n"
-            f"{local_snippets}"
-        )
-    return memory_snippets or local_snippets
+    sections = []
+    if memory_snippets:
+        sections.append("Memory agent snippets:\n" + memory_snippets)
+    if local_snippets:
+        sections.append("Knowledge folder snippets:\n" + local_snippets)
+    if mirror_snippets:
+        sections.append("Searchable mirror snippets:\n" + mirror_snippets)
+
+    if sections:
+        return "\n\n".join(sections).strip()
+    return ""

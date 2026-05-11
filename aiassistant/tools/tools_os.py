@@ -27,6 +27,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
+from aiassistant.infra.config.app_config import CONFIG
+from aiassistant.infra.db.database import MarieDB
+
 try:
     import pyautogui
 
@@ -51,6 +54,15 @@ except Exception:  # pragma: no cover - optional dependency
 
 _SENTENCE_TRANSFORMER_CLASS = None
 _SENTENCE_TRANSFORMER_UNAVAILABLE = False
+
+_SAFE_MODE_ENABLED = bool(CONFIG.get("actions", {}).get("safe_mode", True))
+_PROTECTED_PATH_PREFIXES = [
+    "c:/windows",
+    "c:/program files",
+    "c:/program files (x86)",
+    "c:/$recycle.bin",
+    "c:/system volume information",
+]
 
 
 def _get_sentence_transformer_class():
@@ -155,6 +167,16 @@ def _safe_resolve_path(raw_path: str) -> Path:
     else:
         path = path.resolve()
     return path
+
+
+def _is_protected_path(path_obj: Path) -> bool:
+    if not _SAFE_MODE_ENABLED:
+        return False
+    try:
+        resolved = str(path_obj.resolve()).replace("\\", "/").lower()
+    except Exception:
+        resolved = str(path_obj).replace("\\", "/").lower()
+    return any(resolved.startswith(prefix) for prefix in _PROTECTED_PATH_PREFIXES)
 
 
 def _list_drive_roots() -> List[Path]:
@@ -757,6 +779,18 @@ class UnifiedTaskBridge:
             return _fail("No accessible roots were found.", "missing_roots")
         return _ok("Listed accessible storage roots.", data=[str(path) for path in roots])
 
+    def search_mirror(self, query: str, limit: int = 8) -> Dict[str, Any]:
+        clean = str(query or "").strip()
+        if not clean:
+            return _fail("Mirror search query was empty.", "empty_query")
+
+        try:
+            db = MarieDB()
+            results = db.search_searchable_mirror(clean, limit=int(limit) or 8)
+            return _ok(f"Mirror search returned {len(results)} match(es).", data=results)
+        except Exception as exc:
+            return _fail("Mirror search failed.", str(exc))
+
     def list_directory(
         self,
         path: str,
@@ -1156,6 +1190,8 @@ class UnifiedTaskBridge:
 
         try:
             target = _safe_resolve_path(clean_path)
+            if _is_protected_path(target):
+                return _fail("Path is protected by safe mode.", "protected_path")
             if clean_kind in {"dir", "folder", "directory"}:
                 if target.exists() and not target.is_dir():
                     return _fail("Target exists as a file.", f"path_conflict: {target}")
@@ -1180,6 +1216,8 @@ class UnifiedTaskBridge:
         try:
             src_path = _safe_resolve_path(clean_src)
             dst_path = _safe_resolve_path(clean_dst)
+            if _is_protected_path(src_path) or _is_protected_path(dst_path):
+                return _fail("Path is protected by safe mode.", "protected_path")
 
             if not src_path.exists():
                 return _fail("Move source was not found.", f"missing_source: {src_path}")
@@ -1213,6 +1251,8 @@ class UnifiedTaskBridge:
         try:
             src_path = _safe_resolve_path(clean_src)
             dst_path = _safe_resolve_path(clean_dst)
+            if _is_protected_path(src_path) or _is_protected_path(dst_path):
+                return _fail("Path is protected by safe mode.", "protected_path")
 
             if not src_path.exists():
                 return _fail("Copy source was not found.", f"missing_source: {src_path}")
@@ -1253,6 +1293,8 @@ class UnifiedTaskBridge:
 
         try:
             target = _safe_resolve_path(clean_path)
+            if _is_protected_path(target):
+                return _fail("Path is protected by safe mode.", "protected_path")
             if not target.exists():
                 return _fail("Delete target was not found.", f"missing_path: {target}")
 
@@ -1618,6 +1660,13 @@ class UnifiedTaskBridge:
             if not path.exists() or not path.is_file():
                 return _fail("File was not found.", f"missing_file: {path}")
 
+            office_exts = {".doc", ".docx", ".xlsx", ".xls", ".csv", ".pdf"}
+            if path.suffix.lower() in office_exts:
+                return _ok(
+                    "File content hidden by policy for office documents.",
+                    data={"path": str(path)},
+                )
+
             suffix = path.suffix.lower()
             if suffix == ".pdf":
                 if PyPDF2 is None:
@@ -1784,6 +1833,34 @@ class UnifiedTaskBridge:
             )
         except Exception as exc:
             return _fail("System command execution failed.", str(exc))
+
+    def run_open_interpreter(self, instruction: str, timeout: int = 120) -> Dict[str, Any]:
+        clean = (instruction or "").strip()
+        if not clean:
+            return _fail("Open Interpreter instruction was empty.", "empty_instruction")
+
+        exe = shutil.which("interpreter")
+        if not exe:
+            return _fail("Open Interpreter CLI not found.", "missing_dependency: open-interpreter")
+
+        try:
+            completed = subprocess.run(
+                [exe, "--auto-run"],
+                input=clean,
+                capture_output=True,
+                text=True,
+                timeout=max(5, int(timeout)),
+            )
+            combined = (completed.stdout or "") + ("\n" + completed.stderr if completed.stderr else "")
+            compact = combined.strip()[:4000]
+            if completed.returncode == 0:
+                return _ok("Open Interpreter completed.", data={"output": compact})
+            return _fail(
+                "Open Interpreter failed.",
+                f"exit_code={completed.returncode}; output={compact}",
+            )
+        except Exception as exc:
+            return _fail("Open Interpreter execution failed.", str(exc))
 
     def toggle_dark_mode(self, enable: Optional[bool] = None) -> Dict[str, Any]:
         if os.name == "nt":
@@ -2232,6 +2309,12 @@ class UnifiedTaskBridge:
             if action_name == "list_system_roots":
                 return self.list_system_roots()
 
+            if action_name == "search_mirror":
+                return self.search_mirror(
+                    query=str(action.get("query") or action.get("hint") or ""),
+                    limit=int(action.get("max_results", 8) or 8),
+                )
+
             if action_name == "list_directory":
                 return self.list_directory(
                     path=str(action.get("path", "")),
@@ -2377,6 +2460,12 @@ class UnifiedTaskBridge:
                 return self.run_system_command(
                     command=str(action.get("command", "")),
                     timeout=int(action.get("timeout", 25) or 25),
+                )
+
+            if action_name == "open_interpreter":
+                return self.run_open_interpreter(
+                    instruction=str(action.get("instruction") or action.get("prompt") or ""),
+                    timeout=int(action.get("timeout", 120) or 120),
                 )
 
             if action_name == "toggle_dark_mode":

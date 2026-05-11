@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import threading
+from pathlib import Path
 import pygame
 import math
 import time
@@ -24,6 +25,7 @@ from aiassistant.core.event_bus import EventBus, Events
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.vision.screen_vision import PYAUTOGUI_AVAILABLE, capture_screen_snapshot
 from aiassistant.workers.reasoning_worker import ReasoningStreamWorker
+from aiassistant.infra.doc_indexer import build_default_indexer
 
 # --- LIVE2D IMPORT ---
 try:
@@ -95,6 +97,59 @@ _VOICE_NOISE_KEYWORDS = {
     "unmute",
     "volume",
 }
+
+_SENTIMENT_TAGS = {
+    "happy",
+    "sad",
+    "angry",
+    "excited",
+    "surprised",
+    "confused",
+    "neutral",
+    "concerned",
+    "friendly",
+    "serious",
+    "annoyed",
+    "bored",
+}
+_SENTIMENT_KEYWORDS = {
+    "happy": {"happy", "great", "awesome", "love", "fantastic", "glad", "delight"},
+    "sad": {"sad", "sorry", "down", "upset", "unhappy", "depressed"},
+    "angry": {"angry", "mad", "furious", "annoyed", "rage"},
+    "excited": {"excited", "thrilled", "can't wait", "hyped"},
+    "surprised": {"surprised", "wow", "whoa", "unexpected"},
+    "confused": {"confused", "unsure", "not sure", "unclear"},
+    "concerned": {"concerned", "worried", "issue", "problem"},
+}
+
+
+def _detect_sentiment(text):
+    if not text:
+        return "neutral"
+
+    match = re.search(r"\[([a-zA-Z]+)\]", text)
+    if match:
+        tag = match.group(1).lower()
+        if tag in _SENTIMENT_TAGS:
+            return tag
+
+    lowered = text.lower()
+    scores = {}
+    for sentiment, keywords in _SENTIMENT_KEYWORDS.items():
+        hits = sum(1 for token in keywords if token in lowered)
+        if hits:
+            scores[sentiment] = hits
+
+    if not scores:
+        return "neutral"
+
+    return max(scores.items(), key=lambda item: item[1])[0]
+
+
+def _strip_sentiment_tags(text):
+    if not text:
+        return text
+    return re.sub(r"\[(?:" + "|".join(sorted(_SENTIMENT_TAGS)) + r")\]", "", text, flags=re.IGNORECASE)
 
 
 def _sanitize_action_output_for_chat(output):
@@ -342,11 +397,21 @@ class SettingsWindow(QDialog):
         forget_login_btn.setStyleSheet("background: #6a1b1b; padding: 6px; color: white;")
         forget_login_btn.clicked.connect(self.forget_one_time_login)
 
+        analyze_btn = QPushButton("Analyze Training Documents")
+        analyze_btn.setStyleSheet("background: #2d8a2d; padding: 6px; color: white;")
+        analyze_btn.clicked.connect(self.run_document_indexing)
+
+        open_train_btn = QPushButton("Open Training Folder")
+        open_train_btn.setStyleSheet("background: #444; padding: 6px; color: white;")
+        open_train_btn.clicked.connect(self.open_training_folder)
+
         layout.addRow("Voice Persona:", self.voice_combo)
         layout.addRow("Model Path:", self.model_path_input)
         layout.addRow("", browse_btn)
         layout.addRow("", save_btn)
         layout.addRow("", forget_login_btn)
+        layout.addRow("", analyze_btn)
+        layout.addRow("", open_train_btn)
         
         prefs = self.db.get_preference(self.uid)
         if prefs:
@@ -447,6 +512,20 @@ class SettingsWindow(QDialog):
     def forget_one_time_login(self):
         clear_auto_login_user()
         QMessageBox.information(self, "Done", "One-time login was cleared.")
+
+    def run_document_indexing(self):
+        if hasattr(self.main_win, "run_document_indexing"):
+            self.main_win.run_document_indexing(full_scan=True)
+
+    def open_training_folder(self):
+        train_root = CONFIG.get("paths", {}).get("train_root", "")
+        if not train_root:
+            return
+        try:
+            if os.name == "nt" and hasattr(os, "startfile"):
+                os.startfile(train_root)
+        except Exception:
+            pass
 
     def toggle_log_filter(self):
         self.current_session_only = not self.current_session_only
@@ -560,6 +639,12 @@ class MainWindow(QMainWindow):
         self.current_viseme_value = 0.0
         self.latest_user_text = ""
         self.latest_action_result = ""
+        self.latest_sentiment = "neutral"
+        self.current_sentiment = "neutral"
+        self.last_sentiment_ts = 0.0
+        self.doc_indexer = None
+        self.idle_index_controller = None
+        self.idle_training_status = "Idle training: paused"
         self.voice_thread = None
         self.reasoning_worker = None
         self.current_request_id = None
@@ -596,6 +681,7 @@ class MainWindow(QMainWindow):
             self.voice_thread.text_received.connect(self.handle_voice_input)
             self.voice_thread.status_update.connect(self.update_voice_status)
             self.voice_thread.speech_detected.connect(self.handle_speech_activity)
+            self.voice_thread.clarification_needed.connect(self.handle_low_confidence)
             self.voice_thread.start()
             try:
                 self.hotkey_id = keyboard.add_hotkey(self.mic_hotkey, self.voice_thread.toggle_listening)
@@ -633,6 +719,7 @@ class MainWindow(QMainWindow):
 
         self.perform_startup_checks()
         QTimer.singleShot(100, self.init_live2d_embedding)
+        QTimer.singleShot(300, self._init_idle_training)
 
     def _bind_events(self):
         self.event_bus.subscribe(Events.AI_SENTENCE_READY, self._on_ai_sentence_ready)
@@ -759,6 +846,126 @@ class MainWindow(QMainWindow):
             color = "#d7ba7d"
         self.voice_label.setStyleSheet(f"color: {color}; margin-right: 10px;")
         self.voice_label.setText(f"[{status}]")
+
+    def _apply_idle_training_status(self):
+        if self.is_processing_response or self.waiting_for_voice_finish:
+            return
+        label = self.idle_training_status or "Idle training: paused"
+        color = "#4ec9b0" if "indexing" in label.lower() else "#888"
+        self.set_processing_status(label, color)
+
+    def _update_idle_training_status(self, message):
+        self.idle_training_status = str(message or "Idle training: paused")
+        self._apply_idle_training_status()
+
+    def _init_idle_training(self):
+        if self.doc_indexer or self.idle_index_controller:
+            return
+        self.doc_indexer, self.idle_index_controller = build_default_indexer(
+            db=self.db,
+            status_cb=self._update_idle_training_status,
+        )
+        if self.idle_index_controller:
+            self.idle_index_controller.start()
+        self._prompt_document_analysis()
+
+    def _prompt_document_analysis(self):
+        prompt = (
+            "Analyze training documents now?\n"
+            "This will scan supported files and store text into the local searchable mirror."
+        )
+        confirm = QMessageBox.question(
+            self,
+            "Document Analysis",
+            prompt,
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm == QMessageBox.Yes:
+            self.run_document_indexing(full_scan=True)
+
+    def run_document_indexing(self, full_scan=False):
+        if not self.doc_indexer:
+            return
+
+        def _work():
+            self._update_idle_training_status("Idle training: manual scan running")
+            max_files = None if full_scan else 24
+            processed = self.doc_indexer.run_index_cycle(max_files=max_files, sleep_sec=0.02)
+            if full_scan and self.doc_indexer:
+                train_root = Path(CONFIG.get("paths", {}).get("train_root", "D:/Train"))
+                self.doc_indexer.build_style_profile(train_root)
+            self._update_idle_training_status(
+                f"Idle training: manual scan done ({processed} files)"
+            )
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def handle_low_confidence(self, text, confidence):
+        _ = text
+        try:
+            score = float(confidence)
+        except (TypeError, ValueError):
+            score = 0.0
+        self.chat_history.append(
+            f"<span style='color:#d7ba7d'><i>[System] I didn't catch that (confidence {score:.2f}). Please repeat or type it.</i></span>"
+        )
+        self.set_processing_status("Status: Awaiting clarification", "#d7ba7d")
+
+    def _set_sentiment(self, sentiment):
+        resolved = sentiment if sentiment in _SENTIMENT_TAGS else "neutral"
+        self.current_sentiment = resolved
+        self.last_sentiment_ts = time.time()
+
+    def _resolve_tts_emotion_tag(self, sentiment):
+        if not sentiment or sentiment == "neutral":
+            return ""
+        char_data = CHARACTERS.get(self.current_character)
+        if not char_data:
+            return ""
+        emotions = char_data.get("emotions", {})
+        return sentiment if sentiment in emotions else ""
+
+    def _safe_set_param(self, param_id, value):
+        if not getattr(self, "model", None):
+            return
+        try:
+            self.model.SetParameterValue(param_id, float(value))
+        except Exception:
+            return
+
+    def _apply_sentiment_expression(self):
+        if not getattr(self, "model", None):
+            return
+
+        sentiment = self.current_sentiment
+        if time.time() - self.last_sentiment_ts > 6.0:
+            sentiment = "neutral"
+
+        mouth_form = 0.0
+        brow = 0.0
+        eye_smile = 0.0
+
+        if sentiment in {"happy", "excited", "friendly"}:
+            mouth_form = 0.5
+            eye_smile = 0.6
+            brow = 0.1
+        elif sentiment in {"sad", "concerned"}:
+            mouth_form = -0.5
+            brow = -0.3
+        elif sentiment in {"angry", "annoyed"}:
+            mouth_form = -0.2
+            brow = -0.8
+        elif sentiment == "surprised":
+            mouth_form = 0.2
+            brow = 0.6
+        elif sentiment == "confused":
+            mouth_form = -0.1
+            brow = 0.3
+
+        self._safe_set_param("ParamMouthForm", mouth_form)
+        self._safe_set_param("ParamBrowLY", brow)
+        self._safe_set_param("ParamBrowRY", brow)
+        self._safe_set_param("ParamEyeSmile", eye_smile)
 
     def _docs_url_from_api(self, api_url):
         parsed = urlparse(api_url)
@@ -1009,6 +1216,8 @@ class MainWindow(QMainWindow):
             self.model.SetParameterValue("ParamEyeLOpen", 1.0)
             self.model.SetParameterValue("ParamEyeROpen", 1.0)
 
+        self._apply_sentiment_expression()
+
         self.model.Update()
         if self.transparent_face:
             live2d.clearBuffer(0.0, 0.0, 0.0, 0.0)
@@ -1104,21 +1313,32 @@ class MainWindow(QMainWindow):
         self.append_token(token)
 
     def _on_stream_sentence(self, sentence):
-        self.event_bus.emit(Events.AI_SENTENCE_READY, {"sentence": sentence})
+        if sentence:
+            detected = _detect_sentiment(sentence)
+            if detected != "neutral":
+                self._set_sentiment(detected)
+            self._on_ai_sentence_ready({"sentence": sentence})
 
     def _on_ai_sentence_ready(self, payload):
         sentence = (payload or {}).get("sentence", "")
         if not sentence or not self.voice_output_enabled:
             return
-        threading.Thread(target=self._speak_sentence_remote, args=(sentence,), daemon=True).start()
+        sentiment = _detect_sentiment(sentence)
+        threading.Thread(
+            target=self._speak_sentence_remote,
+            args=(sentence, sentiment),
+            daemon=True,
+        ).start()
 
-    def _speak_sentence_remote(self, sentence):
+    def _speak_sentence_remote(self, sentence, sentiment="neutral"):
         self.is_speaking_remotely = True
         try:
+            resolved_tag = self._resolve_tts_emotion_tag(sentiment) or self._resolve_tts_emotion_tag(self.current_sentiment)
+            tts_text = f"[{resolved_tag}] {sentence}" if resolved_tag else sentence
             voice_response = requests.post(
                 self.voice_url,
                 json={
-                    "text": sentence,
+                    "text": tts_text,
                     "character": self.current_character,
                     "async_play": True,
                 },
@@ -1134,10 +1354,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Voice sentence error: {e}")
 
-    def _on_stream_completed(self, full_text):
+    def _on_stream_completed(self, full_text, sentiment):
         self.current_request_id = None
         self.is_processing_response = False
         self.set_processing_status("Status: Idle", "#888")
+        self._apply_idle_training_status()
+        self.latest_sentiment = sentiment or "neutral"
+        self._set_sentiment(self.latest_sentiment)
         self.signals.finished.emit(full_text)
         self.event_bus.emit(Events.AI_COMPLETED, {"text": full_text})
 
@@ -1157,6 +1380,7 @@ class MainWindow(QMainWindow):
 
         if self.voice_thread and not self.waiting_for_voice_finish:
             self.voice_thread.resume_after_processing()
+        self._apply_idle_training_status()
 
     def _on_stream_cancelled(self):
         self.current_request_id = None
@@ -1164,6 +1388,7 @@ class MainWindow(QMainWindow):
         self.set_processing_status("Status: Interrupted", "#d7ba7d")
         if self.voice_thread and not self.waiting_for_voice_finish:
             self.voice_thread.resume_after_processing()
+        self._apply_idle_training_status()
 
     def schedule_voice_release(self, duration_ms):
         hold_ms = max(300, min(int(duration_ms) + 180, 20000))
@@ -1213,14 +1438,20 @@ class MainWindow(QMainWindow):
     def append_token(self, token):
         cursor = self.chat_history.textCursor()
         cursor.movePosition(cursor.End)
-        cursor.insertText(token)
+        cursor.insertText(_strip_sentiment_tags(token))
         self.chat_history.setTextCursor(cursor)
 
     def finalize_response(self, full_text):
         if not full_text:
             full_text = "[No response]"
 
-        self.db.log_chat(self.current_user_id, "marie", full_text, session_id=self.current_session_id)
+        self.db.log_chat(
+            self.current_user_id,
+            "marie",
+            full_text,
+            emotion=self.latest_sentiment or "neutral",
+            session_id=self.current_session_id,
+        )
         self.db.log_conversation_turn(
             self.current_user_id,
             self.current_session_id,

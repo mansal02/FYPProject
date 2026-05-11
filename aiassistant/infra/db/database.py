@@ -2,6 +2,7 @@ import sqlite3
 import hashlib
 import re
 import os
+import json
 
 from aiassistant.infra.config.app_config import CONFIG
 
@@ -103,12 +104,33 @@ class MarieDB:
             )
         ''')
 
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS searchable_mirror (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT UNIQUE NOT NULL,
+                raw_text_or_data TEXT,
+                file_hash TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS style_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT UNIQUE NOT NULL,
+                profile_json TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         self._ensure_schema_migrations()
 
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_logs_user_session ON chat_logs(user_id, session_id)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_turns_user_session ON conversation_turns(user_id, session_id)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_long_term_user ON long_term_memory(user_id)")
+        self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_searchable_mirror_path ON searchable_mirror(file_path)")
+        self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_style_profiles_scope ON style_profiles(scope)")
         self.conn.commit()
 
     def _ensure_schema_migrations(self):
@@ -466,3 +488,90 @@ class MarieDB:
             self.cursor.execute("DELETE FROM chat_logs WHERE user_id=? AND session_id=?", (user_id, session_id))
             self.cursor.execute("DELETE FROM conversation_turns WHERE user_id=? AND session_id=?", (user_id, session_id))
         self.conn.commit()
+
+    # --- SEARCHABLE MIRROR METHODS ---
+    def save_searchable_mirror(self, file_path, raw_text, file_hash):
+        if not file_path or not raw_text:
+            return False
+        self.cursor.execute(
+            """
+            INSERT INTO searchable_mirror (file_path, raw_text_or_data, file_hash, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(file_path) DO UPDATE SET
+                raw_text_or_data=excluded.raw_text_or_data,
+                file_hash=excluded.file_hash,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (str(file_path), str(raw_text), str(file_hash or "")),
+        )
+        self.conn.commit()
+        return True
+
+    def get_searchable_mirror_hash(self, file_path):
+        if not file_path:
+            return None
+        self.cursor.execute(
+            "SELECT file_hash FROM searchable_mirror WHERE file_path=?",
+            (str(file_path),),
+        )
+        row = self.cursor.fetchone()
+        return row[0] if row else None
+
+    def search_searchable_mirror(self, query, limit=8):
+        clean = str(query or "").strip()
+        if not clean:
+            return []
+        wildcard = f"%{clean}%"
+        self.cursor.execute(
+            """
+            SELECT file_path, raw_text_or_data
+            FROM searchable_mirror
+            WHERE raw_text_or_data LIKE ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (wildcard, int(limit)),
+        )
+        rows = self.cursor.fetchall()
+        results = []
+        for path, raw in rows:
+            snippet = ""
+            if raw:
+                idx = raw.lower().find(clean.lower())
+                if idx >= 0:
+                    start = max(0, idx - 120)
+                    end = min(len(raw), idx + 240)
+                    snippet = raw[start:end].strip()
+            results.append({"file_path": path, "snippet": snippet})
+        return results
+
+    # --- STYLE PROFILE METHODS ---
+    def save_style_profile(self, scope, profile_json):
+        clean_scope = str(scope or "default").strip() or "default"
+        payload = json.dumps(profile_json or {}, ensure_ascii=True)
+        self.cursor.execute(
+            """
+            INSERT INTO style_profiles (scope, profile_json, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(scope) DO UPDATE SET
+                profile_json=excluded.profile_json,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (clean_scope, payload),
+        )
+        self.conn.commit()
+        return True
+
+    def get_style_profile(self, scope="default"):
+        clean_scope = str(scope or "default").strip() or "default"
+        self.cursor.execute(
+            "SELECT profile_json FROM style_profiles WHERE scope=?",
+            (clean_scope,),
+        )
+        row = self.cursor.fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return None

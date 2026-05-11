@@ -26,6 +26,8 @@ _DEFAULT_CONFIG = {
         "piper_dir": "./piper",
         "rvc_dir": "./rvc_models",
         "knowledge_dir": "./knowledge",
+        "train_root": "D:/Train",
+        "train_response_dir": "D:/Train/response",
     },
     "servers": {
         "reasoning_url": "http://127.0.0.1:8000/chat",
@@ -40,7 +42,7 @@ _DEFAULT_CONFIG = {
     },
     "ollama": {
         "host": "http://127.0.0.1:11434",
-        "model": "llama3.2:3b",
+        "model": "qwen2.5-coder:7b",
         "num_predict": 360,
         "num_ctx": 2048,
         "temperature": 0.2,
@@ -104,16 +106,16 @@ _DEFAULT_CONFIG = {
         "response_only_opacity": 0.88,
     },
     "crew": {
-            "researcher": "qwen2.5:7b",
-            "coder": "qwen2.5:7b",
-            "synthesizer": "llama3.1:8b",
+            "researcher": "qwen2.5-coder:7b",
+            "coder": "qwen2.5-coder:7b",
+            "synthesizer": "qwen2.5-coder:7b",
         "provider": "fallback",
         "context_max_chars": 900,
         "verbose": False,
     },
     "vision": {
         "screen_share_enabled": False,
-        "vision_model": "moondream",
+        "vision_model": "qwen2.5vl:7b",
         "screenshot_dir": "./cache/screens",
         "capture_interval_sec": 0.8,
         "max_width": 1280,
@@ -126,6 +128,29 @@ _DEFAULT_CONFIG = {
     "actions": {
         "safe_mode": True,
         "allow_legacy_text_commands": True,
+    },
+    "training": {
+        "idle_min_sec": 120,
+        "idle_max_sec": 300,
+        "max_files_per_cycle": 24,
+        "sleep_between_files_sec": 0.05,
+        "include_extensions": [
+            ".txt",
+            ".log",
+            ".md",
+            ".pdf",
+            ".docx",
+            ".csv",
+            ".xlsx",
+        ],
+        "skip_dirs": [
+            "C:/Windows",
+            "C:/Program Files",
+            "C:/Program Files (x86)",
+            "C:/$Recycle.Bin",
+            "C:/System Volume Information",
+            ".git",
+        ],
     },
 }
 
@@ -199,6 +224,8 @@ def load_config():
     config["paths"]["db_path"] = os.environ.get("MARIE_DB_PATH", config["paths"]["db_path"])
     config["paths"]["auto_login_file"] = os.environ.get("MARIE_AUTO_LOGIN_FILE", config["paths"]["auto_login_file"])
     config["paths"]["default_live2d_model"] = os.environ.get("MARIE_DEFAULT_MODEL", config["paths"]["default_live2d_model"])
+    config["paths"]["train_root"] = os.environ.get("MARIE_TRAIN_ROOT", config["paths"]["train_root"])
+    config["paths"]["train_response_dir"] = os.environ.get("MARIE_TRAIN_RESPONSE_DIR", config["paths"]["train_response_dir"])
 
     config["servers"]["reasoning_url"] = os.environ.get("MARIE_REASONING_URL", config["servers"]["reasoning_url"])
     config["servers"]["reasoning_stream_url"] = os.environ.get("MARIE_REASONING_STREAM_URL", config["servers"]["reasoning_stream_url"])
@@ -365,6 +392,31 @@ def load_config():
         config["memory_agent"].get("watch_extensions", [".txt", ".md"]),
     )
 
+    config["training"]["idle_min_sec"] = _as_int(
+        os.environ.get("MARIE_TRAIN_IDLE_MIN_SEC"),
+        config["training"].get("idle_min_sec", 120),
+    )
+    config["training"]["idle_max_sec"] = _as_int(
+        os.environ.get("MARIE_TRAIN_IDLE_MAX_SEC"),
+        config["training"].get("idle_max_sec", 300),
+    )
+    config["training"]["max_files_per_cycle"] = _as_int(
+        os.environ.get("MARIE_TRAIN_MAX_FILES"),
+        config["training"].get("max_files_per_cycle", 24),
+    )
+    config["training"]["sleep_between_files_sec"] = _as_float(
+        os.environ.get("MARIE_TRAIN_SLEEP_SEC"),
+        config["training"].get("sleep_between_files_sec", 0.05),
+    )
+    config["training"]["include_extensions"] = _as_str_list(
+        os.environ.get("MARIE_TRAIN_EXTENSIONS"),
+        config["training"].get("include_extensions", [".txt", ".md"]),
+    )
+    config["training"]["skip_dirs"] = _as_str_list(
+        os.environ.get("MARIE_TRAIN_SKIP_DIRS"),
+        config["training"].get("skip_dirs", []),
+    )
+
     # Normalize paths
     for key in (
         "db_path",
@@ -373,6 +425,8 @@ def load_config():
         "piper_dir",
         "rvc_dir",
         "knowledge_dir",
+        "train_root",
+        "train_response_dir",
     ):
         config["paths"][key] = _resolve_path(config["paths"][key])
 

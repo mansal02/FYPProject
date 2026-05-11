@@ -159,6 +159,7 @@ ASSISTANT_TOOL_ACTIONS = [
     "close_application",
     "list_running_apps (alias: list_running_applications)",
     "open_service",
+    "search_mirror",
     "move_mouse",
     "click",
     "type_text",
@@ -446,8 +447,8 @@ class ExcelCommandHandler:
             file_path = self._normalize_path(file_name)
             workbook = self._load_or_create_workbook(file_path)
             sheet = self._pick_sheet(workbook, sheet_name)
-            value = sheet[cell.upper()].value
-            print(f"[ACTION][EXCEL] {cell.upper()} = {value}")
+            _ = sheet[cell.upper()].value
+            print(f"[ACTION][EXCEL] {cell.upper()} retrieved from {file_path}. Content hidden by policy.")
             return True
 
         row_match = re.fullmatch(
@@ -628,12 +629,8 @@ class WordCommandHandler:
                 print(f"[ACTION][WORD] File not found: {file_path}")
                 return True
             doc = self._load_or_create_doc(file_path)
-            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-            if not paragraphs:
-                print("[ACTION][WORD] Document is empty.")
-            else:
-                preview = " | ".join(paragraphs[:8])
-                print(f"[ACTION][WORD] Preview: {preview}")
+            _ = doc
+            print(f"[ACTION][WORD] Document read from {file_path}. Content hidden by policy.")
             return True
 
         if re.fullmatch(r"word\s+help", text, flags=re.IGNORECASE):

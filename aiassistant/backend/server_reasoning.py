@@ -38,8 +38,47 @@ RUNTIME_ONLINE_MODE = str(CONFIG.get("runtime", {}).get("online_mode", "auto")).
 RUNTIME_HYBRID_MODE = bool(CONFIG.get("runtime", {}).get("hybrid_mode", False))
 EXTERNAL_MODEL = str(CONFIG.get("runtime", {}).get("external_model", "gemini-2.0-flash")).strip()
 
+
+def _toggle_voice_rvc(enabled: bool) -> None:
+    if requests is None:
+        return
+
+    host = str(CONFIG.get("servers", {}).get("voice_host", "127.0.0.1")).strip()
+    port = int(CONFIG.get("servers", {}).get("voice_port", 8001))
+    action = "load" if enabled else "unload"
+    url = f"http://{host}:{port}/rvc/{action}"
+
+    try:
+        requests.post(url, json={}, timeout=2)
+    except Exception:
+        pass
+
 _cancel_map = {}
 _cancel_lock = threading.RLock()
+
+_SENTIMENT_TAGS = {
+    "happy",
+    "sad",
+    "angry",
+    "excited",
+    "surprised",
+    "confused",
+    "neutral",
+    "concerned",
+    "friendly",
+    "serious",
+    "annoyed",
+    "bored",
+}
+_SENTIMENT_KEYWORDS = {
+    "happy": {"happy", "great", "awesome", "love", "fantastic", "glad", "delight"},
+    "sad": {"sad", "sorry", "down", "upset", "unhappy", "depressed"},
+    "angry": {"angry", "mad", "furious", "annoyed", "rage"},
+    "excited": {"excited", "thrilled", "can't wait", "hyped"},
+    "surprised": {"surprised", "wow", "whoa", "unexpected"},
+    "confused": {"confused", "unsure", "not sure", "unclear"},
+    "concerned": {"concerned", "worried", "issue", "problem"},
+}
 
 
 def _truncate_memory_context(memory_context, max_lines=60, max_chars=7000):
@@ -113,6 +152,29 @@ def _chunk_text(text: str, size: int = 24):
     return [text[idx : idx + size] for idx in range(0, len(text), size)]
 
 
+def _extract_sentiment_tag(text: str) -> str:
+    if not text:
+        return "neutral"
+
+    match = re.search(r"\[([a-zA-Z]+)\]", text)
+    if match:
+        tag = match.group(1).lower()
+        if tag in _SENTIMENT_TAGS:
+            return tag
+
+    lowered = text.lower()
+    scores = {}
+    for sentiment, keywords in _SENTIMENT_KEYWORDS.items():
+        hits = sum(1 for token in keywords if token in lowered)
+        if hits:
+            scores[sentiment] = hits
+
+    if not scores:
+        return "neutral"
+
+    return max(scores.items(), key=lambda item: item[1])[0]
+
+
 def _gemini_generate_text(prompt: str, temperature: float) -> str:
     if requests is None:
         return ""
@@ -168,6 +230,24 @@ def get_marie_response_stream(prompt, memory_context="", online_mode="auto"):
             return
 
         system_instructions = OLLAMA_SYSTEM_PROMPT
+        try:
+            style_profile = db.get_style_profile("train_root")
+        except Exception:
+            style_profile = None
+        if isinstance(style_profile, dict):
+            formal = str(style_profile.get("formal", "")).strip()
+            casual = str(style_profile.get("casual", "")).strip()
+            if formal or casual:
+                system_instructions += (
+                    "\nWriting style profile for documentation:"
+                    f"\nFormal baseline: {formal}"
+                    f"\nCasual baseline: {casual}"
+                    "\nDefault to formal unless the user requests casual."
+                )
+        system_instructions += (
+            "\nWhen handling office files (.doc, .docx, .xlsx, .xls, .csv, .pdf), "
+            "do not echo full file contents. Respond with a concise status and file path."
+        )
         system_instructions += (
             "\nIf desktop control is required, output exactly one JSON object using this schema: "
             "{\"action\":\"open|close|search_web|open_website|volume|write_note\","
@@ -260,11 +340,15 @@ def _resolve_request_context(payload):
 
     screen_context = payload.get("screen_context", "")
     if not screen_context:
-        screen_context = describe_screen_snapshot(
-            image_path=payload.get("screen_image_path", ""),
-            user_text=user_text,
-            window_title=payload.get("screen_window_title", ""),
-        )
+        _toggle_voice_rvc(False)
+        try:
+            screen_context = describe_screen_snapshot(
+                image_path=payload.get("screen_image_path", ""),
+                user_text=user_text,
+                window_title=payload.get("screen_window_title", ""),
+            )
+        finally:
+            _toggle_voice_rvc(True)
     if screen_context:
         rag_context = f"{rag_context}\n\nLive screen context:\n{screen_context}".strip()
 
@@ -281,13 +365,13 @@ def chat_endpoint(payload: dict = Body(...)):
         crew_result = run_crew_assist(user_text, memory_context=rag_context, config=crew_config)
         summary = str(crew_result.get("summary") or "").strip()
         if crew_result.get("ok") and summary:
-            return {"response": summary}
+            return {"response": summary, "sentiment": _extract_sentiment_tag(summary)}
 
     full_response = ""
     for token in get_marie_response_stream(user_text, memory_context=rag_context, online_mode=online_mode):
         full_response += token
 
-    return {"response": full_response}
+    return {"response": full_response, "sentiment": _extract_sentiment_tag(full_response)}
 
 
 @app.post("/chat/multi-agent")
@@ -335,6 +419,7 @@ def chat_stream_endpoint(payload: dict = Body(...)):
                 {
                     "type": "done",
                     "full_response": summary,
+                    "sentiment": _extract_sentiment_tag(summary),
                     "request_id": request_id,
                     "cancelled": False,
                 }
@@ -375,6 +460,7 @@ def chat_stream_endpoint(payload: dict = Body(...)):
                 {
                     "type": "done",
                     "full_response": full_response,
+                    "sentiment": _extract_sentiment_tag(full_response),
                     "request_id": request_id,
                     "cancelled": bool(cancel_event.is_set()),
                 }
