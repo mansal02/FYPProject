@@ -24,6 +24,7 @@ crewai==0.95.0
 pvporcupine==3.0.2
 sentence-transformers==3.0.1
 duckduckgo-search==6.3.4
+psutil==6.0.0
 
 # Voice stack
 faster-whisper==1.2.1

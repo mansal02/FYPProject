@@ -17,6 +17,13 @@ from aiassistant.infra.db.database import MarieDB
 from aiassistant.infra.rag_memory import get_rag_context
 from aiassistant.infra.vision.screen_vision import describe_screen_snapshot
 
+# Mid-tier optimization: Apply quantization settings
+try:
+    from aiassistant.infra.optimization import QuantizationHelper
+    QuantizationHelper.apply_quantization_env()
+except Exception:
+    pass
+
 try:
     import requests
 except Exception:  # pragma: no cover - optional dependency

@@ -779,6 +779,42 @@ class UnifiedTaskBridge:
             return _fail("No accessible roots were found.", "missing_roots")
         return _ok("Listed accessible storage roots.", data=[str(path) for path in roots])
 
+    @staticmethod
+    def _mirror_requested(action: Dict[str, Any]) -> bool:
+        return _to_bool(action.get("use_mirror", False), default=False) or bool(
+            str(action.get("mirror_query") or "").strip()
+        )
+
+    @staticmethod
+    def _mirror_query_from_action(action: Dict[str, Any], fallback: str) -> str:
+        raw = action.get("mirror_query") or action.get("mirror_hint") or action.get("mirror_text")
+        if raw is None:
+            raw = fallback
+        return str(raw or "").strip()
+
+    def _get_mirror_context(self, query: str, limit: int = 6) -> Dict[str, Any] | None:
+        clean = str(query or "").strip()
+        if not clean:
+            return None
+
+        try:
+            db = MarieDB()
+            results = db.search_searchable_mirror(clean, limit=max(1, int(limit)))
+        except Exception:
+            return None
+
+        if not results:
+            return None
+
+        return {"query": clean, "matches": results}
+
+    @staticmethod
+    def _attach_mirror_context(result: Dict[str, Any], mirror_context: Dict[str, Any] | None) -> Dict[str, Any]:
+        if not mirror_context or not isinstance(result, dict):
+            return result
+        result["mirror_context"] = mirror_context
+        return result
+
     def search_mirror(self, query: str, limit: int = 8) -> Dict[str, Any]:
         clean = str(query or "").strip()
         if not clean:
@@ -2316,7 +2352,14 @@ class UnifiedTaskBridge:
                 )
 
             if action_name == "list_directory":
-                return self.list_directory(
+                mirror_context = None
+                if self._mirror_requested(action):
+                    mirror_query = self._mirror_query_from_action(action, action.get("path") or "")
+                    mirror_context = self._get_mirror_context(
+                        mirror_query,
+                        limit=int(action.get("mirror_limit", 6) or 6),
+                    )
+                result = self.list_directory(
                     path=str(action.get("path", "")),
                     recursive=_to_bool(action.get("recursive", False), default=False),
                     max_depth=int(action.get("max_depth", 2) or 2),
@@ -2325,9 +2368,20 @@ class UnifiedTaskBridge:
                     include_files=_to_bool(action.get("include_files", True), default=True),
                     include_dirs=_to_bool(action.get("include_dirs", True), default=True),
                 )
+                return self._attach_mirror_context(result, mirror_context)
 
             if action_name in {"deep_search", "deep_search_paths"}:
-                return self.deep_search_paths(
+                mirror_context = None
+                if self._mirror_requested(action):
+                    mirror_query = self._mirror_query_from_action(
+                        action,
+                        action.get("query") or action.get("hint") or "",
+                    )
+                    mirror_context = self._get_mirror_context(
+                        mirror_query,
+                        limit=int(action.get("mirror_limit", 6) or 6),
+                    )
+                result = self.deep_search_paths(
                     query=str(action.get("query") or action.get("hint") or ""),
                     roots=roots,
                     max_results=int(action.get("max_results", 40) or 40),
@@ -2339,12 +2393,21 @@ class UnifiedTaskBridge:
                     max_scan_entries=int(action.get("max_scan_entries", 120000) or 120000),
                     max_file_size_mb=int(action.get("max_file_size_mb", 5) or 5),
                 )
+                return self._attach_mirror_context(result, mirror_context)
 
             if action_name == "analyze_path":
-                return self.analyze_path(
+                mirror_context = None
+                if self._mirror_requested(action):
+                    mirror_query = self._mirror_query_from_action(action, action.get("path") or "")
+                    mirror_context = self._get_mirror_context(
+                        mirror_query,
+                        limit=int(action.get("mirror_limit", 6) or 6),
+                    )
+                result = self.analyze_path(
                     path=str(action.get("path", "")),
                     max_items=int(action.get("max_items", 3500) or 3500),
                 )
+                return self._attach_mirror_context(result, mirror_context)
 
             if action_name == "create_path":
                 return self.create_path(
@@ -2397,36 +2460,77 @@ class UnifiedTaskBridge:
                 return self.open_service(str(action.get("service", "")))
 
             if action_name == "search_file":
-                return self.smart_heuristic_search_files(
+                mirror_context = None
+                if self._mirror_requested(action):
+                    mirror_query = self._mirror_query_from_action(
+                        action,
+                        action.get("hint") or action.get("query") or "",
+                    )
+                    mirror_context = self._get_mirror_context(
+                        mirror_query,
+                        limit=int(action.get("mirror_limit", 6) or 6),
+                    )
+                result = self.smart_heuristic_search_files(
                     hint=str(action.get("hint") or action.get("query") or ""),
                     roots=roots,
                     max_results=int(action.get("max_results", 20) or 20),
                     include_content=_to_bool(action.get("include_content", True), default=True),
                     max_scan_files=int(action.get("max_scan_files", 4200) or 4200),
                 )
+                return self._attach_mirror_context(result, mirror_context)
 
             if action_name == "semantic_search_file":
-                return self.smart_heuristic_search_files(
+                mirror_context = None
+                if self._mirror_requested(action):
+                    mirror_query = self._mirror_query_from_action(
+                        action,
+                        action.get("hint") or action.get("query") or "",
+                    )
+                    mirror_context = self._get_mirror_context(
+                        mirror_query,
+                        limit=int(action.get("mirror_limit", 6) or 6),
+                    )
+                result = self.smart_heuristic_search_files(
                     hint=str(action.get("hint") or action.get("query") or ""),
                     roots=roots,
                     max_results=int(action.get("max_results", 20) or 20),
                     include_content=_to_bool(action.get("include_content", True), default=True),
                     max_scan_files=int(action.get("max_scan_files", 4200) or 4200),
                 )
+                return self._attach_mirror_context(result, mirror_context)
 
             if action_name == "read_file":
-                return self.read_file_text(
+                mirror_context = None
+                if self._mirror_requested(action):
+                    mirror_query = self._mirror_query_from_action(action, action.get("path") or "")
+                    mirror_context = self._get_mirror_context(
+                        mirror_query,
+                        limit=int(action.get("mirror_limit", 6) or 6),
+                    )
+                result = self.read_file_text(
                     file_path=str(action.get("path", "")),
                     max_chars=int(action.get("max_chars", 12000) or 12000),
                 )
+                return self._attach_mirror_context(result, mirror_context)
 
             if action_name in {"open_file", "open_path"}:
-                return self.open_file(
+                mirror_context = None
+                if self._mirror_requested(action):
+                    mirror_query = self._mirror_query_from_action(
+                        action,
+                        action.get("path") or action.get("hint") or "",
+                    )
+                    mirror_context = self._get_mirror_context(
+                        mirror_query,
+                        limit=int(action.get("mirror_limit", 6) or 6),
+                    )
+                result = self.open_file(
                     file_path=str(action.get("path") or action.get("hint") or ""),
                     resolve_by_hint=_to_bool(action.get("resolve_by_hint", True), default=True),
                     roots=roots,
                     include_content=_to_bool(action.get("include_content", True), default=True),
                 )
+                return self._attach_mirror_context(result, mirror_context)
 
             if action_name == "move_mouse":
                 return self.move_mouse(

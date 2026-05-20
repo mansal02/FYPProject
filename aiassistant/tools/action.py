@@ -752,8 +752,7 @@ class ActionHandler:
         # Add games or portable apps here that the scanner misses.
         # Use double backslashes \\ for paths.
         self.custom_apps = {
-            "genshin": r"C:\Program Files\Genshin Impact\Genshin Impact Game\GenshinImpact.exe",
-            "minecraft": r"C:\XboxGames\Minecraft Launcher\Content\Minecraft.exe",
+   
             "steam": r"C:\Program Files (x86)\Steam\steam.exe",
             "obs": r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"
         }

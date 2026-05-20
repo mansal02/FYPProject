@@ -215,6 +215,19 @@ def _query_searchable_mirror(question, top_k):
 
 
 def get_rag_context(question, top_k=4):
+    """Retrieve RAG context with mid-tier optimization.
+    
+    Respects device-class top_k and lazy loading settings.
+    """
+    from aiassistant.infra.optimization import get_device_capabilities
+    
+    # Auto-adjust top_k for mid-tier devices
+    caps = get_device_capabilities()
+    profile = caps.optimization_profile
+    optimized_top_k = profile.get("top_k", 4)
+    if top_k > optimized_top_k:
+        top_k = optimized_top_k
+    
     memory_snippets = _query_memory_agent(question, top_k=max(1, int(top_k)))
     local_snippets = RAG.query(question, top_k=top_k)
     mirror_snippets = _query_searchable_mirror(question, top_k=max(1, int(top_k)))
