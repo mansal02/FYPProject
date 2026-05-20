@@ -25,6 +25,8 @@ ollama:
   num_predict: 360
   num_ctx: 2048
   temperature: 0.2
+  # Quantization settings for mid-tier optimization
+  quantization_enabled: false  # Set to 'q4' or 'q5' for mid-tier devices
   system_prompt: |
     You are MARIE, a practical desktop assistant.
     Default to short, direct answers focused on what the user needs now.
@@ -45,9 +47,13 @@ memory_agent:
   persist_dir: ./cache/chroma_memory_agent
   collection: marie_memory_agent
   embedding_model: llama3.2:3b
+  # Mid-tier optimization: reduce embeddings computation
+  embedding_batch_size: 32  # Process embeddings in batches
   top_k: 4
   chunk_size: 850
   chunk_overlap: 120
+  # Lazy load RAG if set to true (default false for compatibility)
+  lazy_load: false
   watch_extensions:
     - .txt
     - .md
@@ -73,21 +79,27 @@ voice:
   allow_commands_without_wake_word: true
   enable_openwakeword: false
   enable_silero_vad: true
-  allow_online_fallback: true
+  allow_online_fallback: false
   transcription_confidence_threshold: 0.60
 
 ui:
   theme: dark
   transparent_face: false
-  enable_live2d: true
+  enable_live2d: false
   response_only_mode: false
   response_only_opacity: 0.88
+  # Mid-tier mode: auto-detect and disable heavy features
+  enable_midtier_mode: false  # Set to true for auto mid-tier optimization
+
+features:
+  camera_tracking: false
+  finger_mouse: false
 
 crew:
   enabled: true
   mode: assist
-  router: always
-  provider: crewai
+  router: complex_only
+  provider: fallback
   context_max_chars: 900
   verbose: false
   models:
@@ -105,7 +117,11 @@ vision:
 runtime:
   hybrid_mode: false
   external_model: gemini-2.0-flash
-  online_mode: auto
+  online_mode: offline
+  # Mid-tier device settings
+  device_class: auto  # Options: auto, high_end, mid_tier, low_end
+  enable_aggressive_gc: false  # Garbage collection between requests
+  model_unload_after_inference: true  # Unload model after each response (saves VRAM)
 
 actions:
   safe_mode: true

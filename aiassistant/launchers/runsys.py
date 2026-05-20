@@ -12,10 +12,13 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
+# Disable RAG by default due to ChromaDB/onnxruntime compatibility issues
+if "MARIE_DISABLE_RAG" not in os.environ:
+    os.environ["MARIE_DISABLE_RAG"] = "1"
+
 PYTHON_EXE = sys.executable
 LAUNCH_MODES = {
     "assistant": ["aiassistant.frontend.main_gui"],
-    "legacy": ["aiassistant.backend.server_reasoning", "aiassistant.backend.server_voice", "aiassistant.frontend.main_legacy"],
     "hybrid": ["aiassistant.backend.server_reasoning", "aiassistant.backend.server_voice", "aiassistant.frontend.main_gui"],
 }
 DEFAULT_MODE = "assistant"
@@ -38,6 +41,21 @@ def _build_child_env():
     env.setdefault("OLLAMA_KV_CACHE_TYPE", "q4_0")
     # Keep model residency low between requests to avoid VRAM accumulation.
     env.setdefault("OLLAMA_KEEP_ALIVE", "0")
+    
+    # Auto-enable mid-tier mode for devices with 4-8GB RAM
+    try:
+        import psutil
+        total_gb = psutil.virtual_memory().total / (1024**3)
+        if 4 <= total_gb < 8 and env.get("MARIE_DEVICE_CLASS") not in {"high_end", "high_mid"}:
+            env.setdefault("MARIE_ENABLE_MIDTIER_MODE", "1")
+            env.setdefault("MARIE_DEVICE_CLASS", "mid_tier")
+            env.setdefault("MARIE_ENABLE_AGGRESSIVE_GC", "1")
+        elif total_gb < 4:
+            env.setdefault("MARIE_DEVICE_CLASS", "low_end")
+            env.setdefault("MARIE_ENABLE_AGGRESSIVE_GC", "1")
+    except Exception:
+        pass
+    
     return env
 
 

@@ -81,6 +81,26 @@ def _bootstrap_env_int(name: str, default: int = 0) -> int:
         return int(default)
 
 
+def _auto_apply_midtier_optimizations() -> None:
+    """Auto-disable heavy features on mid-tier devices."""
+    try:
+        import psutil
+        total_gb = psutil.virtual_memory().total / (1024**3)
+        device_class = os.environ.get("MARIE_DEVICE_CLASS", "").strip().lower()
+        
+        # Auto-detect and apply optimizations
+        if device_class == "auto" or not device_class:
+            if total_gb < 8 and "MARIE_ENABLE_MIDTIER_MODE" in os.environ:
+                os.environ.setdefault("MARIE_DISABLE_LIVE2D", "1")
+                os.environ.setdefault("MARIE_DISABLE_SCREEN_CAPTURE", "1")
+                if total_gb < 4:
+                    os.environ.setdefault("MARIE_DISABLE_RAG", "1")
+    except Exception:
+        pass
+
+
+_auto_apply_midtier_optimizations()
+
 _BOOT_STABILITY_MODE_LEVEL = max(0, _bootstrap_env_int("MARIE_STABILITY_MODE_LEVEL", 0))
 _BOOT_DISABLE_LIVE2D = _bootstrap_env_bool("MARIE_DISABLE_LIVE2D", False)
 _BOOT_DISABLE_VOICE_INPUT = _bootstrap_env_bool("MARIE_DISABLE_VOICE_INPUT", False)
@@ -786,10 +806,11 @@ class AssistantMainWindow(QMainWindow):
         )
         self.voice_profile = str(self.preferences.get("preferred_voice") or "system_default")
         self.speaking_speed = float(self.preferences.get("speaking_speed", DEFAULT_TTS_SPEED))
-        self.online_mode = str(
-            self.preferences.get("online_mode")
-            or CONFIG.get("runtime", {}).get("online_mode", "auto")
-        ).strip().lower() or "auto"
+        config_online_mode = str(CONFIG.get("runtime", {}).get("online_mode", "auto")).strip().lower()
+        if config_online_mode not in {"auto", "online", "offline"}:
+            config_online_mode = "auto"
+        pref_online_mode = str(self.preferences.get("online_mode") or "").strip().lower()
+        self.online_mode = config_online_mode if config_online_mode == "offline" else (pref_online_mode or config_online_mode)
         if self.online_mode not in {"auto", "online", "offline"}:
             self.online_mode = "auto"
 
@@ -814,7 +835,13 @@ class AssistantMainWindow(QMainWindow):
             self.allow_legacy_text_actions = False
         self.actions: Optional[object] = None
 
-        self.camera = CameraTracker(camera_index=0)
+        features_cfg = CONFIG.get("features", {})
+        self.camera_tracking_enabled = bool(features_cfg.get("camera_tracking", True))
+        self.finger_mouse_enabled = bool(features_cfg.get("finger_mouse", True))
+        if self.camera_tracking_enabled:
+            self.camera = CameraTracker(camera_index=0)
+        else:
+            self.camera = _NullCameraTracker(camera_index=0)
         voice_cfg = CONFIG.get("voice", {})
         raw_voice_energy_threshold = voice_cfg.get("energy_threshold", 650)
         try:
@@ -1014,13 +1041,7 @@ class AssistantMainWindow(QMainWindow):
         self.screen_preview_toggle.stateChanged.connect(self.on_screen_preview_toggle_changed)
         toggles.addWidget(self.screen_preview_toggle)
 
-        self.camera_toggle = QCheckBox("Enable camera tracking")
-        self.camera_toggle.stateChanged.connect(self.on_camera_toggle_changed)
-        toggles.addWidget(self.camera_toggle)
 
-        self.finger_toggle = QCheckBox("Finger controls mouse")
-        self.finger_toggle.stateChanged.connect(self.on_finger_toggle_changed)
-        toggles.addWidget(self.finger_toggle)
 
         right_layout.addLayout(toggles)
 
@@ -1050,8 +1071,6 @@ class AssistantMainWindow(QMainWindow):
         self._chat_optional_controls = [
             self.screen_toggle,
             self.screen_preview_toggle,
-            self.camera_toggle,
-            self.finger_toggle,
             self.voice_toggle,
             self.voice_mode_btn,
             self.rag_toggle,
@@ -1065,6 +1084,8 @@ class AssistantMainWindow(QMainWindow):
         self.screen_preview_label.setMinimumHeight(175)
         self.screen_preview_label.setWordWrap(True)
         right_layout.addWidget(self.screen_preview_label)
+
+
 
         self.status_label = QLabel("Status: Ready")
         right_layout.addWidget(self.status_label)
@@ -1158,6 +1179,19 @@ class AssistantMainWindow(QMainWindow):
         self.online_mode_combo.addItem("Hybrid (auto)", "auto")
         self.online_mode_combo.addItem("Online only (Gemini)", "online")
         form.addRow("Online model usage", self.online_mode_combo)
+
+        if not self.live2d_enabled:
+            self.model_path_input.setEnabled(False)
+            browse_btn.setEnabled(False)
+            self.model_path_input.setToolTip("Live2D is disabled by configuration.")
+
+        config_online_mode = str(CONFIG.get("runtime", {}).get("online_mode", "auto")).strip().lower()
+        if config_online_mode == "offline":
+            index = self.online_mode_combo.findData("offline")
+            if index >= 0:
+                self.online_mode_combo.setCurrentIndex(index)
+            self.online_mode_combo.setEnabled(False)
+            self.online_mode_combo.setToolTip("Online mode is locked to offline by configuration.")
 
         self.pref_tts_cb = QCheckBox("Enable voice output")
         self.pref_voice_input_cb = QCheckBox("Enable voice command input")
@@ -1845,10 +1879,7 @@ class AssistantMainWindow(QMainWindow):
         extra = []
         if self._idle_training_status:
             extra.append(self._idle_training_status)
-        if self.camera_toggle.isChecked():
-            cam_state = self.camera.get_state()
-            extra.append(f"Camera {'ok' if cam_state.tracking_ok else 'off'}")
-            extra.append(f"Emotion {cam_state.emotion}")
+
 
         if self.screen_toggle.isChecked():
             extra.append("Screen input ON")
@@ -1911,15 +1942,22 @@ class AssistantMainWindow(QMainWindow):
             return
 
         def _work() -> None:
-            self._update_idle_training_status("Idle training: manual scan running")
-            max_files = None if full_scan else 24
-            processed = self.doc_indexer.run_index_cycle(max_files=max_files, sleep_sec=0.02)
-            if full_scan and self.doc_indexer:
-                train_root = Path(CONFIG.get("paths", {}).get("train_root", "D:/Train"))
-                self.doc_indexer.build_style_profile(train_root)
-            self._update_idle_training_status(
-                f"Idle training: manual scan done ({processed} files)"
-            )
+            try:
+                self._update_idle_training_status("Idle training: manual scan running")
+                max_files = None if full_scan else 24
+                processed = self.doc_indexer.run_index_cycle(max_files=max_files, sleep_sec=0.02)
+                if full_scan and self.doc_indexer:
+                    try:
+                        train_root = Path(CONFIG.get("paths", {}).get("train_root", "D:/Train"))
+                        self.doc_indexer.build_style_profile(train_root)
+                    except Exception as e:
+                        print(f"[Warning] Document style profile build failed: {e}")
+                self._update_idle_training_status(
+                    f"Idle training: manual scan done ({processed} files)"
+                )
+            except Exception as e:
+                print(f"[Error] Idle training thread failed: {e}")
+                self._update_idle_training_status("Idle training: error occurred")
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -2399,20 +2437,6 @@ class AssistantMainWindow(QMainWindow):
 
     def on_desktop_mate_toggle(self, state: int) -> None:
         self._set_desktop_mate_enabled(state == Qt.Checked)
-
-    def on_camera_toggle_changed(self, state: int) -> None:
-        enabled = state == Qt.Checked
-        if enabled:
-            self.camera.start()
-            self._append_chat("System", "Camera tracking started.")
-        else:
-            self.camera.stop()
-            self._append_chat("System", "Camera tracking stopped.")
-
-    def on_finger_toggle_changed(self, state: int) -> None:
-        enabled = state == Qt.Checked
-        self.camera.set_mouse_control(enabled)
-        self._append_chat("System", f"Finger mouse control {'enabled' if enabled else 'disabled'}.")
 
     # --- screen preview ---
     def _refresh_screen_preview(self) -> None:

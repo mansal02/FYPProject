@@ -46,13 +46,14 @@ _DEFAULT_CONFIG = {
         "num_predict": 360,
         "num_ctx": 2048,
         "temperature": 0.2,
+        "quantization_enabled": False,
         "system_prompt": (
-            "You are MARIE, a friendly assistant. "
-            "Do not force short replies or fixed word limits. "
-            "For simple tasks, answer in easy plain language and be direct. "
-            "For complex tasks, provide enough detail to be useful. "
-            "Use clear alignment with tool/action output when available. "
-            "Stay warm and natural, not robotic."
+            "You are MARIE, a practical desktop assistant. "
+            "Default to short, direct answers focused on what the user needs now. "
+            "Do not teach, over-explain, or describe internal steps unless the user asks. "
+            "For analysis or execution requests, perform the task first and report results. "
+            "If asked to analyze files, folders, or the PC, provide concise findings and next actions. "
+            "Use clear alignment with tool/action output when available."
         ),
     },
     "memory": {
@@ -67,9 +68,11 @@ _DEFAULT_CONFIG = {
         "persist_dir": "./cache/chroma_memory_agent",
         "collection": "marie_memory_agent",
         "embedding_model": "llama3.2:3b",
+        "embedding_batch_size": 32,
         "top_k": 4,
         "chunk_size": 850,
         "chunk_overlap": 120,
+        "lazy_load": False,
         "watch_extensions": [
             ".txt",
             ".md",
@@ -94,7 +97,7 @@ _DEFAULT_CONFIG = {
         "microphone_hotkey": "F4",
         "summon_hotkey": "ctrl+space",
         "allow_commands_without_wake_word": True,
-        "allow_online_fallback": True,
+        "allow_online_fallback": False,
         "enable_openwakeword": False,
         "enable_silero_vad": True,
     },
@@ -104,11 +107,16 @@ _DEFAULT_CONFIG = {
         "enable_live2d": False,
         "response_only_mode": False,
         "response_only_opacity": 0.88,
+        "enable_midtier_mode": False,
+    },
+    "features": {
+        "camera_tracking": False,
+        "finger_mouse": False,
     },
     "crew": {
-            "researcher": "qwen2.5-coder:7b",
-            "coder": "qwen2.5-coder:7b",
-            "synthesizer": "qwen2.5-coder:7b",
+        "researcher": "qwen2.5-coder:7b",
+        "coder": "qwen2.5-coder:7b",
+        "synthesizer": "qwen2.5-coder:7b",
         "provider": "fallback",
         "context_max_chars": 900,
         "verbose": False,
@@ -123,7 +131,10 @@ _DEFAULT_CONFIG = {
     "runtime": {
         "hybrid_mode": False,
         "external_model": "gemini-2.0-flash",
-        "online_mode": "auto",
+        "online_mode": "offline",
+        "device_class": "auto",
+        "enable_aggressive_gc": False,
+        "model_unload_after_inference": True,
     },
     "actions": {
         "safe_mode": True,
@@ -434,6 +445,36 @@ def load_config():
     config["memory"]["local_context_file"] = _resolve_path(config["memory"]["local_context_file"])
     config["memory_agent"]["watch_dir"] = _resolve_path(config["memory_agent"]["watch_dir"])
     config["memory_agent"]["persist_dir"] = _resolve_path(config["memory_agent"]["persist_dir"])
+
+    # Mid-tier device optimization overrides
+    config["ui"]["enable_midtier_mode"] = _as_bool(
+        os.environ.get("MARIE_ENABLE_MIDTIER_MODE"),
+        config["ui"].get("enable_midtier_mode", False),
+    )
+    config["runtime"]["device_class"] = os.environ.get(
+        "MARIE_DEVICE_CLASS",
+        config["runtime"].get("device_class", "auto"),
+    )
+    config["runtime"]["enable_aggressive_gc"] = _as_bool(
+        os.environ.get("MARIE_ENABLE_AGGRESSIVE_GC"),
+        config["runtime"].get("enable_aggressive_gc", False),
+    )
+    config["runtime"]["model_unload_after_inference"] = _as_bool(
+        os.environ.get("MARIE_MODEL_UNLOAD_AFTER_INFERENCE"),
+        config["runtime"].get("model_unload_after_inference", True),
+    )
+    config["ollama"]["quantization_enabled"] = os.environ.get(
+        "MARIE_OLLAMA_QUANTIZATION",
+        config["ollama"].get("quantization_enabled", False),
+    )
+    config["memory_agent"]["lazy_load"] = _as_bool(
+        os.environ.get("MARIE_MEMORY_AGENT_LAZY_LOAD"),
+        config["memory_agent"].get("lazy_load", False),
+    )
+    config["memory_agent"]["embedding_batch_size"] = _as_int(
+        os.environ.get("MARIE_MEMORY_AGENT_BATCH_SIZE"),
+        config["memory_agent"].get("embedding_batch_size", 32),
+    )
 
     return config
 

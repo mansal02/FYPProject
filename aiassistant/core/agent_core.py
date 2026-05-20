@@ -98,6 +98,13 @@ os.environ.setdefault("OLLAMA_FLASH_ATTENTION", "1")
 os.environ.setdefault("OLLAMA_KV_CACHE_TYPE", "q4_0")
 os.environ.setdefault("OLLAMA_KEEP_ALIVE", "0")
 
+# Apply mid-tier quantization settings
+try:
+    from aiassistant.infra.optimization import QuantizationHelper
+    QuantizationHelper.apply_quantization_env()
+except Exception:
+    pass
+
 FORCED_REASONING_MODEL = "qwen2.5-coder:7b"
 FORCED_VISION_MODEL = "qwen2.5vl:7b"
 HYBRID_MODE = bool(CONFIG.get("runtime", {}).get("hybrid_mode", False))
@@ -477,6 +484,9 @@ class OfflineAgentCore:
         )
         if self.stop_event.is_set():
             return "Request cancelled."
+
+        # Cleanup memory after reasoning
+        self._cleanup_memory_after_inference()
 
         if not base_reply:
             safe_reply = "I could not generate a response right now."
@@ -971,6 +981,13 @@ class OfflineAgentCore:
 
     @staticmethod
     def _release_vram() -> None:
+        """Release VRAM by unloading models and clearing caches."""
+        try:
+            from aiassistant.infra.optimization import get_memory_manager
+            get_memory_manager().cleanup()
+        except Exception:
+            pass
+        
         gc.collect()
         if torch is None:
             return
@@ -979,6 +996,17 @@ class OfflineAgentCore:
                 torch.cuda.empty_cache()
                 if hasattr(torch.cuda, "ipc_collect"):
                     torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    def _cleanup_memory_after_inference(self) -> None:
+        """Aggressive cleanup after model inference to prevent VRAM accumulation."""
+        try:
+            from aiassistant.infra.optimization import get_device_capabilities
+            if get_device_capabilities().optimization_profile.get("aggressive_gc", False):
+                gc.collect()
+                if torch is not None and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         except Exception:
             pass
 

@@ -21,7 +21,8 @@ from aiassistant.infra.config.app_config import CONFIG
 
 try:
     import chromadb
-except Exception:  # pragma: no cover - optional dependency
+except Exception as e:  # pragma: no cover - optional dependency
+    print(f"[Warning] ChromaDB import failed: {e}")
     chromadb = None
 
 try:
@@ -365,7 +366,14 @@ def get_memory_agent() -> MarieMemoryAgent:
     global _MEMORY_AGENT
     with _MEMORY_AGENT_LOCK:
         if _MEMORY_AGENT is None:
-            _MEMORY_AGENT = MarieMemoryAgent()
+            try:
+                _MEMORY_AGENT = MarieMemoryAgent()
+            except Exception as e:
+                print(f"[Warning] Memory agent initialization failed: {e}")
+                # Return a dummy agent that's not ready
+                agent = MarieMemoryAgent.__new__(MarieMemoryAgent)
+                agent.is_ready = False
+                _MEMORY_AGENT = agent
         return _MEMORY_AGENT
 
 
