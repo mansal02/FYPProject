@@ -3,6 +3,7 @@
 from aiassistant.core.agent_factory import AgentFactory, Manager, WorkerSpec, DEFAULT_INTENTS
 from aiassistant.core.orchestrator_new import Orchestrator, TaskContext, TaskResult, _parse_confirmation
 from aiassistant.core.parallel_orchestrator import ParallelOrchestrator, ParallelTaskContext, ParallelTaskResult
+from aiassistant.core.ultra_fast_orchestrator import UltraFastOrchestrator, FastResult, benchmark_comparison
 from aiassistant.core.parallel_worker import (
     ParallelWorkerMixin,
     AsyncVoiceOutput,
@@ -26,6 +27,9 @@ __all__ = [
     "ParallelOrchestrator",
     "ParallelTaskContext",
     "ParallelTaskResult",
+    "UltraFastOrchestrator",
+    "FastResult",
+    "benchmark_comparison",
     "ParallelWorkerMixin",
     "AsyncVoiceOutput",
     "ConcurrentRAGRetriever",

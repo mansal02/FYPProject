@@ -42,6 +42,10 @@ def _build_child_env():
     # Keep model residency low between requests to avoid VRAM accumulation.
     env.setdefault("OLLAMA_KEEP_ALIVE", "0")
     
+    # Disable fast orchestrator for now (to prevent hanging on model load)
+    # Set to 0 to enable when ready
+    env.setdefault("MARIE_DISABLE_FAST_ORCHESTRATOR", "1")
+    
     # Auto-enable mid-tier mode for devices with 4-8GB RAM
     try:
         import psutil

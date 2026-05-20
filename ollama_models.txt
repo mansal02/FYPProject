@@ -1,0 +1,54 @@
+# Ollama Models - Pull Commands
+# Run these commands to download the required models
+
+# ===== CORE MODELS (Required) =====
+
+# Main reasoning model
+ollama pull qwen2.5-coder:7b
+
+# Vision model
+ollama pull qwen2.5vl:7b
+
+# Fast model for ultra-fast responses (optional but recommended)
+ollama pull qwen2.5:3b
+
+# ===== ALTERNATIVE MODELS (Optional) =====
+
+# Backup reasoning models (uncomment to download)
+# ollama pull llama3.1:8b
+# ollama pull mistral:7b
+# ollama pull neural-chat:7b
+
+# Smaller fast models (if running low on VRAM)
+# ollama pull qwen2.5:0.5b  # Ultra-small
+# ollama pull tinyllama     # Minimal
+
+# ===== QUICK START =====
+# 1. Make sure Ollama is running
+# 2. Copy the commands below and run in terminal
+# 3. Wait for downloads to complete
+
+# Minimum (essential)
+# ollama pull qwen2.5-coder:7b
+# ollama pull qwen2.5vl:7b
+
+# Recommended (includes fast responses)
+# ollama pull qwen2.5-coder:7b
+# ollama pull qwen2.5vl:7b
+# ollama pull qwen2.5:3b
+
+# Full (all benefits)
+# ollama pull qwen2.5-coder:7b
+# ollama pull qwen2.5vl:7b
+# ollama pull qwen2.5:3b
+# ollama pull qwen2.5:7b (optional backup)
+
+# ===== VERIFY =====
+# Check installed models:
+# ollama list
+
+# ===== REQUIREMENTS =====
+# Minimum RAM: 6GB
+# Recommended RAM: 8GB+
+# VRAM: 4GB minimum (6GB recommended)
+# Disk space: ~25GB for all models
