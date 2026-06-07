@@ -298,6 +298,10 @@ SMART_SEARCH_SKIP_DIR_NAMES = {
     "chroma",
     "cache",
     "pkgconfig",
+    "appdata",
+    "program files",
+    "program files (x86)",
+    "windows"
 }
 
 

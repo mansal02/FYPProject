@@ -14,8 +14,8 @@ if str(BASE_DIR) not in sys.path:
 
 # Disable RAG by default due to ChromaDB/onnxruntime compatibility issues
 if "MARIE_DISABLE_RAG" not in os.environ:
-    os.environ["MARIE_DISABLE_RAG"] = "1"
-
+    os.environ["MARIE_DISABLE_RAG"] = "0"
+    
 PYTHON_EXE = sys.executable
 LAUNCH_MODES = {
     "assistant": ["aiassistant.frontend.main_gui"],
@@ -37,16 +37,12 @@ LOG_DIR = BASE_DIR / "cache" / "launch_logs"
 
 def _build_child_env():
     env = os.environ.copy()
+    env["PYTHONPATH"] = str(BASE_DIR.resolve())
     env.setdefault("OLLAMA_FLASH_ATTENTION", "1")
     env.setdefault("OLLAMA_KV_CACHE_TYPE", "q4_0")
-    # Keep model residency low between requests to avoid VRAM accumulation.
-    env.setdefault("OLLAMA_KEEP_ALIVE", "0")
+    env.setdefault("OLLAMA_KEEP_ALIVE", "5m")
+    env.setdefault("MARIE_DISABLE_FAST_ORCHESTRATOR", "0")
     
-    # Disable fast orchestrator for now (to prevent hanging on model load)
-    # Set to 0 to enable when ready
-    env.setdefault("MARIE_DISABLE_FAST_ORCHESTRATOR", "1")
-    
-    # Auto-enable mid-tier mode for devices with 4-8GB RAM
     try:
         import psutil
         total_gb = psutil.virtual_memory().total / (1024**3)

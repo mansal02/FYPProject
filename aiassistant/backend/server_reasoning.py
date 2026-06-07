@@ -9,8 +9,7 @@ import uvicorn
 from fastapi import Body, FastAPI
 from fastapi.responses import StreamingResponse
 
-from aiassistant.core.crew_orchestrator import run_crew_assist
-from aiassistant.core.multi_agent_orchestrator import run_multi_agent_round
+from aiassistant.core.llm_core import run_crew_assist, run_multi_agent_round
 from aiassistant.backend.streaming_utils import drain_complete_sentences
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.db.database import MarieDB

@@ -29,14 +29,19 @@ class DatabaseManager:
         )
         self.db_path = Path(configured_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # check_same_thread=False allows usage from GUI worker threads.
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            self.conn.execute("PRAGMA busy_timeout=5000;")  
+        except sqlite3.Error as e:
+            print(f"[Database Warning] Failed to initialize WAL safety layers: {e}")
+            
         self._lock = threading.Lock()
         self._rad_has_user_id = True
 
-        self._create_tables()
+        self._create_tables()  
 
     def _create_tables(self) -> None:
         schema = """

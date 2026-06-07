@@ -756,7 +756,17 @@ class ActionHandler:
             "steam": r"C:\Program Files (x86)\Steam\steam.exe",
             "obs": r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"
         }
-        self.db = db
+        if db is None:
+            try:
+                from aiassistant.infra.db.database_manager import DatabaseManager
+                db_file_path = str(CONFIG.get("paths", {}).get("db_path", "cache/assistant_sessions.db"))
+                self.db = DatabaseManager(db_path=db_file_path)
+            except Exception as e:
+                print(f"[ACTION][INIT] Remote database initialization fallback failed: {e}")
+                self.db = None
+        else:
+            self.db = db
+
         self.context_provider = context_provider
         self.excel = ExcelCommandHandler()
         self.word = WordCommandHandler()
