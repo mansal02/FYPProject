@@ -1,26 +1,32 @@
-import pyautogui
-import re
-import time
-import os
-import subprocess
-import threading
-import json
-import platform
-import shutil
-import pywhatkit
-import csv
-import importlib
-import random
-import io
+from __future__ import annotations
+
+import argparse
 import contextlib
-import webbrowser
+import csv
 from io import StringIO
+import io
+import importlib
+import json
+import os
+import platform
+from pydoc import text
+import pyautogui
+import random
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
 from urllib.parse import quote_plus
+import webbrowser
+
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import LineChart, Reference
 from openpyxl.utils import get_column_letter
+
 from aiassistant.infra.config.app_config import CONFIG
-from aiassistant.tools.tools_os import run_tool_action
+from aiassistant.tools.tools_os import run_tool_action, WINDOWS_APP_ALIASES
 
 try:
     Document = importlib.import_module("docx").Document
@@ -242,7 +248,6 @@ def _open_with_default_app(path):
 
 
 try:
-    # Import AppOpener functions (best on Windows).
     from AppOpener import open as open_app
     from AppOpener import close as close_app
     from AppOpener import give_appnames
@@ -309,7 +314,6 @@ class ExcelCommandHandler:
         workbook = self._load_or_create_workbook(file_path)
         sheet = self._pick_sheet(workbook, "RandomData")
 
-        # Reset sheet contents when regenerating demo data.
         if sheet.max_row > 0:
             sheet.delete_rows(1, sheet.max_row)
         if sheet.max_column > 0:
@@ -524,7 +528,7 @@ class ExcelCommandHandler:
             sheet = self._pick_sheet(workbook, sheet_name)
             sheet[target_cell.upper()] = self._ensure_formula_prefix(f"SUM({source_range.upper()})")
             workbook.save(file_path)
-            print(f"[ACTION][EXCEL] Sum {source_range.upper()} -> {target_cell.upper()} in {file_path}")
+            print(f"[ACTION][SUM] Sum {source_range.upper()} -> {target_cell.upper()} in {file_path}")
             return True
 
         formula_match = re.fullmatch(
@@ -748,25 +752,12 @@ class ActionHandler:
         }
 
     def __init__(self, db=None, context_provider=None):
-        # 1. CUSTOM APPS / GAMES
-        # Add games or portable apps here that the scanner misses.
-        # Use double backslashes \\ for paths.
         self.custom_apps = {
-   
             "steam": r"C:\Program Files (x86)\Steam\steam.exe",
             "obs": r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"
         }
-        if db is None:
-            try:
-                from aiassistant.infra.db.database_manager import DatabaseManager
-                db_file_path = str(CONFIG.get("paths", {}).get("db_path", "cache/assistant_sessions.db"))
-                self.db = DatabaseManager(db_path=db_file_path)
-            except Exception as e:
-                print(f"[ACTION][INIT] Remote database initialization fallback failed: {e}")
-                self.db = None
-        else:
-            self.db = db
-
+        self._explicit_db = db
+        self._db_instance = None
         self.context_provider = context_provider
         self.excel = ExcelCommandHandler()
         self.word = WordCommandHandler()
@@ -774,6 +765,20 @@ class ActionHandler:
         action_cfg = CONFIG.get("actions", {})
         self.safe_mode = bool(action_cfg.get("safe_mode", True))
         self.allow_legacy_text_commands = bool(action_cfg.get("allow_legacy_text_commands", True))
+
+    @property
+    def db(self):
+        if self._explicit_db is not None:
+            return self._explicit_db
+        if self._db_instance is None:
+            try:
+                from aiassistant.infra.db.database_manager import DatabaseManager
+                db_file_path = str(CONFIG.get("paths", {}).get("db_path", "cache/assistant_sessions.db"))
+                self._db_instance = DatabaseManager(db_path=db_file_path)
+            except Exception as e:
+                print(f"[ACTION][INIT] Lazy database fallback assignment failed: {e}")
+                self._db_instance = None
+        return self._db_instance
 
     def execute_and_collect(self, text):
         if not text:
@@ -1057,6 +1062,28 @@ class ActionHandler:
 
     def _open_app_name(self, app_name):
         print(f"[ACTION] Opening: '{app_name}'")
+        web_aliases = {
+            "youtube": "https://www.youtube.com",
+            "yt": "https://www.youtube.com",
+            "youtube music": "https://music.youtube.com",
+            "youtube studio": "https://studio.youtube.com",
+            "google": "https://www.google.com",
+            "github": "https://github.com",
+            "gmail": "https://mail.google.com",
+            "whatsapp": "https://web.whatsapp.com",
+            "telegram": "https://web.telegram.org",
+        }
+        
+        normalized = re.sub(r"[^a-z0-9\s\-_.]+", " ", str(app_name or "").strip().lower())
+        normalized = re.sub(r"\b(app|application|software|program)\b", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        
+        if normalized in WINDOWS_APP_ALIASES:
+            app_name = WINDOWS_APP_ALIASES[normalized]
+        
+        if normalized in web_aliases:
+            self._open_website(web_aliases[normalized])
+            return True
 
         for key, path in self.custom_apps.items():
             if key in app_name:
@@ -1215,7 +1242,6 @@ class ActionHandler:
                 )
                 return True
 
-        # Conversational app open/launch requests.
         natural_open_app_match = re.search(r"\b(?:open|launch|start|run)\b\s+(.+)$", raw_text, flags=re.IGNORECASE)
         if natural_open_app_match:
             if not re.search(r"\b(file|files|folder|folders|document|documents|path)\b", lowered):
@@ -1277,7 +1303,6 @@ class ActionHandler:
                     )
                     return True
 
-        # File system commands.
         if re.fullmatch(r"files\s+roots\s*", raw_text, flags=re.IGNORECASE):
             self._run_tool_bridge_action({"action": "list_system_roots"})
             return True
@@ -1396,7 +1421,6 @@ class ActionHandler:
             )
             return True
 
-        # Software commands.
         match = re.fullmatch(r"software\s+open\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
         if match:
             self._run_tool_bridge_action(
@@ -1431,7 +1455,6 @@ class ActionHandler:
             )
             return True
 
-        # Email and messaging commands.
         match = re.fullmatch(
             r"email\s+(draft|send)\s+to\s+(.+?)\s+subject\s+(.+?)\s+body\s+(.+?)(?:\s+attach\s+(.+?))?(?:\s+provider\s+(gmail|outlook|custom))?\s*$",
             raw_text,
@@ -1552,6 +1575,7 @@ class ActionHandler:
         if action == "play":
             if not target:
                 return False
+            import pywhatkit
             pywhatkit.playonyt(target)
             print(f"[ACTION] Playing on YouTube: {target}")
             return True
@@ -1566,201 +1590,230 @@ class ActionHandler:
         return self._execute_json_action(action_obj)
 
     def execute(self, text):
-        if not text: return
-        raw_text = text.strip()
-        text = raw_text.lower()
-
-        structured_action = self._extract_json_action(raw_text)
-        if structured_action:
-            self._execute_json_action(structured_action)
+        if not text: 
             return
+        
+        try:
+            raw_text = text.strip()
+            
+            # Aggressive formatting cleanups from incoming updates
+            if raw_text.startswith("```json"):
+                raw_text = raw_text.replace("```json", "").replace("```", "").strip()
 
-        if self._handle_extended_tool_commands(raw_text):
-            return
-
-        # =========================================================
-        # EXCEL COMMANDS
-        # =========================================================
-        if self.excel.handle(raw_text):
-            return
-
-        # =========================================================
-        # WORD / POWERPOINT COMMANDS
-        # =========================================================
-        if text.startswith("word ") and self.word.handle(raw_text):
-            return
-
-        if text.startswith("powerpoint ") and self.powerpoint.handle(raw_text):
-            return
-
-        if text == "office help":
-            self.excel.handle("excel help")
-            self.word.handle("word help")
-            self.powerpoint.handle("powerpoint help")
-            return
-
-        # =========================================================
-        # WEB + STUDY + CLIPBOARD
-        # =========================================================
-        web_research_match = re.fullmatch(r"(?:web\s+research|research\s+web|research)\s+(.+)", raw_text, flags=re.IGNORECASE)
-        if web_research_match:
-            query = web_research_match.group(1)
-            self._research_and_store_web_data(query)
-            return
-
-        open_web_match = re.fullmatch(r"(?:open\s+website|browse)\s+(.+)", raw_text, flags=re.IGNORECASE)
-        if open_web_match:
-            self._open_website(open_web_match.group(1))
-            return
-
-        search_web_match = re.fullmatch(r"search\s+web\s+(.+)", raw_text, flags=re.IGNORECASE)
-        if search_web_match:
-            query = search_web_match.group(1).strip()
-            search_url = f"https://duckduckgo.com/?q={quote_plus(query)}"
-            webbrowser.open(search_url)
-            print(f"[ACTION][WEB] Searching web for: {query}")
-            return
-
-        if re.fullmatch(r"(?:copy\s+selected\s+text|copy\s+now)", text):
-            pyautogui.hotkey("ctrl", "c")
-            time.sleep(0.2)
-            if CLIPBOARD_AVAILABLE:
-                snippet = pyperclip.paste().strip()
-                preview = snippet[:120] + ("..." if len(snippet) > 120 else "")
-                print(f"[ACTION][CLIPBOARD] Copied: {preview}")
-            else:
-                print("[ACTION][CLIPBOARD] Copied selection (clipboard preview unavailable).")
-            return
-
-        if re.fullmatch(r"(?:paste\s+clipboard|paste\s+now)", text):
-            pyautogui.hotkey("ctrl", "v")
-            print("[ACTION][CLIPBOARD] Pasted clipboard into active software.")
-            return
-
-        save_clip_match = re.fullmatch(r"save\s+clipboard\s+to\s+rad\s+as\s+(.+)", raw_text, flags=re.IGNORECASE)
-        if save_clip_match:
-            if not CLIPBOARD_AVAILABLE:
-                print("[ACTION][RAD] pyperclip not installed. Run: pip install pyperclip")
-                return
-            if not self.db or not hasattr(self.db, "add_rad_data_if_new"):
-                print("[ACTION][RAD] Database connection unavailable for clipboard save.")
-                return
-
-            key_name = save_clip_match.group(1).strip().strip('"').strip("'")
-            clip_text = pyperclip.paste().strip()
-            if not clip_text:
-                print("[ACTION][RAD] Clipboard is empty.")
-                return
-
-            stored = self.db.add_rad_data_if_new("clipboard_note", key_name, clip_text, 0.84)
-            if stored:
-                print(f"[ACTION][RAD] Clipboard saved under key '{key_name}'.")
-            else:
-                print(f"[ACTION][RAD] Duplicate clipboard note ignored for key '{key_name}'.")
-            return
-
-        # =========================================================
-        # SYSTEM CHECKING / OPTIONAL SECURITY
-        # =========================================================
-        if re.fullmatch(r"(?:system check|check system)", text):
-            self._print_system_check()
-            return
-
-        if re.fullmatch(r"(?:malware scan|scan for malware|run malware scan|security quick scan)", text):
-            threading.Thread(target=self._run_quick_malware_scan, daemon=True).start()
-            return
-
-        # =========================================================
-        # 0. SPECIAL COMMAND: UPDATE APP LIST
-        # =========================================================
-        if "scan apps" in text or "update apps" in text:
-            print("[ACTION] Scanning for new apps...")
-            if APPOPENER_AVAILABLE and give_appnames:
-                # Run this in a thread so it doesn't freeze MARIE
-                threading.Thread(target=give_appnames, daemon=True).start()
-            else:
-                print("[ACTION] App scanning is only available when AppOpener is installed.")
-            return
-
-        # =========================================================
-        # 1. YOUTUBE (Play Video)
-        # =========================================================
-        if text.startswith("play "):
-            video_topic = text.replace("play ", "").replace("please", "").strip()
-            print(f"[ACTION] Playing on YouTube: {video_topic}")
+            # Try to parse string as direct structured JSON payload first
             try:
-                pywhatkit.playonyt(video_topic)
-            except Exception as e:
-                print(f"[ERROR] YouTube failed: {e}")
-            return
+                potential_json = json.loads(raw_text)
+                if isinstance(potential_json, dict) and "action" in potential_json:
+                    from aiassistant.tools.tools_os import run_tool_action
+                    run_tool_action(potential_json)
+                    return
+            except json.JSONDecodeError:
+                pass
 
-        # =========================================================
-        # 2. NOTEPAD (Write text)
-        # =========================================================
-        write_triggers = ["write ", "note ", "type ", "take a note "]
-        triggered_word = next((w for w in write_triggers if text.startswith(w)), None)
+            text = raw_text.lower()
 
-        if triggered_word:
-            content = text.replace(triggered_word, "").strip()
-            print(f"[ACTION] Writing to editor: {content}")
-            self._open_text_editor()
-            time.sleep(1.0)
-            pyautogui.write(content, interval=0.05)
-            return
-
-        # =========================================================
-        # 3. SYSTEM CONTROLS
-        # =========================================================
-        if "volume up" in text:
-            pyautogui.press('volumeup')
-            return
-        elif "volume down" in text:
-            pyautogui.press('volumedown')
-            return
-        elif "mute" in text or "unmute" in text:
-            pyautogui.press('volumemute')
-            return
-
-        # =========================================================
-        # 4. OPEN APPS (Custom + General)
-        # =========================================================
-        if text.startswith("open "):
-            raw_name = text.replace("open ", "").strip()
-            app_name = raw_name.replace("please", "").replace("now", "").strip()
-            app_name = re.sub(r'[^\w\s]', '', app_name)
-
-            if self._looks_like_file_hint(raw_name):
-                self._run_tool_bridge_action(
-                    {
-                        "action": "open_file",
-                        "path": raw_name,
-                        "resolve_by_hint": True,
-                        "include_content": True,
-                    }
-                )
+            # Evaluate regular loose actions
+            structured_action = self._extract_json_action(raw_text)
+            if structured_action:
+                self._execute_json_action(structured_action)
                 return
 
-            opened = self._open_app_name(app_name)
-            if not opened and len(app_name.split()) >= 3:
-                self._run_tool_bridge_action(
-                    {
-                        "action": "open_file",
-                        "path": raw_name,
-                        "resolve_by_hint": True,
-                        "include_content": True,
-                    }
-                )
-            return
+            if self._handle_extended_tool_commands(raw_text):
+                return
 
-        # =========================================================
-        # 5. CLOSE APPS
-        # =========================================================
-        if text.startswith("close "):
-            app_name = text.replace("close ", "").replace("please", "").strip()
-            app_name = re.sub(r'[^\w\s]', '', app_name)
+            if self.excel.handle(raw_text):
+                return
 
-            self._close_app_name(app_name)
-            return
+            if text.startswith("word ") and self.word.handle(raw_text):
+                return
 
-        if self._looks_like_action_command(raw_text):
-            print("[ACTION] No command matched. Run 'office help' for office commands.")
+            if text.startswith("powerpoint ") and self.powerpoint.handle(raw_text):
+                return
+
+            if text == "office help":
+                self.excel.handle("excel help")
+                self.word.handle("word help")
+                self.powerpoint.handle("powerpoint help")
+                return
+
+            web_research_match = re.fullmatch(r"(?:web\s+research|research\s+web|research)\s+(.+)", raw_text, flags=re.IGNORECASE)
+            if web_research_match:
+                query = web_research_match.group(1)
+                self._research_and_store_web_data(query)
+                return
+
+            open_web_match = re.fullmatch(r"(?:open\s+website|browse)\s+(.+)", raw_text, flags=re.IGNORECASE)
+            if open_web_match:
+                self._open_website(open_web_match.group(1))
+                return
+
+            search_web_match = re.fullmatch(r"search\s+web\s+(.+)", raw_text, flags=re.IGNORECASE)
+            if search_web_match:
+                query = search_web_match.group(1).strip()
+                search_url = f"[https://duckduckgo.com/?q=](https://duckduckgo.com/?q=){quote_plus(query)}"
+                webbrowser.open(search_url)
+                print(f"[ACTION][WEB] Searching web for: {query}")
+                return
+
+            if re.fullmatch(r"(?:copy\s+selected\s+text|copy\s+now)", text):
+                pyautogui.hotkey("ctrl", "c")
+                time.sleep(0.2)
+                if CLIPBOARD_AVAILABLE:
+                    snippet = pyperclip.paste().strip()
+                    preview = snippet[:120] + ("..." if len(snippet) > 120 else "")
+                    print(f"[ACTION][CLIPBOARD] Copied: {preview}")
+                else:
+                    print("[ACTION][CLIPBOARD] Copied selection (clipboard preview unavailable).")
+                return
+
+            if re.fullmatch(r"(?:paste\s+clipboard|paste\s+now)", text):
+                pyautogui.hotkey("ctrl", "v")
+                print("[ACTION][CLIPBOARD] Pasted clipboard into active software.")
+                return
+
+            save_clip_match = re.fullmatch(r"save\s+clipboard\s+to\s+rad\s+as\s+(.+)", raw_text, flags=re.IGNORECASE)
+            if save_clip_match:
+                if not CLIPBOARD_AVAILABLE:
+                    print("[ACTION][RAD] pyperclip not installed. Run: pip install pyperclip")
+                    return
+                if not self.db or not hasattr(self.db, "add_rad_data_if_new"):
+                    print("[ACTION][RAD] Database connection unavailable for clipboard save.")
+                    return
+
+                key_name = save_clip_match.group(1).strip().strip('"').strip("'")
+                clip_text = pyperclip.paste().strip()
+                if not clip_text:
+                    print("[ACTION][RAD] Clipboard is empty.")
+                    return
+
+                stored = self.db.add_rad_data_if_new("clipboard_note", key_name, clip_text, 0.84)
+                if stored:
+                    print(f"[ACTION][RAD] Clipboard saved under key '{key_name}'.")
+                else:
+                    print(f"[ACTION][RAD] Duplicate clipboard note ignored for key '{key_name}'.")
+                return
+
+            if re.fullmatch(r"(?:system check|check system)", text):
+                self._print_system_check()
+                return
+
+            if re.fullmatch(r"(?:malware scan|scan for malware|run malware scan|security quick scan)", text):
+                threading.Thread(target=self._run_quick_malware_scan, daemon=True).start()
+                return
+
+            if "scan apps" in text or "update apps" in text:
+                print("[ACTION] Scanning for new apps...")
+                if APPOPENER_AVAILABLE and give_appnames:
+                    threading.Thread(target=give_appnames, daemon=True).start()
+                else:
+                    print("[ACTION] App scanning is only available when AppOpener is installed.")
+                return
+
+            if text.startswith("play "):
+                video_topic = text.replace("play ", "").replace("please", "").strip()
+                print(f"[ACTION] Playing on YouTube: {video_topic}")
+                try:
+                    import pywhatkit
+                    pywhatkit.playonyt(video_topic)
+                except Exception as e:
+                    print(f"[ERROR] pywhatkit failed, falling back to direct browser search query: {e}")
+                    search_url = f"[https://www.youtube.com/results?search_query=](https://www.youtube.com/results?search_query=){quote_plus(video_topic)}"
+                    webbrowser.open(search_url)
+                return
+
+            write_triggers = ["write ", "note ", "type ", "take a note "]
+            triggered_word = next((w for w in write_triggers if text.startswith(w)), None)
+
+            if triggered_word:
+                content = text.replace(triggered_word, "").strip()
+                print(f"[ACTION] Writing to editor: {content}")
+                self._open_text_editor()
+                time.sleep(1.0)
+                pyautogui.write(content, interval=0.05)
+                return
+
+            if "volume up" in text:
+                pyautogui.press('volumeup')
+                return
+            elif "volume down" in text:
+                pyautogui.press('volumedown')
+                return
+            elif "mute" in text or "unmute" in text:
+                pyautogui.press('volumemute')
+                return
+
+            # Integrated & extended global command routing routing fallbacks
+            if text.startswith("open ") or text.startswith("launch "):
+                raw_name = re.sub(r'^(open|launch)\s+', '', text).strip()
+                app_name = raw_name.replace("please", "").replace("now", "").strip()
+                app_name = re.sub(r'[^\w\s]', '', app_name)
+
+                if self._looks_like_file_hint(raw_name):
+                    self._run_tool_bridge_action(
+                        {
+                            "action": "open_file",
+                            "path": raw_name,
+                            "resolve_by_hint": True,
+                            "include_content": True,
+                        }
+                    )
+                    return
+
+                opened = self._open_app_name(app_name)
+                if not opened:
+                    if len(app_name.split()) >= 3:
+                        self._run_tool_bridge_action(
+                            {
+                                "action": "open_file",
+                                "path": raw_name,
+                                "resolve_by_hint": True,
+                                "include_content": True,
+                            }
+                        )
+                    else:
+                        # Direct tool integration bridge routing fallback
+                        from aiassistant.tools.tools_os import run_tool_action
+                        run_tool_action({"action": "launch_application", "app": app_name})
+                return
+
+            if text.startswith("close "):
+                app_name = text.replace("close ", "").replace("please", "").strip()
+                app_name = re.sub(r'[^\w\s]', '', app_name)
+                self._close_app_name(app_name)
+                return
+
+            # Ultimate dead-end system routing fallback command
+            if self._looks_like_action_command(raw_text):
+                from aiassistant.tools.tools_os import run_tool_action
+                run_tool_action({"action": "run_command", "command": raw_text})
+
+        except Exception as global_err:
+            # Ultimate fault tolerance catcher to ensure execution never brings down the interface loop
+            print(f"[Critical Action Failure Guard] Automated recovery handled anomaly: {global_err}")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run one automation action command")
+    parser.add_argument("--text", required=True, help="Action command text")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+    text = str(args.text or "").strip()
+    if not text:
+        return 0
+
+    try:
+        handler = ActionHandler()
+        output = handler.execute_and_collect(text)
+        if output:
+            print(output)
+        return 0
+    except Exception as exc:
+        print(f"[ACTION RUNNER ERROR] {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

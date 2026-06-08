@@ -89,14 +89,10 @@ class DatabaseManager:
             user_id INTEGER PRIMARY KEY,
             preferred_voice TEXT DEFAULT 'system_default',
             preferred_reasoning_model TEXT,
-            preferred_vision_model TEXT,
             preferred_live2d_model TEXT,
             tts_enabled INTEGER DEFAULT 1,
             voice_input_enabled INTEGER DEFAULT 0,
-            screen_capture_enabled INTEGER DEFAULT 0,
-            screen_preview_enabled INTEGER DEFAULT 0,
             rag_enabled INTEGER DEFAULT 1,
-            desktop_mate_enabled INTEGER DEFAULT 0,
             speaking_speed REAL DEFAULT 1.0,
             system_prompt_behavior TEXT DEFAULT 'default',
             system_prompt_custom TEXT DEFAULT '',
@@ -527,14 +523,10 @@ class DatabaseManager:
         column_map = {
             "preferred_voice": "preferred_voice",
             "preferred_reasoning_model": "preferred_reasoning_model",
-            "preferred_vision_model": "preferred_vision_model",
             "preferred_live2d_model": "preferred_live2d_model",
             "tts_enabled": "tts_enabled",
             "voice_input_enabled": "voice_input_enabled",
-            "screen_capture_enabled": "screen_capture_enabled",
-            "screen_preview_enabled": "screen_preview_enabled",
             "rag_enabled": "rag_enabled",
-            "desktop_mate_enabled": "desktop_mate_enabled",
             "speaking_speed": "speaking_speed",
             "system_prompt_behavior": "system_prompt_behavior",
             "system_prompt_custom": "system_prompt_custom",
@@ -542,10 +534,7 @@ class DatabaseManager:
         bool_keys = {
             "tts_enabled",
             "voice_input_enabled",
-            "screen_capture_enabled",
-            "screen_preview_enabled",
             "rag_enabled",
-            "desktop_mate_enabled",
         }
 
         updates: List[str] = []
@@ -595,14 +584,10 @@ class DatabaseManager:
         defaults = {
             "preferred_voice": "system_default",
             "preferred_reasoning_model": str(CONFIG.get("ollama", {}).get("model", "qwen2.5-coder:7b")),
-            "preferred_vision_model": str(CONFIG.get("vision", {}).get("vision_model", "qwen2.5vl:7b")),
             "preferred_live2d_model": str(CONFIG.get("paths", {}).get("default_live2d_model", "")),
             "tts_enabled": True,
             "voice_input_enabled": False,
-            "screen_capture_enabled": bool(CONFIG.get("vision", {}).get("screen_share_enabled", False)),
-            "screen_preview_enabled": False,
             "rag_enabled": True,
-            "desktop_mate_enabled": False,
             "speaking_speed": float(CONFIG.get("voice", {}).get("speaking_speed", 1.0)),
             "system_prompt_behavior": "default",
             "system_prompt_custom": "",
@@ -614,14 +599,10 @@ class DatabaseManager:
                 SELECT
                     preferred_voice,
                     preferred_reasoning_model,
-                    preferred_vision_model,
                     preferred_live2d_model,
                     tts_enabled,
                     voice_input_enabled,
-                    screen_capture_enabled,
-                    screen_preview_enabled,
                     rag_enabled,
-                    desktop_mate_enabled,
                     speaking_speed,
                     system_prompt_behavior,
                     system_prompt_custom
@@ -641,45 +622,19 @@ class DatabaseManager:
 
         result = dict(defaults)
         result["preferred_voice"] = str(row["preferred_voice"] or defaults["preferred_voice"])
-        result["preferred_reasoning_model"] = str(
-            row["preferred_reasoning_model"] or defaults["preferred_reasoning_model"]
-        )
-        result["preferred_vision_model"] = str(
-            row["preferred_vision_model"] or defaults["preferred_vision_model"]
-        )
-        result["preferred_live2d_model"] = str(
-            row["preferred_live2d_model"] or defaults["preferred_live2d_model"]
-        )
+        result["preferred_reasoning_model"] = str(row["preferred_reasoning_model"] or defaults["preferred_reasoning_model"])
+        result["preferred_live2d_model"] = str(row["preferred_live2d_model"] or defaults["preferred_live2d_model"])
         result["tts_enabled"] = _to_bool(row["tts_enabled"], bool(defaults["tts_enabled"]))
-        result["voice_input_enabled"] = _to_bool(
-            row["voice_input_enabled"],
-            bool(defaults["voice_input_enabled"]),
-        )
-        result["screen_capture_enabled"] = _to_bool(
-            row["screen_capture_enabled"],
-            bool(defaults["screen_capture_enabled"]),
-        )
-        result["screen_preview_enabled"] = _to_bool(
-            row["screen_preview_enabled"],
-            bool(defaults["screen_preview_enabled"]),
-        )
+        result["voice_input_enabled"] = _to_bool(row["voice_input_enabled"], bool(defaults["voice_input_enabled"]))
         result["rag_enabled"] = _to_bool(row["rag_enabled"], bool(defaults["rag_enabled"]))
-        result["desktop_mate_enabled"] = _to_bool(
-            row["desktop_mate_enabled"],
-            bool(defaults["desktop_mate_enabled"]),
-        )
 
         try:
             result["speaking_speed"] = max(0.4, min(float(row["speaking_speed"]), 2.5))
         except (TypeError, ValueError):
             result["speaking_speed"] = defaults["speaking_speed"]
 
-        result["system_prompt_behavior"] = str(
-            row["system_prompt_behavior"] or defaults["system_prompt_behavior"]
-        ).strip() or "default"
-        result["system_prompt_custom"] = str(
-            row["system_prompt_custom"] or defaults["system_prompt_custom"]
-        )
+        result["system_prompt_behavior"] = str(row["system_prompt_behavior"] or defaults["system_prompt_behavior"]).strip() or "default"
+        result["system_prompt_custom"] = str(row["system_prompt_custom"] or defaults["system_prompt_custom"])
 
         return result
 
@@ -932,3 +887,33 @@ class DatabaseManager:
                 )
             self.conn.commit()
             return cursor.rowcount > 0
+        
+    def build_memory_context(self, user_id: int, session_id: Optional[str] = None) -> str:
+        """
+        Combines RAD memory + prior conversation turns for continuity.
+        Integrates cleanly with worker pipeline evaluations.
+        """
+        rad_limit = int(CONFIG.get("memory", {}).get("rad_limit", 220))
+        turn_limit = int(CONFIG.get("memory", {}).get("recent_turn_limit", 10))
+        max_context_chars = int(CONFIG.get("memory", {}).get("max_context_chars", 9000))
+        
+        # Pull long term facts
+        rad_rows = self.get_rad_data(user_id, limit=rad_limit)
+        rad_context = "\n".join([f"{r['key_data']}: {r['value_data']}" for r in reversed(rad_rows)])
+
+        # Pull short term session memory window
+        turn_context = ""
+        if session_id:
+            turn_rows = self.get_recent_turns(session_id, turn_limit=turn_limit)
+            turn_context = "\n".join([f"{t['role'].title()}: {t['message']}" for t in turn_rows])
+
+        chunks = []
+        if rad_context: 
+            chunks.append("Known memory:\n" + rad_context)
+        if turn_context: 
+            chunks.append("Recent conversation:\n" + turn_context)
+
+        context = "\n\n".join(chunks)
+        if len(context) <= max_context_chars:
+            return context
+        return context[-max_context_chars:]    

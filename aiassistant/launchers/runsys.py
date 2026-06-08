@@ -74,28 +74,18 @@ def _is_access_violation_exit_code(return_code):
 
 
 def _apply_main_gui_stability_profile(env, level):
-    level_int = max(0, int(level))
-    env["MARIE_STABILITY_MODE_LEVEL"] = str(level_int)
+    env["MARIE_STABILITY_MODE_LEVEL"] = "0"
     env.setdefault("MARIE_FAULTHANDLER", "1")
     env.setdefault("MARIE_GUI_BOOT_LOG", str((BASE_DIR / "cache" / "main_gui_boot.log").resolve()))
 
-    if level_int >= 1:
-        env["MARIE_DISABLE_LIVE2D"] = "1"
-        env["MARIE_ENABLE_LIVE2D"] = "0"
-
-    if level_int >= 2:
-        env["MARIE_DISABLE_VOICE_INPUT"] = "1"
-        env["MARIE_DISABLE_TTS"] = "1"
-        env["MARIE_DISABLE_SCREEN_CAPTURE"] = "1"
-        env["MARIE_DISABLE_SCREEN_PREVIEW"] = "1"
-        env["MARIE_DISABLE_LEGACY_ACTIONS"] = "1"
-        env["MARIE_DISABLE_RAG"] = "1"
-        env["MARIE_SAFE_MINIMAL"] = "1"
-        # Force Qt software rendering for driver-sensitive systems.
-        env["QT_OPENGL"] = "software"
-        env["QT_ANGLE_PLATFORM"] = "software"
-        env["QT_QUICK_BACKEND"] = "software"
-        env["QTWEBENGINE_DISABLE_GPU"] = "1"
+    # Explicitly clear out all feature restrictions
+    env["MARIE_DISABLE_LIVE2D"] = "0"
+    env["MARIE_ENABLE_LIVE2D"] = "1"
+    env["MARIE_DISABLE_VOICE_INPUT"] = "0"
+    env["MARIE_DISABLE_TTS"] = "0"
+    env["MARIE_DISABLE_LEGACY_ACTIONS"] = "0"
+    env["MARIE_DISABLE_RAG"] = "0"
+    env["MARIE_SAFE_MINIMAL"] = "0"
 
 
 def _stability_profile_summary(level):
@@ -103,7 +93,7 @@ def _stability_profile_summary(level):
         return "normal profile"
     if level == 1:
         return "stability profile 1 (Live2D disabled)"
-    return "stability profile 2 (minimal runtime: Live2D/voice/TTS/screen/RAG disabled)"
+    return "stability profile 2 (minimal runtime: Live2D/voice/TTS/RAG disabled)"
 
 
 def _main_gui_boot_log_path() -> str:
@@ -199,30 +189,19 @@ def run_script(script_name):
                 return
 
             if (
-                script_name == "aiassistant.frontend.main_gui"
-                and stability_level < GUI_STABILITY_MAX_LEVEL
-            ):
-                if _is_access_violation_exit_code(return_code):
-                    # Native access violations should skip intermediate profile 1.
-                    next_level = GUI_STABILITY_MAX_LEVEL
-                else:
-                    next_level = min(stability_level + 1, GUI_STABILITY_MAX_LEVEL)
-                stability_level = next_level
-                crash_kind = (
-                    "native GUI crash"
-                    if _is_access_violation_exit_code(return_code)
-                    else "unexpected GUI exit"
-                )
-                print(
-                    f"--- Detected {crash_kind} (exit code {return_code}). Restarting main_gui with {_stability_profile_summary(stability_level)}... ---",
-                    flush=True,
-                )
-                if stability_level >= 1:
-                    print(
-                        f"--- Diagnostic boot log: {_main_gui_boot_log_path()} ---",
-                        flush=True,
-                    )
-                continue
+                            script_name == "aiassistant.frontend.main_gui"
+                        ):
+                            stability_level = 0
+                            crash_kind = (
+                                "native GUI crash"
+                                if _is_access_violation_exit_code(return_code)
+                                else "unexpected GUI exit"
+                            )
+                            print(
+                                f"--- Detected {crash_kind} (exit code {return_code}). Restarting main_gui with full capability profile... ---",
+                                flush=True,
+                            )
+                            continue
 
             with failures_lock:
                 failures.append((script_name, return_code))

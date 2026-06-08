@@ -52,6 +52,8 @@ from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.doc_indexer import build_default_indexer
 from aiassistant.infra.db.database_manager import DatabaseManager
 
+LAST_EVENT_POLL_TIME = 0.0
+_EVENT_POLL_INTERVAL_SEC = 0.05
 
 def _bootstrap_env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
@@ -77,32 +79,19 @@ def _bootstrap_env_int(name: str, default: int = 0) -> int:
 
 def _auto_apply_midtier_optimizations() -> None:
     """Auto-disable heavy features on mid-tier devices."""
-    try:
-        import psutil
-        total_gb = psutil.virtual_memory().total / (1024**3)
-        device_class = os.environ.get("MARIE_DEVICE_CLASS", "").strip().lower()
-
-        if device_class == "auto" or not device_class:
-            if total_gb < 8 and "MARIE_ENABLE_MIDTIER_MODE" in os.environ:
-                os.environ.setdefault("MARIE_DISABLE_LIVE2D", "1")
-                os.environ.setdefault("MARIE_DISABLE_SCREEN_CAPTURE", "1")
-                if total_gb < 4:
-                    os.environ.setdefault("MARIE_DISABLE_RAG", "1")
-    except Exception:
-        pass
+    os.environ["MARIE_DISABLE_LIVE2D"] = "0"
+    os.environ["MARIE_DISABLE_RAG"] = "0"
 
 
 _auto_apply_midtier_optimizations()
 
-_BOOT_STABILITY_MODE_LEVEL = max(0, _bootstrap_env_int("MARIE_STABILITY_MODE_LEVEL", 0))
-_BOOT_DISABLE_LIVE2D = _bootstrap_env_bool("MARIE_DISABLE_LIVE2D", False)
-_BOOT_DISABLE_VOICE_INPUT = _bootstrap_env_bool("MARIE_DISABLE_VOICE_INPUT", True)
-_BOOT_DISABLE_TTS = _bootstrap_env_bool("MARIE_DISABLE_TTS", False)
-_BOOT_DISABLE_SCREEN_CAPTURE = _bootstrap_env_bool("MARIE_DISABLE_SCREEN_CAPTURE", True)
-_BOOT_DISABLE_SCREEN_PREVIEW = _bootstrap_env_bool("MARIE_DISABLE_SCREEN_PREVIEW", True)
-_BOOT_DISABLE_LEGACY_ACTIONS = _bootstrap_env_bool("MARIE_DISABLE_LEGACY_ACTIONS", False)
-_BOOT_SAFE_MINIMAL = _bootstrap_env_bool("MARIE_SAFE_MINIMAL", False)
-_BOOT_SKIP_MEDIA_STACK = True
+_BOOT_STABILITY_MODE_LEVEL = 0
+_BOOT_DISABLE_LIVE2D = False
+_BOOT_DISABLE_VOICE_INPUT = False
+_BOOT_DISABLE_TTS = False
+_BOOT_DISABLE_LEGACY_ACTIONS = False
+_BOOT_SAFE_MINIMAL = False
+_BOOT_SKIP_MEDIA_STACK = False
 
 _DEFAULT_BOOT_LOG = str(
     (
@@ -194,7 +183,6 @@ if not (_BOOT_DISABLE_LIVE2D or _BOOT_SAFE_MINIMAL):
 
 AUTO_LOGIN_FILE = str(CONFIG.get("paths", {}).get("auto_login_file", "./.marie_autologin.json"))
 DEFAULT_REASONING_MODEL = str(CONFIG.get("ollama", {}).get("model", "qwen2.5-coder:7b"))
-DEFAULT_VISION_MODEL = str(CONFIG.get("vision", {}).get("vision_model", "qwen2.5vl:7b") or "qwen2.5vl:7b")
 DEFAULT_LIVE2D_MODEL = str(CONFIG.get("paths", {}).get("default_live2d_model", ""))
 DEFAULT_TTS_SPEED = float(CONFIG.get("voice", {}).get("speaking_speed", 1.0))
 
@@ -250,9 +238,20 @@ def run_action_command_isolated(text: str, timeout_sec: int = 50) -> tuple[bool,
     if not clean_text:
         return True, ""
 
-    command = [sys.executable, "-m", "aiassistant.tools.action_runner", "--text", clean_text]
+    from aiassistant.infra.config.app_config import ROOT_DIR
+    command = [sys.executable, "-m", "aiassistant.tools.action", "--text", clean_text]
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=max(5, int(timeout_sec)), check=False)
+        child_env = os.environ.copy()
+        child_env["PYTHONPATH"] = str(ROOT_DIR)
+        completed = subprocess.run(
+            command, 
+            capture_output=True, 
+            text=True, 
+            timeout=max(5, int(timeout_sec)), 
+            check=False,
+            cwd=str(ROOT_DIR),
+            env=child_env
+        )
     except subprocess.TimeoutExpired:
         return False, "[ACTION] Command timed out in isolated runner."
     except Exception as exc:
@@ -267,7 +266,13 @@ def _looks_like_legacy_action_command(text: str) -> bool:
     lowered = str(text or "").strip().lower()
     if not lowered:
         return False
-    prefixes = ("files ", "software ", "service ", "launch ", "start ", "quit ", "exit ", "open ", "close ")
+    prefixes = (
+        "files ", "software ", "service ", "launch ", "start ", "quit ", "exit ", "open ", "close ",
+        "play ", "write ", "note ", "type ", "take a note ", "search web ", "open website ", "browse ",
+        "excel ", "word ", "powerpoint ", "research ", "web research ", "system check", "check system",
+        "malware scan", "scan for malware", "run malware scan", "security quick scan", "copy selected text",
+        "copy now", "paste clipboard", "paste now", "save clipboard to rad as "
+    )
     return lowered.startswith(prefixes)
 
 
@@ -390,7 +395,6 @@ class AssistantMainWindow(QMainWindow):
         self.response_only_mode = False
 
         self.reasoning_model = DEFAULT_REASONING_MODEL
-        self.vision_model = DEFAULT_VISION_MODEL
         self.model_path = str(self.preferences.get("preferred_live2d_model") or DEFAULT_LIVE2D_MODEL)
         self.voice_profile = str(self.preferences.get("preferred_voice") or "system_default")
         self.speaking_speed = float(self.preferences.get("speaking_speed", DEFAULT_TTS_SPEED))
@@ -400,7 +404,6 @@ class AssistantMainWindow(QMainWindow):
             db=self.db,
             config=AgentConfig(
                 reasoning_model=self.reasoning_model,
-                vision_model=self.vision_model,
                 rag_enabled=bool(self.preferences.get("rag_enabled", True)),
                 hybrid_mode=False,
                 online_mode="offline",
@@ -542,16 +545,9 @@ class AssistantMainWindow(QMainWindow):
 
         toggles_row = QHBoxLayout()
         self.rag_toggle = QCheckBox("Use local RAG memory")
-        if os.environ.get("MARIE_DISABLE_RAG") == "1":
-            self.rag_toggle.setChecked(False)
-            self.rag_toggle.setEnabled(False)
-            self.rag_toggle.setToolTip("RAG hard-disabled in launcher context due to system compatibility constraints.")
-        else:
-            self.rag_toggle.setChecked(bool(self.preferences.get("rag_enabled", True)))
-            self.rag_toggle.stateChanged.connect(self.on_rag_toggle_changed)
-
+        self.rag_toggle.setChecked(bool(self.preferences.get("rag_enabled", True)))
+        self.rag_toggle.stateChanged.connect(self.on_rag_toggle_changed)
         toggles_row.addWidget(self.rag_toggle)
-
         self.tts_toggle = QCheckBox("Speak assistant replies")
         self.tts_toggle.stateChanged.connect(self.on_tts_toggle_changed)
         toggles_row.addWidget(self.tts_toggle)
@@ -745,13 +741,21 @@ class AssistantMainWindow(QMainWindow):
     def update_live2d_frame(self) -> None:
         if not self.model:
             return
-        pygame.event.get()
+        
+        global _LAST_EVENT_POLL_TIME
+        current_time = time.time() 
+        
+        if (current_time - _LAST_EVENT_POLL_TIME) > _EVENT_POLL_INTERVAL_SEC: pygame.event.get()
+        _LAST_EVENT_POLL_TIME = current_time
+        
         self.t_breath += 0.05
         self.model.SetParameterValue("ParamBreath", (math.sin(self.t_breath) + 1) / 2)
         self.model.Update()
         live2d.clearBuffer(0.08, 0.1, 0.14, 1.0)
         self.model.Draw()
         pygame.display.flip()
+        
+        
 
     def _append_chat(self, speaker: str, text: str) -> None:
         self.chat_box.append(f"<b>{html.escape(speaker)}:</b> {html.escape(text)}")
@@ -808,6 +812,11 @@ class AssistantMainWindow(QMainWindow):
         tag = "Action" if success else "Action Error"
         if output:
             self._append_chat(tag, output)
+        else:
+            if success:
+                self._append_chat("Action", "Sure.")
+            else:
+                self._append_chat("Action Error", "There is some problem with my system.")
         self._set_status_core("Ready")
 
     def on_stop_clicked(self) -> None:
@@ -848,7 +857,6 @@ class AssistantMainWindow(QMainWindow):
             "rag_enabled": rag_enabled,
             "tts_enabled": tts_enabled,
             "preferred_reasoning_model": self.reasoning_model,
-            "preferred_vision_model": self.vision_model,
             "preferred_live2d_model": self.model_path,
             "speaking_speed": self.speaking_speed,
             "preferred_voice": self.voice_profile
