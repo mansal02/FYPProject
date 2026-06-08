@@ -107,12 +107,6 @@ crew:
     coder: qwen2.5-coder:7b
     synthesizer: qwen2.5-coder:7b
 
-vision:
-  screen_share_enabled: false
-  vision_model: qwen2.5vl:7b
-  screenshot_dir: ./cache/screens
-  capture_interval_sec: 0.8
-  max_width: 1280
 
 runtime:
   hybrid_mode: false

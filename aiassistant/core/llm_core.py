@@ -30,8 +30,8 @@ except Exception:
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.db.database_manager import DatabaseManager
 from aiassistant.workers import create_fast_worker
-from aiassistant.workers.offline_worker import OfflineLLMClient, OfflineWorker
-from aiassistant.workers.online_worker import OnlineLLMClient, OnlineWorker
+from aiassistant.workers.worker import OfflineLLMClient, OfflineWorker,OnlineLLMClient, OnlineWorker
+
 
 try:
     from crewai import Agent, Task, Crew
@@ -40,6 +40,8 @@ except ImportError:
     Task = None
     Crew = None
 
+_LAST_VRAM_CLEANUP_TIME = 0.0
+_VRAM_CLEANUP_DEBOUNCE_SEC = 10.0 
 
 class EventBus:
     """Simple thread-safe publish/subscribe event bus."""
@@ -1513,11 +1515,9 @@ def _bootstrap_env_int(name: str, default: int = 0) -> int:
     except Exception:
         return int(default)
 
-
-_BOOT_STABILITY_MODE_LEVEL = max(0, _bootstrap_env_int("MARIE_STABILITY_MODE_LEVEL", 0))
-_BOOT_DISABLE_SCREEN_CAPTURE = _bootstrap_env_bool("MARIE_DISABLE_SCREEN_CAPTURE", False)
-_BOOT_DISABLE_RAG = _bootstrap_env_bool("MARIE_DISABLE_RAG", False)
-_BOOT_SAFE_MINIMAL = _bootstrap_env_bool("MARIE_SAFE_MINIMAL", False)
+_BOOT_STABILITY_MODE_LEVEL = 0
+_BOOT_DISABLE_RAG = False
+_BOOT_SAFE_MINIMAL = False
 
 torch = None
 if _BOOT_STABILITY_MODE_LEVEL < 2 and not _BOOT_SAFE_MINIMAL:
@@ -1547,7 +1547,6 @@ except Exception:
     pass
 
 FORCED_REASONING_MODEL = "qwen2.5-coder:7b"
-FORCED_VISION_MODEL = "qwen2.5vl:7b"
 HYBRID_MODE = bool(CONFIG.get("runtime", {}).get("hybrid_mode", False))
 
 
@@ -1619,14 +1618,16 @@ def _run_tool_action_isolated(action: Dict[str, object], timeout_sec: int = 55) 
             "error": str(exc),
         }
 
+    from aiassistant.infra.config.app_config import ROOT_DIR
     command = [
         sys.executable,
         "-m",
-        "aiassistant.tools.tool_action_runner",
+        "aiassistant.tools.tools_os",
     ]
 
     try:
         child_env = os.environ.copy()
+        child_env["PYTHONPATH"] = str(ROOT_DIR)
         completed = subprocess.run(
             command,
             input=payload,
@@ -1634,7 +1635,8 @@ def _run_tool_action_isolated(action: Dict[str, object], timeout_sec: int = 55) 
             text=True,
             timeout=max(5, int(timeout_sec)),
             check=False,
-            env=child_env
+            env=child_env,
+            cwd=str(ROOT_DIR)
         )
     except subprocess.TimeoutExpired:
         return {
@@ -1778,7 +1780,6 @@ class LocalContext:
 @dataclass
 class AgentConfig:
     reasoning_model: str = FORCED_REASONING_MODEL
-    vision_model: str = FORCED_VISION_MODEL
     ollama_host: str = "http://127.0.0.1:11434"
     max_history_turns: int = 3
     temperature: float = 0.2
@@ -1806,12 +1807,10 @@ class OfflineAgentCore:
         self.config = config or AgentConfig()
 
         self.config.reasoning_model = FORCED_REASONING_MODEL
-        self.config.vision_model = FORCED_VISION_MODEL
 
         self.session_id = self.db.create_session(label="offline_desktop_assistant")
         self.stop_event = threading.Event()
-        self.screen_capture_enabled = False
-        self.rag_enabled = bool(self.config.rag_enabled) and not (_BOOT_DISABLE_RAG or _BOOT_SAFE_MINIMAL)
+        self.rag_enabled = bool(self.config.rag_enabled)
         self.system_prompt_behavior = "default"
         self.system_prompt_custom = ""
         self.online_mode = self._normalize_online_mode(self.config.online_mode)
@@ -1826,7 +1825,6 @@ class OfflineAgentCore:
         self.last_llm_latency_ms: Optional[float] = None
         self.last_tool_synthesis_latency_ms: Optional[float] = None
         self.last_external_latency_ms: Optional[float] = None
-        self.last_vision_latency_ms: Optional[float] = None
         self.last_rag_latency_ms: Optional[float] = None
 
         # Bind intent manager for classification
@@ -1865,9 +1863,6 @@ class OfflineAgentCore:
                 self.fast_orchestrator = None
                 self.fast_workers = {}
 
-    def set_screen_capture_enabled(self, enabled: bool) -> None:
-        pass
-
     def set_rag_enabled(self, enabled: bool) -> None:
         if _BOOT_DISABLE_RAG or _BOOT_SAFE_MINIMAL:
             self.rag_enabled = False
@@ -1888,10 +1883,6 @@ class OfflineAgentCore:
     def set_reasoning_model(self, model_name: str) -> None:
         _ = model_name
         self.config.reasoning_model = FORCED_REASONING_MODEL
-
-    def set_vision_model(self, model_name: str) -> None:
-        _ = model_name
-        self.config.vision_model = FORCED_VISION_MODEL
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -1923,7 +1914,6 @@ class OfflineAgentCore:
             "llm_ms": self.last_llm_latency_ms,
             "tool_synthesis_ms": self.last_tool_synthesis_latency_ms,
             "external_ms": self.last_external_latency_ms,
-            "vision_ms": self.last_vision_latency_ms,
             "rag_ms": self.last_rag_latency_ms,
         }
 
@@ -1934,16 +1924,13 @@ class OfflineAgentCore:
 
             if self.stop_event.is_set():
                 return "Processing is currently stopped. Press Resume to continue."
-
             self._capture_preference_from_text(text)
             self.db.log_interaction(self.session_id, role="user", message=text, category="chat")
-
-            # FIX: Check the specialized intent classification instead of a hardcoded keyword array
             intent = "general"
+            
             if hasattr(self, 'manager') and self.manager:
                 intent = self.manager.classify(text, None)
 
-            # Only use the fast orchestrator stream path for generic conversational chatter ("general")
             if self.fast_orchestrator and intent == "general" and not self.stop_event.is_set():
                 try:
                     result_container = {"result": None, "error": None}
@@ -1965,20 +1952,51 @@ class OfflineAgentCore:
                         return cleaned
                 except Exception as exc:
                     print(f"[FAST] Fallback triggered via exception: {exc}")
-
-            # Standard specialized multi-agent tool execution pipeline continues below...
             recent_history = self.db.get_recent_turns(self.session_id, turn_limit=self.config.max_history_turns)
             
             rag_context = ""
             if self.rag_enabled and not self.stop_event.is_set():
                 rag_context = self._retrieve_rag_context(text)
+                
+            if self.stop_event.is_set():
+                return ""
+            crew_context = ""
+            
+            if self.crew_enabled:
+                crew_summary, crew_replace = self._get_crew_context(text, rag_context)
+                if crew_replace:
+                    cleaned_replace = self.clean_output_for_ui(crew_replace) or crew_replace
+                    self.db.log_interaction(self.session_id, role="assistant", message=cleaned_replace, category="chat")
+                    return cleaned_replace
+                crew_context = crew_summary
+
+            base_reply = self._reason_over_input(
+                user_text=text,
+                recent_history=recent_history,
+                rag_context=rag_context,
+                crew_context=crew_context
+            )
+
+            if self.stop_event.is_set():
+                return ""
+
+            actions, clean_reply = self._extract_tool_actions(base_reply)
+
+            if actions:
+                tool_results = self._execute_tool_actions(actions)
+                final_reply = self._synthesize_after_tools(text, clean_reply, tool_results)
+            else:
+                final_reply = clean_reply
+            cleaned_final = self.clean_output_for_ui(final_reply) or final_reply
+            self.db.log_interaction(self.session_id, role="assistant", message=cleaned_final, category="chat")
+            
+            return cleaned_final
 
 
     def _reason_over_input(
         self,
         user_text: str,
         recent_history: List[Dict[str, str]],
-        screen_context: str,
         rag_context: str,
         crew_context: str,
     ) -> str:
@@ -2181,27 +2199,37 @@ class OfflineAgentCore:
         return clean
 
     def _retrieve_rag_context(self, user_text: str) -> str:
-        if get_rag_context is None:
+        if os.environ.get("MARIE_DISABLE_RAG") == "1":
+            return ""
+        try:
+            from aiassistant.infra.rag_memory import get_rag_context
+        except Exception as e:
+            print(f"[RAG Warning] System bypassed. Failed to load embedding layer: {e}", flush=True)
             return ""
 
+        if get_rag_context is None:
+            return ""
         self.last_rag_latency_ms = None
         try:
             t_start = time.time()
             snippets = get_rag_context(user_text, top_k=self.config.rag_top_k) or ""
             self.last_rag_latency_ms = (time.time() - t_start) * 1000
+            
             snippets = snippets.strip()
             if not snippets:
                 return ""
-
             snippets = snippets[:1800]
-            self.db.log_interaction(
-                self.session_id,
-                role="system",
-                message=snippets,
-                category="rag",
-            )
+            if self.db:
+                self.db.log_interaction(
+                    self.session_id,
+                    role="system",
+                    message=snippets,
+                    category="rag",
+                )
             return snippets
-        except Exception:
+
+        except Exception as e:
+            print(f"[RAG Error] Runtime failure during search: {e}", flush=True)
             return ""
 
     def _execute_tool_actions(self, actions: List[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -2398,10 +2426,13 @@ class OfflineAgentCore:
             value = match.group(1).strip(" .,!?:;")
             if value:
                 self.local_context.set_preference("always_use", value)
-
+                
+ 
+              
     @staticmethod
     def _release_vram() -> None:
-        """Release VRAM by unloading models and clearing caches."""
+        """Release VRAM gracefully without stalling the synchronous generation critical path."""
+        global _LAST_VRAM_CLEANUP_TIME
         try:
             from aiassistant.infra.optimization import get_memory_manager
             get_memory_manager().cleanup()
@@ -2411,11 +2442,23 @@ class OfflineAgentCore:
         gc.collect()
         if torch is None:
             return
+            
         try:
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                if hasattr(torch.cuda, "ipc_collect"):
-                    torch.cuda.ipc_collect()
+                current_time = time.time()
+                if (current_time - _LAST_VRAM_CLEANUP_TIME) >_VRAM_CLEANUP_DEBOUNCE_SEC:
+                    
+                    def _async_flush():
+                        try:
+                            torch.cuda.empty_cache()
+                            if hasattr(torch.cuda, "ipc_collect"):
+                                torch.cuda.ipc_collect()
+                        except Exception:
+                            pass
+                    
+                    # Spin off the allocation barrier so it doesn't block the active thread response
+                    threading.Thread(target=_async_flush, daemon=True).start()
+                    _LAST_VRAM_CLEANUP_TIME = current_time
         except Exception:
             pass
 

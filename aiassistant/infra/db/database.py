@@ -435,41 +435,23 @@ class MarieDB:
 
     def build_memory_context(self, user_id, session_id=None):
         """Combines RAD memory + prior conversation turns for continuity."""
-        mem_cfg = CONFIG.get("memory", {})
-        rad_limit = int(mem_cfg.get("rad_limit", 220))
-        turn_limit = int(mem_cfg.get("recent_turn_limit", 10))
-        max_context_chars = int(mem_cfg.get("max_context_chars", 9000))
+        rad_limit = int(CONFIG.get("memory", {}).get("rad_limit", 220))
+        turn_limit = int(CONFIG.get("memory", {}).get("recent_turn_limit", 10))
+        max_context_chars = int(CONFIG.get("memory", {}).get("max_context_chars", 9000))
+        rad_rows = self.get_rad_data(user_id, limit=rad_limit)
+        rad_context = "\n".join([f"{r['key_data']}: {r['value_data']}" for r in reversed(rad_rows)])
 
-        rad_context = self.get_all_rad_data(limit=rad_limit)
-        ltm_context = self.get_long_term_memory(user_id, limit=80)
-        turn_context = self.get_recent_turn_context(user_id, session_id=session_id, limit=turn_limit)
+        turn_rows = self.get_recent_turns(session_id, turn_limit=turn_limit)
+        turn_context = "\n".join([f"{t['role'].title()}: {t['message']}" for t in turn_rows])
 
         chunks = []
-        if rad_context:
-            chunks.append("Known memory:\n" + rad_context)
-        if ltm_context:
-            chunks.append("Long-term memory:\n" + ltm_context)
-        if turn_context:
-            chunks.append("Recent conversation:\n" + turn_context)
+        if rad_context: chunks.append("Known memory:\n" + rad_context)
+        if turn_context: chunks.append("Recent conversation:\n" + turn_context)
 
         context = "\n\n".join(chunks)
         if len(context) <= max_context_chars:
             return context
-
-        # Keep newest lines so long-running sessions do not overflow model context.
-        lines = [line for line in context.splitlines() if line.strip()]
-        kept = []
-        used = 0
-        for line in reversed(lines):
-            line_size = len(line) + 1
-            if used + line_size > max_context_chars:
-                break
-            kept.append(line)
-            used += line_size
-
-        kept.reverse()
-        trimmed = "\n".join(kept)
-        return "[Context trimmed automatically to fit memory window]\n" + trimmed
+        return context[-max_context_chars:]
     
     # --- DELETE METHODS ---
     def delete_chat_log(self, log_id):

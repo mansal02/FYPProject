@@ -14,7 +14,6 @@ from aiassistant.backend.streaming_utils import drain_complete_sentences
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.db.database import MarieDB
 from aiassistant.infra.rag_memory import get_rag_context
-from aiassistant.infra.vision.screen_vision import describe_screen_snapshot
 
 # Mid-tier optimization: Apply quantization settings
 try:
@@ -343,20 +342,6 @@ def _resolve_request_context(payload):
     action_result = payload.get("action_result", "")
     if action_result:
         rag_context = f"{rag_context}\n\nLatest action/tool output:\n{action_result}".strip()
-
-    screen_context = payload.get("screen_context", "")
-    if not screen_context:
-        _toggle_voice_rvc(False)
-        try:
-            screen_context = describe_screen_snapshot(
-                image_path=payload.get("screen_image_path", ""),
-                user_text=user_text,
-                window_title=payload.get("screen_window_title", ""),
-            )
-        finally:
-            _toggle_voice_rvc(True)
-    if screen_context:
-        rag_context = f"{rag_context}\n\nLive screen context:\n{screen_context}".strip()
 
     return user_text, rag_context
 

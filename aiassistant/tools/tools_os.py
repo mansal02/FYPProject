@@ -1,25 +1,25 @@
-"""
-Crash-safe OS tools for local autonomous actions.
+"""Crash-safe OS tools and execution subprocess runner loop for local autonomous actions.
 
 Every public function returns a dict with at least:
 - success: bool
 - message: user-friendly status
 - data or error: details for the agent
-
-This contract prevents tool failures from crashing the main loop.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import difflib
 import fnmatch
+import json
 import mimetypes
 import os
 import re
 import shutil
 import smtplib
 import subprocess
+import sys
 import time
 import webbrowser
 from email.message import EmailMessage
@@ -32,7 +32,6 @@ from aiassistant.infra.db.database import MarieDB
 
 try:
     import pyautogui
-
     pyautogui.FAILSAFE = True
 except Exception:  # pragma: no cover - optional dependency
     pyautogui = None
@@ -75,7 +74,6 @@ def _get_sentence_transformer_class():
 
     try:
         from sentence_transformers import SentenceTransformer as _SentenceTransformer
-
         _SENTENCE_TRANSFORMER_CLASS = _SentenceTransformer
         return _SENTENCE_TRANSFORMER_CLASS
     except BaseException:  # pragma: no cover - optional dependency and defensive import guard
@@ -111,7 +109,6 @@ try:
     from AppOpener import close as appopener_close
     from AppOpener import give_appnames as appopener_list
     from AppOpener import open as appopener_open
-
     APPOPENER_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
     appopener_open = None
@@ -198,110 +195,37 @@ def _list_drive_roots() -> List[Path]:
 
 
 TEXT_SEARCH_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".py",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".ini",
-    ".cfg",
-    ".csv",
-    ".log",
-    ".xml",
-    ".html",
-    ".htm",
-    ".js",
-    ".jsx",
-    ".ts",
-    ".tsx",
-    ".java",
-    ".cs",
-    ".cpp",
-    ".c",
-    ".h",
-    ".hpp",
-    ".ps1",
-    ".bat",
-    ".cmd",
-    ".sql",
-    ".toml",
-    ".rtf",
+    ".txt", ".md", ".py", ".json", ".yaml", ".yml", ".ini", ".cfg", ".csv", ".log",
+    ".xml", ".html", ".htm", ".js", ".jsx", ".ts", ".tsx", ".java", ".cs", ".cpp",
+    ".c", ".h", ".hpp", ".ps1", ".bat", ".cmd", ".sql", ".toml", ".rtf",
 }
 
 
 WINDOWS_APP_ALIASES = {
-    "vscode": "code",
-    "vs code": "code",
-    "visual studio code": "code",
-    "visual studio": "devenv",
-    "excel": "excel",
-    "word": "winword",
-    "powerpoint": "powerpnt",
-    "outlook": "outlook",
-    "notepad": "notepad",
+    "vscode": "code", "vs code": "code", "visual studio code": "code", "visual studio": "devenv",
+    "excel": "excel", "word": "winword", "powerpoint": "powerpnt", "outlook": "outlook",
+    "notepad": "notepad", "calculator": "calc", "cmd": "cmd", "music": "ytmusic", "yt": "youtube",
 }
 
-WINDOWS_WEB_APP_ALIASES = {
-    "youtube": "https://www.youtube.com",
-    "yt": "https://www.youtube.com",
-    "youtube music": "https://music.youtube.com",
-    "youtube studio": "https://studio.youtube.com",
+WEB_APP_ALIASES = {
+    "youtube": "https://www.youtube.com", "yt": "https://www.youtube.com",
+    "youtube music": "https://music.youtube.com", "youtube studio": "https://studio.youtube.com",
+    "google": "https://www.google.com", "github": "https://github.com",
+    "gmail": "https://mail.google.com", "whatsapp": "https://web.whatsapp.com",
+    "telegram": "https://web.telegram.org",
 }
-
 
 SMART_SEARCH_STOP_WORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "can",
-    "did",
-    "do",
-    "for",
-    "from",
-    "get",
-    "have",
-    "i",
-    "in",
-    "is",
-    "it",
-    "last",
-    "me",
-    "my",
-    "of",
-    "on",
-    "open",
-    "please",
-    "recent",
-    "search",
-    "that",
-    "the",
-    "this",
-    "to",
-    "want",
-    "with",
+    "a", "an", "and", "are", "can", "did", "do", "for", "from", "get", "have", "i", "in", "is",
+    "it", "last", "me", "my", "of", "on", "open", "please", "recent", "search", "that", "the",
+    "this", "to", "want", "with",
 }
 
 
 SMART_SEARCH_SKIP_DIR_NAMES = {
-    "$recycle.bin",
-    "system volume information",
-    ".git",
-    ".venv",
-    "node_modules",
-    "__pycache__",
-    "models",
-    "piper",
-    "rvc_models",
-    "checkpoints",
-    "chroma",
-    "cache",
-    "pkgconfig",
-    "appdata",
-    "program files",
-    "program files (x86)",
-    "windows"
+    "$recycle.bin", "system volume information", ".git", ".venv", "node_modules",
+    "__pycache__", "models", "piper", "rvc_models", "checkpoints", "chroma", "cache",
+    "pkgconfig", "appdata", "program files", "program files (x86)", "windows"
 }
 
 
@@ -319,7 +243,6 @@ def default_search_roots() -> List[Path]:
             except Exception:
                 continue
 
-    # Only add broad user folders when the current working directory is home itself.
     try:
         if cwd.resolve() == Path.home().resolve():
             roots.extend([Path.home() / "Desktop", Path.home() / "Documents", Path.home() / "Downloads"])
@@ -345,10 +268,7 @@ class ConnectivityModule:
             return _fail("Online query text was empty.", "empty_online_query")
 
         if DDGS is None:
-            return _fail(
-                "duckduckgo-search is unavailable.",
-                "missing_dependency: duckduckgo-search",
-            )
+            return _fail("duckduckgo-search is unavailable.", "missing_dependency: duckduckgo-search")
 
         try:
             with DDGS() as ddgs:
@@ -372,12 +292,7 @@ class ConnectivityModule:
 
 
 class UnifiedTaskBridge:
-    """
-    Unified bridge for UI automation, semantic file search, and system commands.
-
-    - UI actions use pyautogui.
-    - System actions use subprocess.
-    """
+    """Unified bridge for UI automation, semantic file search, and system commands."""
 
     def __init__(self) -> None:
         self.connectivity = ConnectivityModule()
@@ -391,17 +306,7 @@ class UnifiedTaskBridge:
             return False
         if len(clean.split()) >= 3:
             return True
-        vague_tokens = {
-            "something",
-            "document",
-            "notes",
-            "file",
-            "thing",
-            "report",
-            "project",
-            "old",
-            "latest",
-        }
+        vague_tokens = {"something", "document", "notes", "file", "thing", "report", "project", "old", "latest"}
         return any(token in clean for token in vague_tokens)
 
     def _load_semantic_model(self):
@@ -411,7 +316,6 @@ class UnifiedTaskBridge:
         if sentence_transformer_cls is None:
             return None
         if self._semantic_model is None:
-            # CPU pin avoids stealing VRAM from Ollama on low-end GPUs.
             try:
                 self._semantic_model = sentence_transformer_cls("all-MiniLM-L6-v2", device="cpu")
             except Exception:
@@ -422,15 +326,8 @@ class UnifiedTaskBridge:
     def _iter_candidate_files(search_roots: List[Path], max_files: int = 1400) -> List[Path]:
         files: List[Path] = []
         priority_dirs = {
-            "aiassistant": 0,
-            "knowledge": 1,
-            "script": 2,
-            "launchers": 3,
-            "frontend": 4,
-            "backend": 5,
-            "core": 6,
-            "tools": 7,
-            "infra": 8,
+            "aiassistant": 0, "knowledge": 1, "script": 2, "launchers": 3,
+            "frontend": 4, "backend": 5, "core": 6, "tools": 7, "infra": 8,
         }
 
         for root in search_roots:
@@ -449,7 +346,6 @@ class UnifiedTaskBridge:
                             return files
                         if not path.is_file():
                             continue
-                        # Skip very large files for responsive matching.
                         try:
                             if path.stat().st_size > 20 * 1024 * 1024:
                                 continue
@@ -505,26 +401,15 @@ class UnifiedTaskBridge:
         elif hint_norm in full_norm:
             exact_bonus = 0.30
 
-        weighted = max(
-            (ratio_name * 0.55) + (ratio_stem * 0.25) + (ratio_full * 0.20),
-            token_score,
-        )
+        weighted = max((ratio_name * 0.55) + (ratio_stem * 0.25) + (ratio_full * 0.20), token_score)
         return min(1.0, weighted + exact_bonus)
 
     @classmethod
-    def _content_grep_score(
-        cls,
-        path: Path,
-        hint_tokens: List[str],
-        hint: str,
-        max_file_size_bytes: int = 3 * 1024 * 1024,
-    ) -> tuple[float, str]:
+    def _content_grep_score(cls, path: Path, hint_tokens: List[str], hint: str, max_file_size_bytes: int = 3 * 1024 * 1024) -> tuple[float, str]:
         if not hint_tokens:
             return 0.0, ""
-
         if path.suffix.lower() not in TEXT_SEARCH_EXTENSIONS:
             return 0.0, ""
-
         try:
             if path.stat().st_size > max_file_size_bytes:
                 return 0.0, ""
@@ -563,23 +448,38 @@ class UnifiedTaskBridge:
             if score > best_score:
                 best_score = score
                 best_line = line[:220]
-
                 if score >= 0.95:
                     break
 
         return best_score, best_line
 
-    def smart_heuristic_search_files(
-        self,
-        hint: str,
-        roots: Optional[List[str]] = None,
-        max_results: int = 20,
-        include_content: bool = True,
-        max_scan_files: int = 4200,
-    ) -> Dict[str, Any]:
+    def smart_heuristic_search_files(self, hint: str, roots: Optional[List[str]] = None, max_results: int = 20, include_content: bool = True, max_scan_files: int = 4200) -> Dict[str, Any]:
         clean_hint = str(hint or "").strip()
         if not clean_hint:
             return _fail("Search hint was empty.", "empty_search_hint")
+        
+        cap_results = max(1, int(max_results))
+        
+        try:
+            from aiassistant.infra.db.database import MarieDB
+            db = MarieDB()
+            if hasattr(db, "search_searchable_mirror"):
+                # Query index database records directly
+                mirror_results = db.search_searchable_mirror(clean_hint, limit=cap_results)
+                if mirror_results:
+                    valid_paths = []
+                    for entry in mirror_results:
+                        file_path_str = entry.get("file_path")
+                        if file_path_str and os.path.exists(file_path_str):
+                            valid_paths.append(str(Path(file_path_str).resolve()))
+                    
+                    if valid_paths:
+                        return _ok(
+                            f"Fast index mirror search located {len(valid_paths)} match(es).", 
+                            data=valid_paths[:cap_results]
+                        )
+        except Exception as db_err:
+            print(f"[Warning] Fast searchable mirror index lookup bypassed: {db_err}")
 
         search_roots = self._resolve_search_roots(roots=roots, include_all_drives=False)
         if not search_roots:
@@ -590,7 +490,6 @@ class UnifiedTaskBridge:
             return _ok("No files available for smart heuristic search.", data=[])
 
         hint_tokens = self._tokenize_search_hint(clean_hint)
-        cap_results = max(1, int(max_results))
 
         path_ranked: List[Dict[str, Any]] = []
         for file_path in files:
@@ -620,44 +519,35 @@ class UnifiedTaskBridge:
 
         if include_content and hint_tokens:
             for item in shortlist:
-                score, line = self._content_grep_score(
-                    path=item["path"],
-                    hint_tokens=hint_tokens,
-                    hint=clean_hint,
-                )
-                item["content_score"] = score
-                item["content_line"] = line
+                try:
+                    score, line = self._content_grep_score(path=item["path"], hint_tokens=hint_tokens, hint=clean_hint)
+                    item["content_score"] = score
+                    item["content_line"] = line
+                except Exception:
+                    continue
 
         scored: List[Dict[str, Any]] = []
         for item in shortlist:
             combined = (float(item["path_score"]) * 0.72) + (float(item["content_score"]) * 0.28)
             if combined < 0.20 and float(item["path_score"]) < 0.28:
                 continue
-
-            scored.append(
-                {
+            try:
+                scored.append({
                     "path": str(item["path"].resolve()),
                     "score": round(combined, 4),
                     "snippet": str(item["content_line"]),
-                }
-            )
+                })
+            except Exception:
+                continue
 
         if not scored:
             return self.lexical_search_files(clean_hint, roots=roots, max_results=cap_results)
 
         scored.sort(key=lambda item: float(item["score"]), reverse=True)
         result_paths = [entry["path"] for entry in scored[:cap_results]]
-        return _ok(
-            f"Smart heuristic search found {len(result_paths)} match(es).",
-            data=result_paths,
-        )
+        return _ok(f"Smart heuristic search found {len(result_paths)} match(es).", data=result_paths)
 
-    def lexical_search_files(
-        self,
-        hint: str,
-        roots: Optional[List[str]] = None,
-        max_results: int = 20,
-    ) -> Dict[str, Any]:
+    def lexical_search_files(self, hint: str, roots: Optional[List[str]] = None, max_results: int = 20) -> Dict[str, Any]:
         clean = (hint or "").strip()
         if not clean:
             return _fail("Search hint was empty.", "empty_search_hint")
@@ -684,12 +574,7 @@ class UnifiedTaskBridge:
 
         return _ok(f"Found {len(matches)} lexical file match(es).", data=matches)
 
-    def semantic_search_files(
-        self,
-        hint: str,
-        roots: Optional[List[str]] = None,
-        max_results: int = 20,
-    ) -> Dict[str, Any]:
+    def semantic_search_files(self, hint: str, roots: Optional[List[str]] = None, max_results: int = 20) -> Dict[str, Any]:
         clean = (hint or "").strip()
         if not clean:
             return _fail("Search hint was empty.", "empty_search_hint")
@@ -719,19 +604,8 @@ class UnifiedTaskBridge:
 
         return _ok(f"Found {len(results)} semantic file match(es).", data=results)
 
-    def search_files_by_hint(
-        self,
-        hint: str,
-        roots: Optional[List[str]] = None,
-        max_results: int = 20,
-    ) -> Dict[str, Any]:
-        heuristic = self.smart_heuristic_search_files(
-            hint=hint,
-            roots=roots,
-            max_results=max_results,
-            include_content=True,
-        )
-
+    def search_files_by_hint(self, hint: str, roots: Optional[List[str]] = None, max_results: int = 20) -> Dict[str, Any]:
+        heuristic = self.smart_heuristic_search_files(hint=hint, roots=roots, max_results=max_results, include_content=True)
         if isinstance(heuristic, dict) and heuristic.get("success") and heuristic.get("data"):
             return heuristic
 
@@ -742,13 +616,8 @@ class UnifiedTaskBridge:
 
         return self.lexical_search_files(hint, roots=roots, max_results=max_results)
 
-    def _resolve_search_roots(
-        self,
-        roots: Optional[List[str]] = None,
-        include_all_drives: bool = False,
-    ) -> List[Path]:
+    def _resolve_search_roots(self, roots: Optional[List[str]] = None, include_all_drives: bool = False) -> List[Path]:
         candidates: List[Path] = []
-
         if roots:
             for root in roots:
                 clean = str(root or "").strip()
@@ -774,7 +643,6 @@ class UnifiedTaskBridge:
             if resolved.exists() and resolved not in seen:
                 unique_existing.append(resolved)
                 seen.add(resolved)
-
         return unique_existing
 
     def list_system_roots(self) -> Dict[str, Any]:
@@ -785,9 +653,7 @@ class UnifiedTaskBridge:
 
     @staticmethod
     def _mirror_requested(action: Dict[str, Any]) -> bool:
-        return _to_bool(action.get("use_mirror", False), default=False) or bool(
-            str(action.get("mirror_query") or "").strip()
-        )
+        return _to_bool(action.get("use_mirror", False), default=False) or bool(str(action.get("mirror_query") or "").strip())
 
     @staticmethod
     def _mirror_query_from_action(action: Dict[str, Any], fallback: str) -> str:
@@ -800,16 +666,13 @@ class UnifiedTaskBridge:
         clean = str(query or "").strip()
         if not clean:
             return None
-
         try:
             db = MarieDB()
             results = db.search_searchable_mirror(clean, limit=max(1, int(limit)))
         except Exception:
             return None
-
         if not results:
             return None
-
         return {"query": clean, "matches": results}
 
     @staticmethod
@@ -823,7 +686,6 @@ class UnifiedTaskBridge:
         clean = str(query or "").strip()
         if not clean:
             return _fail("Mirror search query was empty.", "empty_query")
-
         try:
             db = MarieDB()
             results = db.search_searchable_mirror(clean, limit=int(limit) or 8)
@@ -831,16 +693,7 @@ class UnifiedTaskBridge:
         except Exception as exc:
             return _fail("Mirror search failed.", str(exc))
 
-    def list_directory(
-        self,
-        path: str,
-        recursive: bool = False,
-        max_depth: int = 2,
-        max_results: int = 300,
-        pattern: str = "",
-        include_files: bool = True,
-        include_dirs: bool = True,
-    ) -> Dict[str, Any]:
+    def list_directory(self, path: str, recursive: bool = False, max_depth: int = 2, max_results: int = 300, pattern: str = "", include_files: bool = True, include_dirs: bool = True) -> Dict[str, Any]:
         clean_path = str(path or "").strip()
         if not clean_path:
             return _fail("Directory path was empty.", "empty_path")
@@ -872,16 +725,12 @@ class UnifiedTaskBridge:
                     if not _name_match(child.name):
                         continue
 
-                    entry: Dict[str, Any] = {
-                        "path": str(child.resolve()),
-                        "type": "directory" if child.is_dir() else "file",
-                    }
+                    entry: Dict[str, Any] = {"path": str(child.resolve()), "type": "directory" if child.is_dir() else "file"}
                     if child.is_file():
                         try:
                             entry["size_bytes"] = child.stat().st_size
                         except Exception:
                             pass
-
                     items.append(entry)
                     if len(items) >= max_items:
                         truncated = True
@@ -898,12 +747,7 @@ class UnifiedTaskBridge:
                         for dirname in sorted(dirs):
                             if not _name_match(dirname):
                                 continue
-                            items.append(
-                                {
-                                    "path": str((current / dirname).resolve()),
-                                    "type": "directory",
-                                }
-                            )
+                            items.append({"path": str((current / dirname).resolve()), "type": "directory"})
                             if len(items) >= max_items:
                                 truncated = True
                                 break
@@ -915,10 +759,7 @@ class UnifiedTaskBridge:
                             if not _name_match(filename):
                                 continue
                             file_path = current / filename
-                            entry = {
-                                "path": str(file_path.resolve()),
-                                "type": "file",
-                            }
+                            entry = {"path": str(file_path.resolve()), "type": "file"}
                             try:
                                 entry["size_bytes"] = file_path.stat().st_size
                             except Exception:
@@ -930,31 +771,11 @@ class UnifiedTaskBridge:
                         if truncated:
                             break
 
-            return _ok(
-                f"Listed {len(items)} item(s) from {target}.",
-                data={
-                    "path": str(target),
-                    "items": items,
-                    "truncated": truncated,
-                    "recursive": bool(recursive),
-                },
-            )
+            return _ok(f"Listed {len(items)} item(s) from {target}.", data={"path": str(target), "items": items, "truncated": truncated, "recursive": bool(recursive)})
         except Exception as exc:
             return _fail("Directory listing failed.", str(exc))
 
-    def deep_search_paths(
-        self,
-        query: str,
-        roots: Optional[List[str]] = None,
-        max_results: int = 40,
-        include_all_drives: bool = False,
-        include_content: bool = False,
-        case_sensitive: bool = False,
-        use_regex: bool = False,
-        file_extensions: Optional[List[str]] = None,
-        max_scan_entries: int = 120000,
-        max_file_size_mb: int = 5,
-    ) -> Dict[str, Any]:
+    def deep_search_paths(self, query: str, roots: Optional[List[str]] = None, max_results: int = 40, include_all_drives: bool = False, include_content: bool = False, case_sensitive: bool = False, use_regex: bool = False, file_extensions: Optional[List[str]] = None, max_scan_entries: int = 120000, max_file_size_mb: int = 5) -> Dict[str, Any]:
         clean_query = str(query or "").strip()
         if not clean_query:
             return _fail("Deep search query was empty.", "empty_query")
@@ -996,7 +817,6 @@ class UnifiedTaskBridge:
         def _snippet(text: str) -> str:
             if not text:
                 return ""
-
             if regex is not None:
                 match = regex.search(text)
                 if not match:
@@ -1017,14 +837,7 @@ class UnifiedTaskBridge:
         truncated = False
         results: List[Dict[str, Any]] = []
 
-        skip_dir_names = {
-            "$recycle.bin",
-            "system volume information",
-            ".git",
-            ".venv",
-            "node_modules",
-            "__pycache__",
-        }
+        skip_dir_names = {"$recycle.bin", "system volume information", ".git", ".venv", "node_modules", "__pycache__"}
 
         for root in search_roots:
             if len(results) >= max_hits or scanned_entries >= max_scanned:
@@ -1035,14 +848,12 @@ class UnifiedTaskBridge:
                 if len(results) >= max_hits or scanned_entries >= max_scanned:
                     truncated = True
                     break
-
                 current_path = Path(current_root)
 
                 kept_dirs = []
                 for dirname in dirs:
                     if dirname.lower() in skip_dir_names:
                         continue
-
                     scanned_entries += 1
                     if scanned_entries > max_scanned:
                         truncated = True
@@ -1051,13 +862,7 @@ class UnifiedTaskBridge:
                     dir_path = current_path / dirname
                     kept_dirs.append(dirname)
                     if _matches(str(dir_path)):
-                        results.append(
-                            {
-                                "path": str(dir_path.resolve()),
-                                "type": "directory",
-                                "match": "name",
-                            }
-                        )
+                        results.append({"path": str(dir_path.resolve()), "type": "directory", "match": "name"})
                         if len(results) >= max_hits:
                             truncated = True
                             break
@@ -1074,13 +879,7 @@ class UnifiedTaskBridge:
 
                     file_path = current_path / filename
                     if _matches(str(file_path)):
-                        results.append(
-                            {
-                                "path": str(file_path.resolve()),
-                                "type": "file",
-                                "match": "name",
-                            }
-                        )
+                        results.append({"path": str(file_path.resolve()), "type": "file", "match": "name"})
                         if len(results) >= max_hits:
                             truncated = True
                             break
@@ -1106,11 +905,7 @@ class UnifiedTaskBridge:
                         continue
 
                     if _matches(file_text):
-                        entry: Dict[str, Any] = {
-                            "path": str(file_path.resolve()),
-                            "type": "file",
-                            "match": "content",
-                        }
+                        entry: Dict[str, Any] = {"path": str(file_path.resolve()), "type": "file", "match": "content"}
                         context = _snippet(file_text)
                         if context:
                             entry["snippet"] = context
@@ -1122,16 +917,7 @@ class UnifiedTaskBridge:
                 if truncated and (len(results) >= max_hits or scanned_entries >= max_scanned):
                     break
 
-        return _ok(
-            f"Deep search found {len(results)} match(es).",
-            data={
-                "query": clean_query,
-                "results": results,
-                "scanned_entries": scanned_entries,
-                "truncated": truncated,
-                "roots": [str(root) for root in search_roots],
-            },
-        )
+        return _ok(f"Deep search found {len(results)} match(es).", data={"query": clean_query, "results": results, "scanned_entries": scanned_entries, "truncated": truncated, "roots": [str(root) for root in search_roots]})
 
     def analyze_path(self, path: str, max_items: int = 3500) -> Dict[str, Any]:
         clean_path = str(path or "").strip()
@@ -1145,16 +931,7 @@ class UnifiedTaskBridge:
 
             if target.is_file():
                 stat = target.stat()
-                return _ok(
-                    f"Analyzed file: {target.name}",
-                    data={
-                        "path": str(target),
-                        "type": "file",
-                        "size_bytes": stat.st_size,
-                        "suffix": target.suffix.lower(),
-                        "modified_epoch": stat.st_mtime,
-                    },
-                )
+                return _ok(f"Analyzed file: {target.name}", data={"path": str(target), "type": "file", "size_bytes": stat.st_size, "suffix": target.suffix.lower(), "modified_epoch": stat.st_mtime})
 
             cap = max(200, int(max_items))
             scanned_files = 0
@@ -1167,7 +944,6 @@ class UnifiedTaskBridge:
 
             for current_root, dirs, files in os.walk(target, topdown=True, onerror=lambda _e: None):
                 total_dirs += len(dirs)
-
                 for filename in files:
                     scanned_files += 1
                     if scanned_files > cap:
@@ -1188,44 +964,18 @@ class UnifiedTaskBridge:
                     largest_files.sort(key=lambda item: int(item["size_bytes"]), reverse=True)
                     if len(largest_files) > 8:
                         largest_files = largest_files[:8]
-
                 if truncated:
                     break
 
-            top_extensions = sorted(
-                extension_counts.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )[:12]
-
-            return _ok(
-                f"Analyzed directory: {target}",
-                data={
-                    "path": str(target),
-                    "type": "directory",
-                    "total_files": scanned_files if not truncated else cap,
-                    "total_dirs": total_dirs,
-                    "total_size_bytes": total_size,
-                    "top_extensions": top_extensions,
-                    "largest_files": largest_files,
-                    "truncated": truncated,
-                    "max_items": cap,
-                },
-            )
+            top_extensions = sorted(extension_counts.items(), key=lambda item: item[1], reverse=True)[:12]
+            return _ok(f"Analyzed directory: {target}", data={"path": str(target), "type": "directory", "total_files": scanned_files if not truncated else cap, "total_dirs": total_dirs, "total_size_bytes": total_size, "top_extensions": top_extensions, "largest_files": largest_files, "truncated": truncated, "max_items": cap})
         except Exception as exc:
             return _fail("Path analysis failed.", str(exc))
 
-    def create_path(
-        self,
-        path: str,
-        kind: str = "file",
-        content: str = "",
-        overwrite: bool = False,
-    ) -> Dict[str, Any]:
+    def create_path(self, path: str, kind: str = "file", content: str = "", overwrite: bool = False) -> Dict[str, Any]:
         clean_path = str(path or "").strip()
         if not clean_path:
             return _fail("Create path was empty.", "empty_path")
-
         clean_kind = str(kind or "file").strip().lower()
 
         try:
@@ -1258,16 +1008,12 @@ class UnifiedTaskBridge:
             dst_path = _safe_resolve_path(clean_dst)
             if _is_protected_path(src_path) or _is_protected_path(dst_path):
                 return _fail("Path is protected by safe mode.", "protected_path")
-
             if not src_path.exists():
                 return _fail("Move source was not found.", f"missing_source: {src_path}")
 
             if dst_path.exists():
                 if not overwrite:
-                    return _fail(
-                        "Move destination already exists. Use overwrite=true to replace it.",
-                        f"existing_destination: {dst_path}",
-                    )
+                    return _fail("Move destination already exists. Use overwrite=true to replace it.", f"existing_destination: {dst_path}")
                 if dst_path.is_dir():
                     shutil.rmtree(dst_path)
                 else:
@@ -1275,10 +1021,7 @@ class UnifiedTaskBridge:
 
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src_path), str(dst_path))
-            return _ok(
-                "Move completed.",
-                data={"from": str(src_path), "to": str(dst_path)},
-            )
+            return _ok("Move completed.", data={"from": str(src_path), "to": str(dst_path)})
         except Exception as exc:
             return _fail("Move operation failed.", str(exc))
 
@@ -1293,16 +1036,12 @@ class UnifiedTaskBridge:
             dst_path = _safe_resolve_path(clean_dst)
             if _is_protected_path(src_path) or _is_protected_path(dst_path):
                 return _fail("Path is protected by safe mode.", "protected_path")
-
             if not src_path.exists():
                 return _fail("Copy source was not found.", f"missing_source: {src_path}")
 
             if dst_path.exists():
                 if not overwrite:
-                    return _fail(
-                        "Copy destination already exists. Use overwrite=true to replace it.",
-                        f"existing_destination: {dst_path}",
-                    )
+                    return _fail("Copy destination already exists. Use overwrite=true to replace it.", f"existing_destination: {dst_path}")
                 if dst_path.is_dir():
                     shutil.rmtree(dst_path)
                 else:
@@ -1313,20 +1052,11 @@ class UnifiedTaskBridge:
                 shutil.copytree(src_path, dst_path)
             else:
                 shutil.copy2(src_path, dst_path)
-
-            return _ok(
-                "Copy completed.",
-                data={"from": str(src_path), "to": str(dst_path)},
-            )
+            return _ok("Copy completed.", data={"from": str(src_path), "to": str(dst_path)})
         except Exception as exc:
             return _fail("Copy operation failed.", str(exc))
 
-    def delete_path(
-        self,
-        path: str,
-        recursive: bool = False,
-        use_trash: bool = True,
-    ) -> Dict[str, Any]:
+    def delete_path(self, path: str, recursive: bool = False, use_trash: bool = True) -> Dict[str, Any]:
         clean_path = str(path or "").strip()
         if not clean_path:
             return _fail("Delete path was empty.", "empty_path")
@@ -1344,14 +1074,10 @@ class UnifiedTaskBridge:
 
             if target.is_dir():
                 if not _to_bool(recursive, default=False):
-                    return _fail(
-                        "Target is a directory. Set recursive=true to delete it permanently.",
-                        "directory_requires_recursive",
-                    )
+                    return _fail("Target is a directory. Set recursive=true to delete it permanently.", "directory_requires_recursive")
                 shutil.rmtree(target)
             else:
                 target.unlink()
-
             return _ok("Delete completed.", data={"path": str(target)})
         except Exception as exc:
             return _fail("Delete operation failed.", str(exc))
@@ -1371,11 +1097,7 @@ class UnifiedTaskBridge:
         if APPOPENER_AVAILABLE and appopener_list is not None:
             try:
                 raw_names = appopener_list()
-                if isinstance(raw_names, dict):
-                    iterable = raw_names.keys()
-                else:
-                    iterable = raw_names
-
+                iterable = raw_names.keys() if isinstance(raw_names, dict) else raw_names
                 for item in iterable:
                     original = str(item or "").strip()
                     normalized = self._normalize_app_alias(original)
@@ -1383,7 +1105,6 @@ class UnifiedTaskBridge:
                         name_map[normalized] = original
             except Exception:
                 name_map = {}
-
         self._appopener_name_map = name_map
         return self._appopener_name_map
 
@@ -1392,42 +1113,32 @@ class UnifiedTaskBridge:
         if not normalized_query:
             return None
 
-        name_map = self._load_appopener_name_map()
-        if not name_map:
-            return None
+        if APPOPENER_AVAILABLE and appopener_list is not None:
+            try:
+                name_map = self._load_appopener_name_map()
+                if not name_map:
+                    from AppOpener import update_list
+                    update_list()
+                    self._appopener_name_map = None 
+                    name_map = self._load_appopener_name_map()
+            except Exception:
+                pass
 
+        name_map = self._load_appopener_name_map() or {}
         if normalized_query in name_map:
             return name_map[normalized_query]
 
-        alias = WINDOWS_APP_ALIASES.get(normalized_query)
-        if alias:
-            alias_key = self._normalize_app_alias(alias)
-            if alias_key in name_map:
-                return name_map[alias_key]
-
-        query_tokens = [token for token in normalized_query.split() if token]
+        query_tokens = [t for t in normalized_query.split() if t]
         if query_tokens:
-            contains_all: List[tuple[int, int, str]] = []
             for normalized_name, original_name in name_map.items():
-                token_set = set(normalized_name.split())
-                if all(token in token_set for token in query_tokens):
-                    contains_all.append((len(token_set), len(normalized_name), original_name))
-            if contains_all:
-                contains_all.sort(key=lambda item: (item[0], item[1], item[2]))
-                return contains_all[0][2]
+                if all(token in normalized_name for token in query_tokens):
+                    return original_name
 
-        close = difflib.get_close_matches(normalized_query, list(name_map.keys()), n=1, cutoff=0.82)
-        if close:
-            return name_map.get(close[0])
+        # Pure fuzzy string fallback ratio
+        close = difflib.get_close_matches(normalized_query, list(name_map.keys()), n=1, cutoff=0.6)
+        return name_map.get(close[0]) if close else None
 
-        return None
-
-    def launch_application(
-        self,
-        app_name: str,
-        args: Optional[List[str]] = None,
-        target_path: str = "",
-    ) -> Dict[str, Any]:
+    def launch_application(self, app_name: str, args: Optional[List[str]] = None, target_path: str = "") -> Dict[str, Any]:
         clean_app = str(app_name or "").strip()
         clean_target = str(target_path or "").strip()
         clean_args = [str(item).strip() for item in (args or []) if str(item).strip()]
@@ -1438,22 +1149,20 @@ class UnifiedTaskBridge:
             return _fail("Application name was empty.", "empty_app_name")
 
         normalized_app = self._normalize_app_alias(clean_app)
-
-        if os.name == "nt":
-            web_url = WINDOWS_WEB_APP_ALIASES.get(normalized_app)
-            if web_url and not clean_target:
-                try:
+        web_url = WEB_APP_ALIASES.get(normalized_app)
+        if web_url and not clean_target:
+            try:
+                if os.name == "nt":
+                    os.startfile(web_url)
+                else:
                     webbrowser.open(web_url)
-                    return _ok(
-                        f"Opened {clean_app} in browser.",
-                        data={
-                            "app": clean_app,
-                            "url": web_url,
-                        },
-                    )
-                except Exception as exc:
-                    return _fail("Launch application failed.", str(exc))
+                return _ok(f"Opened {clean_app} in browser.", data={"app": clean_app, "url": web_url})
+            except Exception as exc:
+                return _fail("Launch web application failed.", str(exc))
 
+        creation_flags = 0
+        if os.name == "nt":
+            creation_flags = 0x00000008 | 0x00000200
             if normalized_app == "discord" and not clean_target:
                 local_app_data = Path(os.environ.get("LOCALAPPDATA", "")).expanduser()
                 discord_candidates = [
@@ -1465,35 +1174,14 @@ class UnifiedTaskBridge:
                     if not candidate.exists():
                         continue
                     try:
-                        subprocess.Popen(
-                            [
-                                str(candidate),
-                                "--processStart",
-                                "Discord.exe",
-                            ]
-                            + clean_args
-                        )
-                        return _ok(
-                            "Launched application: discord",
-                            data={
-                                "app": clean_app,
-                                "executable": str(candidate),
-                                "args": clean_args,
-                            },
-                        )
+                        subprocess.Popen([str(candidate), "--processStart", "Discord.exe"] + clean_args, creationflags=creation_flags)
+                        return _ok("Launched application: discord", data={"app": clean_app, "executable": str(candidate), "args": clean_args})
                     except Exception:
                         continue
-
                 try:
                     fallback_url = "https://discord.com/app"
-                    webbrowser.open(fallback_url)
-                    return _ok(
-                        "Opened Discord web (desktop app not found).",
-                        data={
-                            "app": clean_app,
-                            "url": fallback_url,
-                        },
-                    )
+                    subprocess.Popen(f'start "" "{fallback_url}"', shell=True, creationflags=creation_flags)
+                    return _ok("Opened Discord web (desktop app not found).", data={"app": clean_app, "url": fallback_url})
                 except Exception as exc:
                     return _fail("Launch application failed.", str(exc))
 
@@ -1501,22 +1189,10 @@ class UnifiedTaskBridge:
                 resolved_app_name = self._resolve_appopener_app_name(clean_app)
                 if resolved_app_name:
                     try:
-                        appopener_open(
-                            resolved_app_name,
-                            match_closest=False,
-                            output=False,
-                            throw_error=True,
-                        )
-                        return _ok(
-                            f"Launched application: {clean_app}",
-                            data={
-                                "app": clean_app,
-                                "resolved_app": resolved_app_name,
-                                "args": clean_args,
-                                "target": clean_target,
-                                "launcher": "AppOpener",
-                            },
-                        )
+                        appopener_open(resolved_app_name, match_closest=False, output=False, throw_error=True)
+                        alias = WINDOWS_APP_ALIASES.get(self._normalize_app_alias(clean_app)) or resolved_app_name
+                        subprocess.Popen(f'start "" "{alias}"', shell=True, creationflags=creation_flags)
+                        return _ok(f"Launched application: {clean_app}")
                     except Exception:
                         pass
 
@@ -1532,21 +1208,23 @@ class UnifiedTaskBridge:
                 command = [str(app_path.resolve())] + clean_args
                 if clean_target:
                     command.append(str(_safe_resolve_path(clean_target)))
-                subprocess.Popen(command)
+                subprocess.Popen(command, creationflags=creation_flags)
             elif os.name == "nt":
                 resolved_exec = shutil.which(executable)
-                if not resolved_exec:
-                    return _fail(
-                        "Launch application failed.",
-                        (
-                            f"Unknown app '{clean_app}'. "
-                            "AppOpener could not resolve this app name and no executable was found in PATH."
-                        ),
-                    )
-                command = [resolved_exec] + clean_args
-                if clean_target:
-                    command.append(str(_safe_resolve_path(clean_target)))
-                subprocess.Popen(command)
+                if resolved_exec:
+                    command = [resolved_exec] + clean_args
+                    if clean_target:
+                        command.append(str(_safe_resolve_path(clean_target)))
+                    subprocess.Popen(command, creationflags=creation_flags)
+                else:
+                    try:
+                        if clean_target:
+                            subprocess.Popen(f'start "" "{executable}" "{clean_target}"', shell=True, creationflags=creation_flags)
+                        else:
+                            subprocess.Popen(f'start "" "{executable}"', shell=True, creationflags=creation_flags)
+                        return _ok(f"Launched application via shell breakaway: {clean_app}")
+                    except Exception:
+                        return _fail("Launch application failed.", f"Unknown app '{clean_app}'. No executable was found in PATH or registry context tables.")
             elif os.name == "posix":
                 command = [executable] + clean_args
                 if clean_target:
@@ -1558,14 +1236,7 @@ class UnifiedTaskBridge:
                     command.append(str(_safe_resolve_path(clean_target)))
                 subprocess.Popen(command)
 
-            return _ok(
-                f"Launched application: {clean_app}",
-                data={
-                    "app": clean_app,
-                    "args": clean_args,
-                    "target": clean_target,
-                },
-            )
+            return _ok(f"Launched application: {clean_app}", data={"app": clean_app, "args": clean_args, "target": clean_target})
         except Exception as exc:
             return _fail("Launch application failed.", str(exc))
 
@@ -1581,20 +1252,8 @@ class UnifiedTaskBridge:
                     resolved_app_name = self._resolve_appopener_app_name(clean_app)
                     if resolved_app_name:
                         try:
-                            appopener_close(
-                                resolved_app_name,
-                                match_closest=False,
-                                output=False,
-                                throw_error=True,
-                            )
-                            return _ok(
-                                f"Closed application: {clean_app}",
-                                data={
-                                    "app": clean_app,
-                                    "resolved_app": resolved_app_name,
-                                    "launcher": "AppOpener",
-                                },
-                            )
+                            appopener_close(resolved_app_name, match_closest=False, output=False, throw_error=True)
+                            return _ok(f"Closed application: {clean_app}", data={"app": clean_app, "resolved_app": resolved_app_name, "launcher": "AppOpener"})
                         except Exception:
                             pass
 
@@ -1613,10 +1272,7 @@ class UnifiedTaskBridge:
                 completed = subprocess.run(command, capture_output=True, text=True, check=False)
                 output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
                 if completed.returncode == 0:
-                    return _ok(
-                        f"Closed application: {clean_app}",
-                        data={"app": clean_app, "output": output[:1200]},
-                    )
+                    return _ok(f"Closed application: {clean_app}", data={"app": clean_app, "output": output[:1200]})
                 return _fail("Close application failed.", output[:1200] or f"exit_code={completed.returncode}")
 
             command = ["pkill", "-f", target]
@@ -1633,15 +1289,9 @@ class UnifiedTaskBridge:
         try:
             apps: List[str] = []
             if os.name == "nt":
-                completed = subprocess.run(
-                    ["tasklist", "/FO", "CSV", "/NH"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                completed = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, check=False)
                 if completed.returncode != 0:
                     return _fail("Could not list running applications.", (completed.stderr or "").strip())
-
                 reader = csv.reader((completed.stdout or "").splitlines())
                 for row in reader:
                     if not row:
@@ -1652,22 +1302,15 @@ class UnifiedTaskBridge:
                     if len(apps) >= cap:
                         break
             else:
-                completed = subprocess.run(
-                    ["ps", "-e", "-o", "comm="],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
+                completed = subprocess.run(["ps", "-e", "-o", "comm="], capture_output=True, text=True, check=False)
                 if completed.returncode != 0:
                     return _fail("Could not list running applications.", (completed.stderr or "").strip())
-
                 for line in (completed.stdout or "").splitlines():
                     name = line.strip()
                     if name:
                         apps.append(name)
                     if len(apps) >= cap:
                         break
-
             return _ok(f"Found {len(apps)} running application(s).", data=apps)
         except Exception as exc:
             return _fail("Listing running applications failed.", str(exc))
@@ -1691,7 +1334,6 @@ class UnifiedTaskBridge:
                 return _ok(f"Opened {clean}.", data={"url": url})
             except Exception as exc:
                 return _fail(f"Failed to open {clean}.", str(exc))
-
         return self.launch_application(clean)
 
     def read_file_text(self, file_path: str, max_chars: int = 12000) -> Dict[str, Any]:
@@ -1702,18 +1344,12 @@ class UnifiedTaskBridge:
 
             office_exts = {".doc", ".docx", ".xlsx", ".xls", ".csv", ".pdf"}
             if path.suffix.lower() in office_exts:
-                return _ok(
-                    "File content hidden by policy for office documents.",
-                    data={"path": str(path)},
-                )
+                return _ok("File content hidden by policy for office documents.", data={"path": str(path)})
 
             suffix = path.suffix.lower()
             if suffix == ".pdf":
                 if PyPDF2 is None:
-                    return _fail(
-                        "PyPDF2 is not available to read PDF files.",
-                        "missing_dependency: PyPDF2",
-                    )
+                    return _fail("PyPDF2 is not available to read PDF files.", "missing_dependency: PyPDF2")
                 try:
                     with path.open("rb") as fh:
                         reader = PyPDF2.PdfReader(fh)
@@ -1728,10 +1364,7 @@ class UnifiedTaskBridge:
                     return _fail("Could not parse PDF file.", str(exc))
             elif suffix == ".docx":
                 if docx is None:
-                    return _fail(
-                        "python-docx is not available to read DOCX files.",
-                        "missing_dependency: python-docx",
-                    )
+                    return _fail("python-docx is not available to read DOCX files.", "missing_dependency: python-docx")
                 try:
                     document = docx.Document(str(path))
                     text = "\n".join(p.text for p in document.paragraphs)
@@ -1744,20 +1377,11 @@ class UnifiedTaskBridge:
                     text = path.read_bytes().decode("utf-8", errors="ignore")
 
             text = text[:max_chars]
-            return _ok(
-                f"Read file successfully: {path.name}",
-                data={"path": str(path), "text": text},
-            )
+            return _ok(f"Read file successfully: {path.name}", data={"path": str(path), "text": text})
         except Exception as exc:
             return _fail("File read failed.", str(exc))
 
-    def open_file(
-        self,
-        file_path: str,
-        resolve_by_hint: bool = False,
-        roots: Optional[List[str]] = None,
-        include_content: bool = True,
-    ) -> Dict[str, Any]:
+    def open_file(self, file_path: str, resolve_by_hint: bool = False, roots: Optional[List[str]] = None, include_content: bool = True) -> Dict[str, Any]:
         try:
             raw_target = str(file_path or "").strip()
             if not raw_target:
@@ -1767,35 +1391,24 @@ class UnifiedTaskBridge:
             resolved_from_hint = False
 
             if not path.exists() and _to_bool(resolve_by_hint, default=False):
-                search_result = self.smart_heuristic_search_files(
-                    hint=raw_target,
-                    roots=roots,
-                    max_results=1,
-                    include_content=_to_bool(include_content, default=True),
-                )
+                search_result = self.smart_heuristic_search_files(hint=raw_target, roots=roots, max_results=1, include_content=_to_bool(include_content, default=True))
                 candidates = search_result.get("data") if isinstance(search_result, dict) else []
                 if candidates:
                     path = Path(str(candidates[0])).expanduser().resolve()
                     resolved_from_hint = True
 
             if not path.exists():
-                return _fail(
-                    "Cannot open path because it does not exist.",
-                    f"missing_file: {path}",
-                )
+                return _fail("Cannot open path because it does not exist.", f"missing_file: {path}")
 
             if os.name == "nt":
-                os.startfile(str(path))  # type: ignore[attr-defined]
+                os.startfile(str(path))
             elif os.name == "posix":
                 subprocess.Popen(["xdg-open", str(path)])
             else:
                 subprocess.Popen(["open", str(path)])
 
             if resolved_from_hint:
-                return _ok(
-                    f"Opened path: {path.name} (resolved from hint).",
-                    data=str(path),
-                )
+                return _ok(f"Opened path: {path.name} (resolved from hint).", data=str(path))
             return _ok(f"Opened path: {path.name}", data=str(path))
         except Exception as exc:
             return _fail("Failed to open path.", str(exc))
@@ -1855,22 +1468,12 @@ class UnifiedTaskBridge:
             env = os.environ.copy()
             env.setdefault("OLLAMA_FLASH_ATTENTION", "1")
             env.setdefault("OLLAMA_KV_CACHE_TYPE", "q4_0")
-            completed = subprocess.run(
-                clean,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=max(1, int(timeout)),
-                env=env,
-            )
+            completed = subprocess.run(clean, shell=True, capture_output=True, text=True, timeout=max(1, int(timeout)), env=env)
             combined = (completed.stdout or "") + ("\n" + completed.stderr if completed.stderr else "")
             compact = combined.strip()[:4000]
             if completed.returncode == 0:
                 return _ok("System command completed.", data={"output": compact})
-            return _fail(
-                "System command failed.",
-                f"exit_code={completed.returncode}; output={compact}",
-            )
+            return _fail("System command failed.", f"exit_code={completed.returncode}; output={compact}")
         except Exception as exc:
             return _fail("System command execution failed.", str(exc))
 
@@ -1884,21 +1487,12 @@ class UnifiedTaskBridge:
             return _fail("Open Interpreter CLI not found.", "missing_dependency: open-interpreter")
 
         try:
-            completed = subprocess.run(
-                [exe, "--auto-run"],
-                input=clean,
-                capture_output=True,
-                text=True,
-                timeout=max(5, int(timeout)),
-            )
+            completed = subprocess.run([exe, "--auto-run"], input=clean, capture_output=True, text=True, timeout=max(5, int(timeout)))
             combined = (completed.stdout or "") + ("\n" + completed.stderr if completed.stderr else "")
             compact = combined.strip()[:4000]
             if completed.returncode == 0:
                 return _ok("Open Interpreter completed.", data={"output": compact})
-            return _fail(
-                "Open Interpreter failed.",
-                f"exit_code={completed.returncode}; output={compact}",
-            )
+            return _fail("Open Interpreter failed.", f"exit_code={completed.returncode}; output={compact}")
         except Exception as exc:
             return _fail("Open Interpreter execution failed.", str(exc))
 
@@ -1911,11 +1505,7 @@ class UnifiedTaskBridge:
         key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
         current_is_dark = False
         try:
-            probe = subprocess.run(
-                ["reg", "query", key, "/v", "AppsUseLightTheme"],
-                capture_output=True,
-                text=True,
-            )
+            probe = subprocess.run(["reg", "query", key, "/v", "AppsUseLightTheme"], capture_output=True, text=True)
             current_is_dark = "0x0" in (probe.stdout or "")
         except Exception:
             current_is_dark = False
@@ -1924,18 +1514,8 @@ class UnifiedTaskBridge:
         value = "0" if target_is_dark else "1"
 
         try:
-            subprocess.run(
-                ["reg", "add", key, "/v", "AppsUseLightTheme", "/t", "REG_DWORD", "/d", value, "/f"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                ["reg", "add", key, "/v", "SystemUsesLightTheme", "/t", "REG_DWORD", "/d", value, "/f"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            subprocess.run(["reg", "add", key, "/v", "AppsUseLightTheme", "/t", "REG_DWORD", "/d", value, "/f"], check=False, capture_output=True, text=True)
+            subprocess.run(["reg", "add", key, "/v", "SystemUsesLightTheme", "/t", "REG_DWORD", "/d", value, "/f"], check=False, capture_output=True, text=True)
             mode = "dark" if target_is_dark else "light"
             return _ok(f"Windows theme toggled to {mode} mode.")
         except Exception as exc:
@@ -1947,28 +1527,14 @@ class UnifiedTaskBridge:
         gtk_theme = "Adwaita-dark" if target_is_dark else "Adwaita"
 
         try:
-            subprocess.run(
-                ["gsettings", "set", "org.gnome.desktop.interface", "color-scheme", color_scheme],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            subprocess.run(
-                ["gsettings", "set", "org.gnome.desktop.interface", "gtk-theme", gtk_theme],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
+            subprocess.run(["gsettings", "set", "org.gnome.desktop.interface", "color-scheme", color_scheme], check=False, capture_output=True, text=True)
+            subprocess.run(["gsettings", "set", "org.gnome.desktop.interface", "gtk-theme", gtk_theme], check=False, capture_output=True, text=True)
             mode = "dark" if target_is_dark else "light"
             return _ok(f"Linux theme toggled to {mode} mode.")
         except Exception as exc:
             return _fail("Failed to toggle Linux dark mode.", str(exc))
 
-    def _resolve_attachment_paths(
-        self,
-        attachments: Optional[List[str]],
-        roots: Optional[List[str]] = None,
-    ) -> tuple[List[str], List[str]]:
+    def _resolve_attachment_paths(self, attachments: Optional[List[str]], roots: Optional[List[str]] = None) -> tuple[List[str], List[str]]:
         resolved: List[str] = []
         unresolved: List[str] = []
 
@@ -1976,7 +1542,6 @@ class UnifiedTaskBridge:
             hint = str(item or "").strip()
             if not hint:
                 continue
-
             try:
                 direct_path = _safe_resolve_path(hint)
                 if direct_path.exists() and direct_path.is_file():
@@ -1992,14 +1557,12 @@ class UnifiedTaskBridge:
             else:
                 unresolved.append(hint)
 
-        # Preserve order and remove duplicates.
         unique_resolved: List[str] = []
         seen = set()
         for path in resolved:
             if path not in seen:
                 unique_resolved.append(path)
                 seen.add(path)
-
         return unique_resolved, unresolved
 
     @staticmethod
@@ -2011,22 +1574,7 @@ class UnifiedTaskBridge:
             return "smtp.office365.com", 587
         return "", 587
 
-    def send_email(
-        self,
-        to_email: str,
-        subject: str,
-        body: str,
-        provider: str = "gmail",
-        attachments: Optional[List[str]] = None,
-        roots: Optional[List[str]] = None,
-        smtp_host: str = "",
-        smtp_port: int = 587,
-        smtp_user: str = "",
-        smtp_password: str = "",
-        from_email: str = "",
-        send_now: bool = False,
-        use_outlook_desktop: bool = True,
-    ) -> Dict[str, Any]:
+    def send_email(self, to_email: str, subject: str, body: str, provider: str = "gmail", attachments: Optional[List[str]] = None, roots: Optional[List[str]] = None, smtp_host: str = "", smtp_port: int = 587, smtp_user: str = "", smtp_password: str = "", from_email: str = "", send_now: bool = False, use_outlook_desktop: bool = True) -> Dict[str, Any]:
         clean_to = str(to_email or "").strip()
         if not clean_to:
             return _fail("Recipient email is required.", "missing_to_email")
@@ -2034,13 +1582,7 @@ class UnifiedTaskBridge:
         clean_provider = str(provider or "gmail").strip().lower() or "gmail"
         resolved_attachments, unresolved_attachments = self._resolve_attachment_paths(attachments, roots=roots)
 
-        # Outlook desktop route for Windows users.
-        if (
-            clean_provider == "outlook"
-            and os.name == "nt"
-            and win32 is not None
-            and _to_bool(use_outlook_desktop, default=True)
-        ):
+        if clean_provider == "outlook" and os.name == "nt" and win32 is not None and _to_bool(use_outlook_desktop, default=True):
             try:
                 outlook = win32.Dispatch("Outlook.Application")
                 mail = outlook.CreateItem(0)
@@ -2057,33 +1599,22 @@ class UnifiedTaskBridge:
                     mail.Save()
                     status = "Outlook draft created."
 
-                payload = {
-                    "provider": "outlook_desktop",
-                    "to": clean_to,
-                    "attachments": resolved_attachments,
-                }
+                payload = {"provider": "outlook_desktop", "to": clean_to, "attachments": resolved_attachments}
                 if unresolved_attachments:
                     payload["unresolved_attachments"] = unresolved_attachments
                 return _ok(status, data=payload)
             except Exception as exc:
                 return _fail("Outlook desktop send failed.", str(exc))
 
-        # SMTP route (Gmail, Outlook SMTP, or custom SMTP).
         default_host, default_port = self._smtp_default(clean_provider)
         final_host = str(smtp_host or default_host).strip()
         final_port = int(smtp_port or default_port or 587)
         sender = str(from_email or smtp_user or "").strip()
 
         if not final_host:
-            return _fail(
-                "SMTP host is required for this email provider.",
-                "missing_smtp_host",
-            )
+            return _fail("SMTP host is required for this email provider.", "missing_smtp_host")
         if not sender:
-            return _fail(
-                "Sender address is required (from_email or smtp_user).",
-                "missing_sender",
-            )
+            return _fail("Sender address is required (from_email or smtp_user).", "missing_sender")
 
         try:
             msg = EmailMessage()
@@ -2098,32 +1629,17 @@ class UnifiedTaskBridge:
                 if not mime_type:
                     mime_type = "application/octet-stream"
                 maintype, subtype = mime_type.split("/", 1)
-                msg.add_attachment(
-                    source.read_bytes(),
-                    maintype=maintype,
-                    subtype=subtype,
-                    filename=source.name,
-                )
+                msg.add_attachment(source.read_bytes(), maintype=maintype, subtype=subtype, filename=source.name)
 
             if _to_bool(send_now, default=False):
                 if not str(smtp_user or "").strip() or not str(smtp_password or ""):
-                    return _fail(
-                        "SMTP credentials are required to send now.",
-                        "missing_smtp_credentials",
-                    )
-
+                    return _fail("SMTP credentials are required to send now.", "missing_smtp_credentials")
                 with smtplib.SMTP(final_host, final_port, timeout=25) as smtp:
                     smtp.starttls()
                     smtp.login(str(smtp_user).strip(), str(smtp_password))
                     smtp.send_message(msg)
 
-                payload = {
-                    "provider": clean_provider,
-                    "mode": "smtp_send",
-                    "smtp_host": final_host,
-                    "to": clean_to,
-                    "attachments": resolved_attachments,
-                }
+                payload = {"provider": clean_provider, "mode": "smtp_send", "smtp_host": final_host, "to": clean_to, "attachments": resolved_attachments}
                 if unresolved_attachments:
                     payload["unresolved_attachments"] = unresolved_attachments
                 return _ok("Email sent via SMTP.", data=payload)
@@ -2134,59 +1650,17 @@ class UnifiedTaskBridge:
             draft_path = draft_dir / draft_name
             draft_path.write_bytes(bytes(msg))
 
-            payload = {
-                "provider": clean_provider,
-                "mode": "draft_file",
-                "draft": str(draft_path.resolve()),
-                "to": clean_to,
-                "attachments": resolved_attachments,
-            }
+            payload = {"provider": clean_provider, "mode": "draft_file", "draft": str(draft_path.resolve()), "to": clean_to, "attachments": resolved_attachments}
             if unresolved_attachments:
                 payload["unresolved_attachments"] = unresolved_attachments
             return _ok("Email draft file created.", data=payload)
         except Exception as exc:
             return _fail("Email operation failed.", str(exc))
 
-    def draft_email_attachment(
-        self,
-        to_email: str,
-        subject: str,
-        body: str,
-        file_hint: str,
-        roots: Optional[List[str]] = None,
-        smtp_host: str = "",
-        smtp_port: int = 587,
-        smtp_user: str = "",
-        smtp_password: str = "",
-        from_email: str = "",
-        send_now: bool = False,
-    ) -> Dict[str, Any]:
-        return self.send_email(
-            to_email=to_email,
-            subject=subject,
-            body=body,
-            provider="outlook" if os.name == "nt" else "custom",
-            attachments=[str(file_hint or "")],
-            roots=roots,
-            smtp_host=smtp_host,
-            smtp_port=smtp_port,
-            smtp_user=smtp_user,
-            smtp_password=smtp_password,
-            from_email=from_email,
-            send_now=send_now,
-            use_outlook_desktop=True,
-        )
+    def draft_email_attachment(self, to_email: str, subject: str, body: str, file_hint: str, roots: Optional[List[str]] = None, smtp_host: str = "", smtp_port: int = 587, smtp_user: str = "", smtp_password: str = "", from_email: str = "", send_now: bool = False) -> Dict[str, Any]:
+        return self.send_email(to_email=to_email, subject=subject, body=body, provider="outlook" if os.name == "nt" else "custom", attachments=[str(file_hint or "")], roots=roots, smtp_host=smtp_host, smtp_port=smtp_port, smtp_user=smtp_user, smtp_password=smtp_password, from_email=from_email, send_now=send_now, use_outlook_desktop=True)
 
-    def send_telegram(
-        self,
-        bot_token: str,
-        chat_id: str,
-        message: str = "",
-        file_path: str = "",
-        file_hint: str = "",
-        roots: Optional[List[str]] = None,
-        disable_web_preview: bool = False,
-    ) -> Dict[str, Any]:
+    def send_telegram(self, bot_token: str, chat_id: str, message: str = "", file_path: str = "", file_hint: str = "", roots: Optional[List[str]] = None, disable_web_preview: bool = False) -> Dict[str, Any]:
         if requests is None:
             return _fail("requests is unavailable for Telegram messaging.", "missing_dependency: requests")
 
@@ -2201,11 +1675,7 @@ class UnifiedTaskBridge:
 
         try:
             if clean_message:
-                payload = {
-                    "chat_id": clean_chat,
-                    "text": clean_message,
-                    "disable_web_page_preview": _to_bool(disable_web_preview, default=False),
-                }
+                payload = {"chat_id": clean_chat, "text": clean_message, "disable_web_page_preview": _to_bool(disable_web_preview, default=False)}
                 response = requests.post(f"{base_url}/sendMessage", data=payload, timeout=20)
                 if not response.ok:
                     return _fail("Telegram message send failed.", response.text[:1200])
@@ -2216,42 +1686,23 @@ class UnifiedTaskBridge:
                 resolved, unresolved = self._resolve_attachment_paths([file_candidate], roots=roots)
                 if not resolved:
                     return _fail("Telegram file was not found.", f"unresolved_file: {unresolved}")
-
                 source = Path(resolved[0])
                 with source.open("rb") as handle:
                     payload = {"chat_id": clean_chat}
                     if clean_message:
                         payload["caption"] = clean_message[:900]
-                    response = requests.post(
-                        f"{base_url}/sendDocument",
-                        data=payload,
-                        files={"document": handle},
-                        timeout=40,
-                    )
+                    response = requests.post(f"{base_url}/sendDocument", data=payload, files={"document": handle}, timeout=40)
                 if not response.ok:
                     return _fail("Telegram file send failed.", response.text[:1200])
                 sent.append("document")
 
             if not sent:
                 return _fail("Nothing to send to Telegram. Provide message or file_path.", "empty_telegram_payload")
-
-            return _ok(
-                "Telegram send completed.",
-                data={"chat_id": clean_chat, "sent": sent},
-            )
+            return _ok("Telegram send completed.", data={"chat_id": clean_chat, "sent": sent})
         except Exception as exc:
             return _fail("Telegram operation failed.", str(exc))
 
-    def send_whatsapp(
-        self,
-        to_number: str,
-        message: str,
-        use_twilio: bool = False,
-        twilio_account_sid: str = "",
-        twilio_auth_token: str = "",
-        twilio_from: str = "",
-        media_url: str = "",
-    ) -> Dict[str, Any]:
+    def send_whatsapp(self, to_number: str, message: str, use_twilio: bool = False, twilio_account_sid: str = "", twilio_auth_token: str = "", twilio_from: str = "", media_url: str = "") -> Dict[str, Any]:
         clean_to = str(to_number or "").strip()
         clean_message = str(message or "").strip()
         clean_media_url = str(media_url or "").strip()
@@ -2259,24 +1710,16 @@ class UnifiedTaskBridge:
         if not clean_to:
             return _fail("WhatsApp recipient number is required.", "missing_whatsapp_number")
 
-        wants_twilio = _to_bool(use_twilio, default=False) or bool(
-            str(twilio_account_sid or "").strip()
-            and str(twilio_auth_token or "").strip()
-            and str(twilio_from or "").strip()
-        )
+        wants_twilio = _to_bool(use_twilio, default=False) or bool(str(twilio_account_sid or "").strip() and str(twilio_auth_token or "").strip() and str(twilio_from or "").strip())
 
         if wants_twilio:
             if requests is None:
                 return _fail("requests is unavailable for Twilio WhatsApp.", "missing_dependency: requests")
-
             sid = str(twilio_account_sid or "").strip()
             token = str(twilio_auth_token or "").strip()
             from_number = str(twilio_from or "").strip()
             if not sid or not token or not from_number:
-                return _fail(
-                    "Twilio SID, token, and from number are required.",
-                    "missing_twilio_credentials",
-                )
+                return _fail("Twilio SID, token, and from number are required.", "missing_twilio_credentials")
 
             to_value = clean_to if clean_to.lower().startswith("whatsapp:") else f"whatsapp:{clean_to}"
             from_value = from_number if from_number.lower().startswith("whatsapp:") else f"whatsapp:{from_number}"
@@ -2287,50 +1730,21 @@ class UnifiedTaskBridge:
                 payload["MediaUrl"] = clean_media_url
 
             try:
-                response = requests.post(
-                    f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
-                    data=payload,
-                    auth=(sid, token),
-                    timeout=25,
-                )
+                response = requests.post(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json", data=payload, auth=(sid, token), timeout=25)
                 if response.status_code >= 400:
                     return _fail("Twilio WhatsApp send failed.", response.text[:1200])
-
-                response_data = {}
-                try:
-                    response_data = response.json()
-                except Exception:
-                    response_data = {}
-
-                return _ok(
-                    "WhatsApp message sent via Twilio.",
-                    data={
-                        "to": to_value,
-                        "sid": response_data.get("sid", ""),
-                    },
-                )
+                response_data = response.json() if hasattr(response, "json") else {}
+                return _ok("WhatsApp message sent via Twilio.", data={"to": to_value, "sid": response_data.get("sid", "")})
             except Exception as exc:
                 return _fail("Twilio WhatsApp send failed.", str(exc))
 
         if not clean_message:
-            return _fail(
-                "WhatsApp web mode supports text messages only. Provide a message.",
-                "missing_message",
-            )
+            return _fail("WhatsApp web mode supports text messages only. Provide a message.", "missing_message")
 
         if pywhatkit is not None:
             try:
-                pywhatkit.sendwhatmsg_instantly(
-                    phone_no=clean_to,
-                    message=clean_message,
-                    wait_time=15,
-                    tab_close=True,
-                    close_time=4,
-                )
-                return _ok(
-                    "WhatsApp Web message queued. Ensure your browser is logged in to WhatsApp.",
-                    data={"to": clean_to},
-                )
+                pywhatkit.sendwhatmsg_instantly(phone_no=clean_to, message=clean_message, wait_time=15, tab_close=True, close_time=4)
+                return _ok("WhatsApp Web message queued. Ensure your browser is logged in to WhatsApp.", data={"to": clean_to})
             except Exception as exc:
                 return _fail("WhatsApp Web send failed.", str(exc))
 
@@ -2348,315 +1762,90 @@ class UnifiedTaskBridge:
 
             if action_name == "list_system_roots":
                 return self.list_system_roots()
-
             if action_name == "search_mirror":
-                return self.search_mirror(
-                    query=str(action.get("query") or action.get("hint") or ""),
-                    limit=int(action.get("max_results", 8) or 8),
-                )
-
+                return self.search_mirror(query=str(action.get("query") or action.get("hint") or ""), limit=int(action.get("max_results", 8) or 8))
             if action_name == "list_directory":
-                mirror_context = None
-                if self._mirror_requested(action):
-                    mirror_query = self._mirror_query_from_action(action, action.get("path") or "")
-                    mirror_context = self._get_mirror_context(
-                        mirror_query,
-                        limit=int(action.get("mirror_limit", 6) or 6),
-                    )
-                result = self.list_directory(
-                    path=str(action.get("path", "")),
-                    recursive=_to_bool(action.get("recursive", False), default=False),
-                    max_depth=int(action.get("max_depth", 2) or 2),
-                    max_results=int(action.get("max_results", 300) or 300),
-                    pattern=str(action.get("pattern", "")),
-                    include_files=_to_bool(action.get("include_files", True), default=True),
-                    include_dirs=_to_bool(action.get("include_dirs", True), default=True),
-                )
+                mirror_context = self._get_mirror_context(self._mirror_query_from_action(action, action.get("path") or ""), limit=int(action.get("mirror_limit", 6) or 6)) if self._mirror_requested(action) else None
+                result = self.list_directory(path=str(action.get("path", "")), recursive=_to_bool(action.get("recursive", False), default=False), max_depth=int(action.get("max_depth", 2) or 2), max_results=int(action.get("max_results", 300) or 300), pattern=str(action.get("pattern", "")), include_files=_to_bool(action.get("include_files", True), default=True), include_dirs=_to_bool(action.get("include_dirs", True), default=True))
                 return self._attach_mirror_context(result, mirror_context)
-
             if action_name in {"deep_search", "deep_search_paths"}:
-                mirror_context = None
-                if self._mirror_requested(action):
-                    mirror_query = self._mirror_query_from_action(
-                        action,
-                        action.get("query") or action.get("hint") or "",
-                    )
-                    mirror_context = self._get_mirror_context(
-                        mirror_query,
-                        limit=int(action.get("mirror_limit", 6) or 6),
-                    )
-                result = self.deep_search_paths(
-                    query=str(action.get("query") or action.get("hint") or ""),
-                    roots=roots,
-                    max_results=int(action.get("max_results", 40) or 40),
-                    include_all_drives=_to_bool(action.get("include_all_drives", False), default=False),
-                    include_content=_to_bool(action.get("include_content", False), default=False),
-                    case_sensitive=_to_bool(action.get("case_sensitive", False), default=False),
-                    use_regex=_to_bool(action.get("use_regex", False), default=False),
-                    file_extensions=_to_str_list(action.get("file_extensions")) or None,
-                    max_scan_entries=int(action.get("max_scan_entries", 120000) or 120000),
-                    max_file_size_mb=int(action.get("max_file_size_mb", 5) or 5),
-                )
+                mirror_context = self._get_mirror_context(self._mirror_query_from_action(action, action.get("query") or action.get("hint") or ""), limit=int(action.get("mirror_limit", 6) or 6)) if self._mirror_requested(action) else None
+                result = self.deep_search_paths(query=str(action.get("query") or action.get("hint") or ""), roots=roots, max_results=int(action.get("max_results", 40) or 40), include_all_drives=_to_bool(action.get("include_all_drives", False), default=False), include_content=_to_bool(action.get("include_content", False), default=False), case_sensitive=_to_bool(action.get("case_sensitive", False), default=False), use_regex=_to_bool(action.get("use_regex", False), default=False), file_extensions=_to_str_list(action.get("file_extensions")) or None, max_scan_entries=int(action.get("max_scan_entries", 120000) or 120000), max_file_size_mb=int(action.get("max_file_size_mb", 5) or 5))
                 return self._attach_mirror_context(result, mirror_context)
-
             if action_name == "analyze_path":
-                mirror_context = None
-                if self._mirror_requested(action):
-                    mirror_query = self._mirror_query_from_action(action, action.get("path") or "")
-                    mirror_context = self._get_mirror_context(
-                        mirror_query,
-                        limit=int(action.get("mirror_limit", 6) or 6),
-                    )
-                result = self.analyze_path(
-                    path=str(action.get("path", "")),
-                    max_items=int(action.get("max_items", 3500) or 3500),
-                )
+                mirror_context = self._get_mirror_context(self._mirror_query_from_action(action, action.get("path") or ""), limit=int(action.get("mirror_limit", 6) or 6)) if self._mirror_requested(action) else None
+                result = self.analyze_path(path=str(action.get("path", "")), max_items=int(action.get("max_items", 3500) or 3500))
                 return self._attach_mirror_context(result, mirror_context)
-
             if action_name == "create_path":
-                return self.create_path(
-                    path=str(action.get("path", "")),
-                    kind=str(action.get("kind", "file")),
-                    content=str(action.get("content", "")),
-                    overwrite=_to_bool(action.get("overwrite", False), default=False),
-                )
-
+                return self.create_path(path=str(action.get("path", "")), kind=str(action.get("kind", "file")), content=str(action.get("content", "")), overwrite=_to_bool(action.get("overwrite", False), default=False))
             if action_name == "move_path":
-                return self.move_path(
-                    src=str(action.get("src") or action.get("source") or ""),
-                    dst=str(action.get("dst") or action.get("destination") or ""),
-                    overwrite=_to_bool(action.get("overwrite", False), default=False),
-                )
-
+                return self.move_path(src=str(action.get("src") or action.get("source") or ""), dst=str(action.get("dst") or action.get("destination") or ""), overwrite=_to_bool(action.get("overwrite", False), default=False))
             if action_name == "copy_path":
-                return self.copy_path(
-                    src=str(action.get("src") or action.get("source") or ""),
-                    dst=str(action.get("dst") or action.get("destination") or ""),
-                    overwrite=_to_bool(action.get("overwrite", False), default=False),
-                )
-
+                return self.copy_path(src=str(action.get("src") or action.get("source") or ""), dst=str(action.get("dst") or action.get("destination") or ""), overwrite=_to_bool(action.get("overwrite", False), default=False))
             if action_name == "delete_path":
-                return self.delete_path(
-                    path=str(action.get("path", "")),
-                    recursive=_to_bool(action.get("recursive", False), default=False),
-                    use_trash=_to_bool(action.get("use_trash", True), default=True),
-                )
-
+                return self.delete_path(path=str(action.get("path", "")), recursive=_to_bool(action.get("recursive", False), default=False), use_trash=_to_bool(action.get("use_trash", True), default=True))
             if action_name == "launch_application":
-                return self.launch_application(
-                    app_name=str(action.get("app") or action.get("name") or ""),
-                    args=_to_str_list(action.get("args")) or None,
-                    target_path=str(action.get("path") or action.get("target_path") or ""),
-                )
-
+                return self.launch_application(app_name=str(action.get("app") or action.get("name") or ""), args=_to_str_list(action.get("args")) or None, target_path=str(action.get("path") or action.get("target_path") or ""))
             if action_name == "close_application":
-                return self.close_application(
-                    app_name=str(action.get("app") or action.get("name") or ""),
-                    force=_to_bool(action.get("force", True), default=True),
-                )
-
+                return self.close_application(app_name=str(action.get("app") or action.get("name") or ""), force=_to_bool(action.get("force", True), default=True))
             if action_name in {"list_running_apps", "list_running_applications"}:
-                return self.list_running_applications(
-                    max_results=int(action.get("max_results", 120) or 120),
-                )
-
+                return self.list_running_applications(max_results=int(action.get("max_results", 120) or 120))
             if action_name == "open_service":
                 return self.open_service(str(action.get("service", "")))
-
-            if action_name == "search_file":
-                mirror_context = None
-                if self._mirror_requested(action):
-                    mirror_query = self._mirror_query_from_action(
-                        action,
-                        action.get("hint") or action.get("query") or "",
-                    )
-                    mirror_context = self._get_mirror_context(
-                        mirror_query,
-                        limit=int(action.get("mirror_limit", 6) or 6),
-                    )
-                result = self.smart_heuristic_search_files(
-                    hint=str(action.get("hint") or action.get("query") or ""),
-                    roots=roots,
-                    max_results=int(action.get("max_results", 20) or 20),
-                    include_content=_to_bool(action.get("include_content", True), default=True),
-                    max_scan_files=int(action.get("max_scan_files", 4200) or 4200),
-                )
+            if action_name in {"search_file", "semantic_search_file"}:
+                mirror_context = self._get_mirror_context(self._mirror_query_from_action(action, action.get("hint") or action.get("query") or ""), limit=int(action.get("mirror_limit", 6) or 6)) if self._mirror_requested(action) else None
+                result = self.smart_heuristic_search_files(hint=str(action.get("hint") or action.get("query") or ""), roots=roots, max_results=int(action.get("max_results", 20) or 20), include_content=_to_bool(action.get("include_content", True), default=True), max_scan_files=int(action.get("max_scan_files", 4200) or 4200))
                 return self._attach_mirror_context(result, mirror_context)
-
-            if action_name == "semantic_search_file":
-                mirror_context = None
-                if self._mirror_requested(action):
-                    mirror_query = self._mirror_query_from_action(
-                        action,
-                        action.get("hint") or action.get("query") or "",
-                    )
-                    mirror_context = self._get_mirror_context(
-                        mirror_query,
-                        limit=int(action.get("mirror_limit", 6) or 6),
-                    )
-                result = self.smart_heuristic_search_files(
-                    hint=str(action.get("hint") or action.get("query") or ""),
-                    roots=roots,
-                    max_results=int(action.get("max_results", 20) or 20),
-                    include_content=_to_bool(action.get("include_content", True), default=True),
-                    max_scan_files=int(action.get("max_scan_files", 4200) or 4200),
-                )
-                return self._attach_mirror_context(result, mirror_context)
-
             if action_name == "read_file":
-                mirror_context = None
-                if self._mirror_requested(action):
-                    mirror_query = self._mirror_query_from_action(action, action.get("path") or "")
-                    mirror_context = self._get_mirror_context(
-                        mirror_query,
-                        limit=int(action.get("mirror_limit", 6) or 6),
-                    )
-                result = self.read_file_text(
-                    file_path=str(action.get("path", "")),
-                    max_chars=int(action.get("max_chars", 12000) or 12000),
-                )
+                mirror_context = self._get_mirror_context(self._mirror_query_from_action(action, action.get("path") or ""), limit=int(action.get("mirror_limit", 6) or 6)) if self._mirror_requested(action) else None
+                result = self.read_file_text(file_path=str(action.get("path", "")), max_chars=int(action.get("max_chars", 12000) or 12000))
                 return self._attach_mirror_context(result, mirror_context)
-
             if action_name in {"open_file", "open_path"}:
-                mirror_context = None
-                if self._mirror_requested(action):
-                    mirror_query = self._mirror_query_from_action(
-                        action,
-                        action.get("path") or action.get("hint") or "",
-                    )
-                    mirror_context = self._get_mirror_context(
-                        mirror_query,
-                        limit=int(action.get("mirror_limit", 6) or 6),
-                    )
-                result = self.open_file(
-                    file_path=str(action.get("path") or action.get("hint") or ""),
-                    resolve_by_hint=_to_bool(action.get("resolve_by_hint", True), default=True),
-                    roots=roots,
-                    include_content=_to_bool(action.get("include_content", True), default=True),
-                )
+                mirror_context = self._get_mirror_context(self._mirror_query_from_action(action, action.get("path") or action.get("hint") or ""), limit=int(action.get("mirror_limit", 6) or 6)) if self._mirror_requested(action) else None
+                result = self.open_file(file_path=str(action.get("path") or action.get("hint") or ""), resolve_by_hint=_to_bool(action.get("resolve_by_hint", True), default=True), roots=roots, include_content=_to_bool(action.get("include_content", True), default=True))
                 return self._attach_mirror_context(result, mirror_context)
-
             if action_name == "move_mouse":
-                return self.move_mouse(
-                    x=int(action.get("x", 0)),
-                    y=int(action.get("y", 0)),
-                    duration=float(action.get("duration", 0.2)),
-                )
-
+                return self.move_mouse(x=int(action.get("x", 0)), y=int(action.get("y", 0)), duration=float(action.get("duration", 0.2)))
             if action_name == "click":
-                return self.click(
-                    button=str(action.get("button", "left")),
-                    clicks=int(action.get("clicks", 1)),
-                )
-
+                return self.click(button=str(action.get("button", "left")), clicks=int(action.get("clicks", 1)))
             if action_name == "type_text":
-                return self.type_text(
-                    text=str(action.get("text", "")),
-                    interval=float(action.get("interval", 0.01)),
-                )
-
+                return self.type_text(text=str(action.get("text", "")), interval=float(action.get("interval", 0.01)))
             if action_name == "press_key":
                 return self.press_key(str(action.get("key", "enter")))
-
             if action_name == "hotkey":
                 keys = _to_str_list(action.get("keys"))
                 if not keys:
                     return _fail("Hotkey keys must be a non-empty list.", "invalid_hotkey_payload")
                 return self.hotkey(keys)
-
             if action_name == "run_command":
-                return self.run_system_command(
-                    command=str(action.get("command", "")),
-                    timeout=int(action.get("timeout", 25) or 25),
-                )
-
+                return self.run_system_command(command=str(action.get("command", "")), timeout=int(action.get("timeout", 25) or 25))
             if action_name == "open_interpreter":
-                return self.run_open_interpreter(
-                    instruction=str(action.get("instruction") or action.get("prompt") or ""),
-                    timeout=int(action.get("timeout", 120) or 120),
-                )
-
+                return self.run_open_interpreter(instruction=str(action.get("instruction") or action.get("prompt") or ""), timeout=int(action.get("timeout", 120) or 120))
             if action_name == "toggle_dark_mode":
                 enable = action.get("enable")
-                parsed_enable = None if enable is None else _to_bool(enable, default=False)
-                return self.toggle_dark_mode(parsed_enable)
-
+                return self.toggle_dark_mode(None if enable is None else _to_bool(enable, default=False))
             if action_name == "send_email":
                 attachments = _to_str_list(action.get("attachments"))
                 attachments.extend(_to_str_list(action.get("attachment")))
                 file_hint = str(action.get("file_hint", "")).strip()
                 if file_hint:
                     attachments.append(file_hint)
-
-                return self.send_email(
-                    to_email=str(action.get("to") or action.get("to_email") or ""),
-                    subject=str(action.get("subject", "")),
-                    body=str(action.get("body") or action.get("message") or ""),
-                    provider=str(action.get("provider", "gmail")),
-                    attachments=attachments,
-                    roots=roots,
-                    smtp_host=str(action.get("smtp_host", "")),
-                    smtp_port=int(action.get("smtp_port", 587) or 587),
-                    smtp_user=str(action.get("smtp_user", "")),
-                    smtp_password=str(action.get("smtp_password", "")),
-                    from_email=str(action.get("from") or action.get("from_email") or ""),
-                    send_now=_to_bool(action.get("send_now", False), default=False),
-                    use_outlook_desktop=_to_bool(action.get("use_outlook_desktop", True), default=True),
-                )
-
+                return self.send_email(to_email=str(action.get("to") or action.get("to_email") or ""), subject=str(action.get("subject", "")), body=str(action.get("body") or action.get("message") or ""), provider=str(action.get("provider", "gmail")), attachments=attachments, roots=roots, smtp_host=str(action.get("smtp_host", "")), smtp_port=int(action.get("smtp_port", 587) or 587), smtp_user=str(action.get("smtp_user", "")), smtp_password=str(action.get("smtp_password", "")), from_email=str(action.get("from") or action.get("from_email") or ""), send_now=_to_bool(action.get("send_now", False), default=False), use_outlook_desktop=_to_bool(action.get("use_outlook_desktop", True), default=True))
             if action_name == "draft_email_attachment":
-                return self.draft_email_attachment(
-                    to_email=str(action.get("to") or action.get("to_email") or ""),
-                    subject=str(action.get("subject", "")),
-                    body=str(action.get("body", "")),
-                    file_hint=str(action.get("file_hint", "")),
-                    roots=roots,
-                    smtp_host=str(action.get("smtp_host", "")),
-                    smtp_port=int(action.get("smtp_port", 587) or 587),
-                    smtp_user=str(action.get("smtp_user", "")),
-                    smtp_password=str(action.get("smtp_password", "")),
-                    from_email=str(action.get("from") or action.get("from_email") or ""),
-                    send_now=_to_bool(action.get("send_now", False), default=False),
-                )
-
+                return self.draft_email_attachment(to_email=str(action.get("to") or action.get("to_email") or ""), subject=str(action.get("subject", "")), body=str(action.get("body", "")), file_hint=str(action.get("file_hint", "")), roots=roots, smtp_host=str(action.get("smtp_host", "")), smtp_port=int(action.get("smtp_port", 587) or 587), smtp_user=str(action.get("smtp_user", "")), smtp_password=str(action.get("smtp_password", "")), from_email=str(action.get("from") or action.get("from_email") or ""), send_now=_to_bool(action.get("send_now", False), default=False))
             if action_name == "send_telegram":
-                return self.send_telegram(
-                    bot_token=str(action.get("bot_token") or action.get("token") or ""),
-                    chat_id=str(action.get("chat_id") or action.get("to") or ""),
-                    message=str(action.get("message") or action.get("text") or ""),
-                    file_path=str(action.get("file_path") or action.get("path") or ""),
-                    file_hint=str(action.get("file_hint") or action.get("attachment") or ""),
-                    roots=roots,
-                    disable_web_preview=_to_bool(action.get("disable_web_preview", False), default=False),
-                )
-
+                return self.send_telegram(bot_token=str(action.get("bot_token") or action.get("token") or ""), chat_id=str(action.get("chat_id") or action.get("to") or ""), message=str(action.get("message") or action.get("text") or ""), file_path=str(action.get("file_path") or action.get("path") or ""), file_hint=str(action.get("file_hint") or action.get("attachment") or ""), roots=roots, disable_web_preview=_to_bool(action.get("disable_web_preview", False), default=False))
             if action_name == "send_whatsapp":
-                return self.send_whatsapp(
-                    to_number=str(action.get("to") or action.get("to_number") or ""),
-                    message=str(action.get("message") or action.get("text") or ""),
-                    use_twilio=_to_bool(action.get("use_twilio", False), default=False),
-                    twilio_account_sid=str(action.get("twilio_account_sid") or action.get("account_sid") or ""),
-                    twilio_auth_token=str(action.get("twilio_auth_token") or action.get("auth_token") or ""),
-                    twilio_from=str(action.get("twilio_from") or action.get("from") or ""),
-                    media_url=str(action.get("media_url", "")),
-                )
-
+                return self.send_whatsapp(to_number=str(action.get("to") or action.get("to_number") or ""), message=str(action.get("message") or action.get("text") or ""), use_twilio=_to_bool(action.get("use_twilio", False), default=False), twilio_account_sid=str(action.get("twilio_account_sid") or action.get("account_sid") or ""), twilio_auth_token=str(action.get("twilio_auth_token") or action.get("auth_token") or ""), twilio_from=str(action.get("twilio_from") or action.get("from") or ""), media_url=str(action.get("media_url", "")))
             if action_name == "online_query":
-                return self.connectivity.online_query(
-                    query=str(action.get("query", "")),
-                    max_results=int(action.get("max_results", 5) or 5),
-                )
+                return self.connectivity.online_query(query=str(action.get("query", "")), max_results=int(action.get("max_results", 5) or 5))
 
             return _fail("Unknown tool action.", f"unsupported_action: {action_name}")
         except Exception as exc:
             return _fail("Tool dispatcher failed.", str(exc))
 
 
-def search_files_by_hint(
-    hint: str,
-    roots: Optional[List[str]] = None,
-    max_results: int = 20,
-) -> Dict[str, Any]:
+def search_files_by_hint(hint: str, roots: Optional[List[str]] = None, max_results: int = 20) -> Dict[str, Any]:
     return _TASK_BRIDGE.search_files_by_hint(hint=hint, roots=roots, max_results=max_results)
 
 
@@ -2692,13 +1881,61 @@ _TASK_BRIDGE = UnifiedTaskBridge()
 
 
 def run_tool_action(action: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Dispatches tool actions produced by the agent.
-
-    Expected schema example:
-    {
-        "action": "search_file",
-        "hint": "report"
-    }
-    """
+    """Dispatches tool actions produced by the agent."""
     return _TASK_BRIDGE.execute_action(action)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run one tool action JSON payload")
+    parser.add_argument("--action-json", default="", help="Tool action payload as JSON object")
+    return parser.parse_args()
+
+
+def _read_payload(args: argparse.Namespace) -> str:
+    from_arg = str(getattr(args, "action_json", "") or "").strip()
+    if from_arg:
+        return from_arg
+    try:
+        if sys.stdin is not None and not sys.stdin.closed:
+            return sys.stdin.read().strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _emit(result: dict) -> None:
+    print(json.dumps(result, ensure_ascii=True))
+
+
+def main() -> int:
+    args = _parse_args()
+    raw_payload = _read_payload(args)
+    if not raw_payload:
+        _emit({"success": False, "message": "Tool action payload was empty.", "error": "empty_action_payload"})
+        return 1
+
+    try:
+        parsed = json.loads(raw_payload)
+    except Exception as exc:
+        _emit({"success": False, "message": "Tool action payload was not valid JSON.", "error": str(exc)})
+        return 1
+
+    if not isinstance(parsed, dict):
+        _emit({"success": False, "message": "Tool action payload must be a JSON object.", "error": "invalid_action_payload"})
+        return 1
+
+    try:
+        result = run_tool_action(parsed)
+    except Exception as exc:
+        _emit({"success": False, "message": "Tool action runner crashed while executing payload.", "error": str(exc)})
+        return 1
+
+    if not isinstance(result, dict):
+        result = {"success": False, "message": "Tool action returned an invalid result payload.", "error": str(result)}
+
+    _emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -28,7 +28,6 @@ For detailed setup information, see: [SCRIPTS.md](SCRIPTS.md)
 - Safe assistant actions: assistant-side desktop control now requires strict JSON action format.
 - Config-first runtime: `.env` + `config.yaml` replace hardcoded local paths.
 - Optional multimodal and multi-agent scaffolds are included for extension work.
-- Optional live screen context: attach desktop screenshots to prompts with a one-click UI toggle.
 - Optional CrewAI advisory mode (fallbacks to local multi-agent chain if CrewAI is unavailable).
 - Response-only mode for a transparent, minimal UI output view.
 - **NEW: Ultra-fast responses** - 3.4x faster (350ms vs 1200ms) with auto-caching - see [OPTIMIZATION.md](OPTIMIZATION.md)
@@ -50,12 +49,6 @@ Pull the base model:
 
 ```bash
 ollama pull llama3
-```
-
-Optional (for screen understanding):
-
-```bash
-ollama pull llava:7b
 ```
 
 ### 2. Create Virtual Environment
@@ -181,7 +174,7 @@ aiassistant/
     frontend/    # GUI apps
     backend/     # FastAPI services
     core/        # agent/orchestration logic
-    infra/       # config, db, voice, vision, avatar integrations
+    infra/       # config, db, voice, avatar integrations
     tools/       # desktop/system tool actions
     workers/     # background workers
     launchers/   # launch orchestration
@@ -225,25 +218,6 @@ Terminal 3:
 python -m aiassistant.frontend.main_gui
 ```
 
-## Enable Live Screen View
-
-MARIE can capture your current desktop on each prompt and send a summarized screen context to reasoning.
-
-1. In `config.yaml`, set:
-
-```yaml
-vision:
-    screen_share_enabled: true
-    vision_model: llava:7b
-```
-
-2. Start MARIE and use the `Screen: ON/OFF` button in the top bar.
-
-Notes:
-- If `vision_model` is empty, MARIE only forwards active window title metadata.
-- Screenshots are stored in `vision.screenshot_dir` (default: `./cache/screens`).
-- Capture relies on `pyautogui` (already in `requirements.txt`).
-
 ## Voice & Action Commands
 
 Examples you can speak/type:
@@ -273,9 +247,6 @@ POST /chat/multi-agent
 
 This runs a local researcher -> coder -> synthesizer chain and returns each agent output.
 
-- Webcam multimodal worker:
-    - `aiassistant/infra/vision/multimodal_vision.py` contains `VisionWorker` (OpenCV + MediaPipe hook points).
-    - Intended for gesture/expression-driven controls (for example pause on "stop" hand gesture).
 
 ## Architecture Diagram
 
@@ -298,7 +269,7 @@ flowchart LR
 
         VS --> UI
         UI --> L2D[Live2D + viseme timeline]
-        UI --> CAM[VisionWorker webcam hook - optional]
+
 ```
 
 ## Packaging

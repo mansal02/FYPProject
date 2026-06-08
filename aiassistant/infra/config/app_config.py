@@ -121,13 +121,6 @@ _DEFAULT_CONFIG = {
         "context_max_chars": 900,
         "verbose": False,
     },
-    "vision": {
-        "screen_share_enabled": False,
-        "vision_model": "qwen2.5vl:7b",
-        "screenshot_dir": "./cache/screens",
-        "capture_interval_sec": 0.8,
-        "max_width": 1280,
-    },
     "runtime": {
         "hybrid_mode": False,
         "external_model": "gemini-2.0-flash",
@@ -300,26 +293,7 @@ def load_config():
         config["voice"].get("enable_silero_vad", True),
     )
 
-    config["vision"]["screen_share_enabled"] = _as_bool(
-        os.environ.get("MARIE_SCREEN_SHARE_ENABLED"),
-        config["vision"].get("screen_share_enabled", False),
-    )
-    config["vision"]["vision_model"] = os.environ.get(
-        "MARIE_VISION_MODEL",
-        config["vision"].get("vision_model", ""),
-    )
-    config["vision"]["screenshot_dir"] = os.environ.get(
-        "MARIE_SCREENSHOT_DIR",
-        config["vision"].get("screenshot_dir", "./cache/screens"),
-    )
-    config["vision"]["capture_interval_sec"] = _as_float(
-        os.environ.get("MARIE_SCREEN_CAPTURE_INTERVAL_SEC"),
-        config["vision"].get("capture_interval_sec", 0.8),
-    )
-    config["vision"]["max_width"] = _as_int(
-        os.environ.get("MARIE_SCREEN_MAX_WIDTH"),
-        config["vision"].get("max_width", 1280),
-    )
+
 
     config["runtime"]["hybrid_mode"] = _as_bool(
         os.environ.get("MARIE_HYBRID_MODE"),
@@ -441,7 +415,6 @@ def load_config():
     ):
         config["paths"][key] = _resolve_path(config["paths"][key])
 
-    config["vision"]["screenshot_dir"] = _resolve_path(config["vision"]["screenshot_dir"])
     config["memory"]["local_context_file"] = _resolve_path(config["memory"]["local_context_file"])
     config["memory_agent"]["watch_dir"] = _resolve_path(config["memory_agent"]["watch_dir"])
     config["memory_agent"]["persist_dir"] = _resolve_path(config["memory_agent"]["persist_dir"])
