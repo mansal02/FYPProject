@@ -244,6 +244,29 @@ ASSISTANT_JSON_ACTIONS = [
     '{"action":"play","target":"lofi coding music"}',
 ]
 
+def search_local_files(query: str, limit: int = 5) -> str:
+    """
+    Searches the local device for files using the internal FTS5 database mirror.
+    Use this strictly when the user asks to 'search file' or 'find file'.
+    """
+    db = DatabaseManager()
+    results = db.search_searchable_mirror(query, limit=limit)
+    
+    if not results:
+        return f"No files found matching the query: '{query}' in the local database mirror."
+
+    response = [f"Found {len(results)} matching files:"]
+    for idx, item in enumerate(results, 1):
+        file_path = item.get("file_path", "Unknown Path")
+        snippet = item.get("snippet", "").strip()
+        
+        if snippet:
+            response.append(f"{idx}. {file_path}\n   Excerpt: \"{snippet[:200]}...\"")
+        else:
+            response.append(f"{idx}. {file_path}")
+
+    return "\n".join(response)
+
 def execute_office_tool(tool_name: str, payload: dict) -> dict:
     """
     Dynamically routes Office Automation tasks and guarantees a safe return state,
@@ -1875,10 +1898,10 @@ class UnifiedTaskBridge:
                 return self.list_running_applications(max_results=int(action.get("max_results", 120) or 120))
             if action_name == "open_service":
                 return self.open_service(str(action.get("service", "")))
-            if action_name in {"search_file", "semantic_search_file"}:
-                mirror_context = self._get_mirror_context(self._mirror_query_from_action(action, action.get("hint") or action.get("query") or ""), limit=int(action.get("mirror_limit", 6) or 6)) if self._mirror_requested(action) else None
-                result = self.smart_heuristic_search_files(hint=str(action.get("hint") or action.get("query") or ""), roots=roots, max_results=int(action.get("max_results", 20) or 20), include_content=_to_bool(action.get("include_content", True), default=True), max_scan_files=int(action.get("max_scan_files", 4200) or 4200))
-                return self._attach_mirror_context(result, mirror_context)
+            if action_name in {"search_file", "semantic_search_file", "search_mirror"}:
+                query = str(action.get("hint") or action.get("query") or action.get("mirror_query") or "")
+                limit = int(action.get("max_results", 20) or 20)
+                return self.search_mirror(query=query, limit=limit)
             if action_name == "read_file":
                 mirror_context = self._get_mirror_context(self._mirror_query_from_action(action, action.get("path") or ""), limit=int(action.get("mirror_limit", 6) or 6)) if self._mirror_requested(action) else None
                 result = self.read_file_text(file_path=str(action.get("path", "")), max_chars=int(action.get("max_chars", 12000) or 12000))

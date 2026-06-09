@@ -46,10 +46,20 @@ class LocalRAG:
                 # Fetch our accelerated embedding function
                 marie_ef = get_marie_embedding_function()
                 
-                self.collection = client.get_or_create_collection(
-                    name="marie_knowledge",
-                    embedding_function=marie_ef # <--- Chroma will now use this automatically
-                )
+                try:
+                    # 1. Try to simply retrieve the existing collection
+                    # ChromaDB will automatically use the stored embedding function
+                    self.collection = client.get_collection(
+                        name="marie_knowledge",
+                        embedding_function=marie_ef
+                    )
+                except ValueError:
+                    # 2. If it doesn't exist (ValueError), create it
+                    self.collection = client.create_collection(
+                        name="marie_knowledge",
+                        embedding_function=marie_ef
+                    )
+                    
             except BaseException as exc:
                 print(f"[RAG] Failed to init ChromaDB: {exc}")
 

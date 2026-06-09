@@ -445,6 +445,8 @@ class LoginDialog(QDialog):
 
 # === Main Application Window ===
 class AssistantMainWindow(QMainWindow):
+    
+    indexer_status_signal = pyqtSignal(str)
     # --- 1. Initialization & Setup ---
     def __init__(self, db: DatabaseManager, user_id: int, username: str) -> None:
         super().__init__()
@@ -462,7 +464,7 @@ class AssistantMainWindow(QMainWindow):
         self.idle_index_controller = None
         self._idle_training_status = "Idle training: paused"
         self.response_only_mode = False
-
+        self.indexer_status_signal.connect(self._set_status_core)
         # Configs
         self.reasoning_model = DEFAULT_REASONING_MODEL
         self.model_path = str(self.preferences.get("preferred_live2d_model") or DEFAULT_LIVE2D_MODEL)
@@ -496,7 +498,7 @@ class AssistantMainWindow(QMainWindow):
         self.action_worker: Optional[ActionWorker] = None
 
         # Window Config
-        self.setWindowTitle(f"Offline Desktop Assistant | {self.current_username}")
+        self.setWindowTitle(f" Desktop Assistant | {self.current_username}")
         self.resize(1180, 780)
 
         # Core Initializations
@@ -514,7 +516,20 @@ class AssistantMainWindow(QMainWindow):
             QTimer.singleShot(150, self.init_live2d_embedding)
 
     def _init_idle_training(self) -> None:
-        self.doc_indexer, self.idle_index_controller = build_default_indexer(db=self.db, status_cb=lambda msg: None)
+        def status_callback(msg: str):
+            # Clean up the backend messages for the UI
+            if "indexing documents" in msg:
+                self.indexer_status_signal.emit("Scanning searchable mirror...")
+            elif "paused" in msg:
+                self.indexer_status_signal.emit("Ready")
+            else:
+                self.indexer_status_signal.emit(msg)
+
+        # Pass the callback instead of the dummy lambda
+        self.doc_indexer, self.idle_index_controller = build_default_indexer(
+            db=self.db, 
+            status_cb=status_callback
+        )
         if self.idle_index_controller:
             self.idle_index_controller.start()
 
@@ -650,6 +665,29 @@ class AssistantMainWindow(QMainWindow):
         right_layout.addWidget(self.status_label)
 
         layout.addWidget(right_panel, stretch=1)
+        
+        self._start_auto_scanner()
+        
+    def _start_auto_scanner(self):
+        """Initializes and starts the searchable mirror auto-scan."""
+        
+        # The callback simply emits the thread-safe signal
+        def status_callback(msg: str):
+            # Change "Idle training" to a more user-friendly label
+            clean_msg = msg.replace("Idle training: indexing documents...", "🔍 Scanning searchable mirror...")
+            clean_msg = clean_msg.replace("Idle training: paused", "✅ Mirror scan paused (Idle)")
+            self.indexer_status_signal.emit(clean_msg)
+
+        # Build the controller using the existing function from doc_indexer.py
+        self.doc_indexer, self.indexer_controller = build_default_indexer(self.db, status_cb=status_callback)
+        
+        # Start the background daemon thread
+        import threading
+        self.indexer_thread = threading.Thread(
+            target=self.indexer_controller._run, 
+            daemon=True
+        )
+        self.indexer_thread.start()    
 
     def _build_history_tab(self) -> None:
         layout = QVBoxLayout(self.history_tab)
