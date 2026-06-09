@@ -1,138 +1,121 @@
 import argparse
 import importlib.util
-import os
-import subprocess
-import sys
-import threading
+import os, subprocess, sys, threading, pyautogui, openpyxl
+import argparse, contextlib, csv, difflib, fnmatch, importlib, io, json, mimetypes, os, platform, random, re, shutil, smtplib, subprocess, sys, threading, time, webbrowser
 from pathlib import Path
+from typing import Dict, List, Tuple
 
-# Keep launcher behavior anchored to repository root where compatibility scripts live.
+# ==========================================
+# CONFIGURATION & CONSTANTS
+# ==========================================
+# Keep launcher behavior anchored to repository root
 BASE_DIR = Path(__file__).resolve().parents[2]
-# Running this file directly by absolute path does not always include repo root on sys.path.
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-# Disable RAG by default due to ChromaDB/onnxruntime compatibility issues
-if "MARIE_DISABLE_RAG" not in os.environ:
-    os.environ["MARIE_DISABLE_RAG"] = "0"
-    
 PYTHON_EXE = sys.executable
+LOG_DIR = BASE_DIR / "cache" / "launch_logs"
+
 LAUNCH_MODES = {
     "assistant": ["aiassistant.frontend.main_gui"],
-    "hybrid": ["aiassistant.backend.server_reasoning", "aiassistant.backend.server_voice", "aiassistant.frontend.main_gui"],
+    "hybrid": [
+        "aiassistant.backend.server_reasoning",
+        "aiassistant.backend.server_voice",
+        "aiassistant.frontend.main_gui"
+    ],
 }
 DEFAULT_MODE = "assistant"
+
 CTRL_C_EXIT_CODES = {130, -1073741510, 3221225786}
 ACCESS_VIOLATION_EXIT_CODES = {3221225477, -1073741819}
 TERMINATE_TIMEOUT_SECONDS = 5
 GUI_STABILITY_MAX_LEVEL = 2
 
-failures = []
+
+# ==========================================
+# GLOBAL STATE
+# ==========================================
+failures: List[Tuple[str, int | str]] = []
 failures_lock = threading.Lock()
-processes = {}
+
+processes: Dict[str, subprocess.Popen] = {}
 processes_lock = threading.Lock()
+
 shutdown_requested = threading.Event()
-LOG_DIR = BASE_DIR / "cache" / "launch_logs"
 
 
-def _build_child_env():
+# ==========================================
+# ENVIRONMENT & HELPER FUNCTIONS
+# ==========================================
+def _build_child_env() -> Dict[str, str]:
+    """Prepare the environment variables for child processes."""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(BASE_DIR.resolve())
     env.setdefault("OLLAMA_FLASH_ATTENTION", "1")
     env.setdefault("OLLAMA_KV_CACHE_TYPE", "q4_0")
     env.setdefault("OLLAMA_KEEP_ALIVE", "5m")
-    env.setdefault("MARIE_DISABLE_FAST_ORCHESTRATOR", "0")
-    
-    try:
-        import psutil
-        total_gb = psutil.virtual_memory().total / (1024**3)
-        if 4 <= total_gb < 8 and env.get("MARIE_DEVICE_CLASS") not in {"high_end", "high_mid"}:
-            env.setdefault("MARIE_ENABLE_MIDTIER_MODE", "1")
-            env.setdefault("MARIE_DEVICE_CLASS", "mid_tier")
-            env.setdefault("MARIE_ENABLE_AGGRESSIVE_GC", "1")
-        elif total_gb < 4:
-            env.setdefault("MARIE_DEVICE_CLASS", "low_end")
-            env.setdefault("MARIE_ENABLE_AGGRESSIVE_GC", "1")
-    except Exception:
-        pass
-    
     return env
 
 
-def _creation_flags():
-    if os.name == "nt":
-        return subprocess.CREATE_NEW_PROCESS_GROUP
-    return 0
-
-
-def _is_interrupt_exit_code(return_code):
-    return return_code in CTRL_C_EXIT_CODES
-
-
-def _is_access_violation_exit_code(return_code):
-    return return_code in ACCESS_VIOLATION_EXIT_CODES
-
-
-def _apply_main_gui_stability_profile(env, level):
-    env["MARIE_STABILITY_MODE_LEVEL"] = "0"
+def _apply_main_gui_stability_profile(env: Dict[str, str], level: int) -> None:
+    """Apply specific environment variables for GUI stability mode."""
+    env["MARIE_STABILITY_MODE_LEVEL"] = str(level)
     env.setdefault("MARIE_FAULTHANDLER", "1")
-    env.setdefault("MARIE_GUI_BOOT_LOG", str((BASE_DIR / "cache" / "main_gui_boot.log").resolve()))
-
-    # Explicitly clear out all feature restrictions
-    env["MARIE_DISABLE_LIVE2D"] = "0"
-    env["MARIE_ENABLE_LIVE2D"] = "1"
-    env["MARIE_DISABLE_VOICE_INPUT"] = "0"
-    env["MARIE_DISABLE_TTS"] = "0"
-    env["MARIE_DISABLE_LEGACY_ACTIONS"] = "0"
-    env["MARIE_DISABLE_RAG"] = "0"
-    env["MARIE_SAFE_MINIMAL"] = "0"
-
-
-def _stability_profile_summary(level):
-    if level <= 0:
-        return "normal profile"
-    if level == 1:
-        return "stability profile 1 (Live2D disabled)"
-    return "stability profile 2 (minimal runtime: Live2D/voice/TTS/RAG disabled)"
+    env.setdefault("MARIE_GUI_BOOT_LOG", _main_gui_boot_log_path())
+    env["MARIE_DISABLE_VOICE_INPUT"] = "1" if level > 0 else "0"
+    env["MARIE_SAFE_MINIMAL"] = "1" if level > 0 else "0"
 
 
 def _main_gui_boot_log_path() -> str:
     return str((BASE_DIR / "cache" / "main_gui_boot.log").resolve())
 
 
-def _parse_args():
-    parser = argparse.ArgumentParser(
-        description="Local assistant launcher",
-    )
+def _creation_flags() -> int:
+    return subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+
+
+def _is_interrupt(return_code: int) -> bool:
+    return return_code in CTRL_C_EXIT_CODES
+
+
+def _is_access_violation(return_code: int) -> bool:
+    return return_code in ACCESS_VIOLATION_EXIT_CODES
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="MARIE Local Assistant Launcher")
     parser.add_argument(
         "--mode",
         choices=sorted(LAUNCH_MODES.keys()),
         default=DEFAULT_MODE,
-        help=(
-            "assistant: launch new UI only (default), "
-            "legacy: old server stack, hybrid: old servers + new UI"
-        ),
+        help="assistant: launch new UI only (default), hybrid: backend servers + new UI",
     )
     return parser.parse_args()
 
 
-def _resolve_modules(mode):
+def _resolve_modules(mode: str) -> List[str]:
+    """Verify all requested modules exist before attempting to launch them."""
     modules = LAUNCH_MODES.get(mode, LAUNCH_MODES[DEFAULT_MODE])
-    missing = [module for module in modules if importlib.util.find_spec(module) is None]
+    missing = [mod for mod in modules if importlib.util.find_spec(mod) is None]
 
     if missing:
         print("Cannot start launcher. Missing Python modules:")
-        for module in missing:
-            print(f"- {module}")
+        for mod in missing:
+            print(f"  - {mod}")
         sys.exit(1)
-
+        
     return modules
 
 
-def _terminate_running_processes(reason, exclude_script=None):
+# ==========================================
+# PROCESS MANAGEMENT
+# ==========================================
+def _terminate_running_processes(reason: str, exclude_script: str = None) -> None:
+    """Safely terminate or force kill all running child processes."""
     with processes_lock:
         running = list(processes.items())
 
+    # Phase 1: Attempt graceful termination
     for script_name, process in running:
         if script_name == exclude_script:
             continue
@@ -140,6 +123,7 @@ def _terminate_running_processes(reason, exclude_script=None):
             print(f"--- Stopping {script_name} ({reason}) ---", flush=True)
             process.terminate()
 
+    # Phase 2: Force kill if they hang
     for script_name, process in running:
         if script_name == exclude_script:
             continue
@@ -152,8 +136,23 @@ def _terminate_running_processes(reason, exclude_script=None):
             process.kill()
 
 
-def run_script(script_name):
+def _record_failure(script_name: str, error_detail: int | str) -> None:
+    """Thread-safe recording of script failures and triggering global shutdown."""
+    with failures_lock:
+        failures.append((script_name, error_detail))
+        
+    print(f"ERROR: {script_name} failed with: {error_detail}", flush=True)
+    
+    if not shutdown_requested.is_set():
+        shutdown_requested.set()
+        _terminate_running_processes("another script failed", exclude_script=script_name)
+
+
+def run_script(script_name: str) -> None:
+    """Launch and monitor a specific Python script, handling its lifecycle and restarts."""
     stability_level = 0
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"{script_name.replace('.', '_')}.log"
 
     while True:
         try:
@@ -161,102 +160,99 @@ def run_script(script_name):
             if script_name == "aiassistant.frontend.main_gui":
                 _apply_main_gui_stability_profile(env, stability_level)
 
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            log_path = LOG_DIR / f"{script_name.replace('.', '_')}.log"
-            log_file = open(log_path, "a", encoding="utf-8")
+            # Context manager ensures file is closed properly regardless of errors
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                process = subprocess.Popen(
+                    [PYTHON_EXE, "-m", script_name],
+                    cwd=str(BASE_DIR),
+                    creationflags=_creation_flags(),
+                    env=env,
+                    stdout=log_file,
+                    stderr=log_file,
+                )
+                
+                with processes_lock:
+                    processes[script_name] = process
 
-            process = subprocess.Popen(
-                [PYTHON_EXE, "-m", script_name],
-                cwd=str(BASE_DIR),
-                creationflags=_creation_flags(),
-                env=env,
-                stdout=log_file,
-                stderr=log_file,
-            )
-            with processes_lock:
-                processes[script_name] = process
+                # Wait for process to complete
+                return_code = process.wait()
+                log_file.flush()
 
-            return_code = process.wait()
-            log_file.flush()
-            log_file.close()
-
+            # --- Evaluate Exit State ---
             if return_code == 0:
                 print(f"--- Finished {script_name} ---\n", flush=True)
                 return
 
-            if shutdown_requested.is_set() or _is_interrupt_exit_code(return_code):
+            if shutdown_requested.is_set() or _is_interrupt(return_code):
                 print(f"--- Stopped {script_name} ---", flush=True)
                 return
 
-            if (
-                            script_name == "aiassistant.frontend.main_gui"
-                        ):
-                            stability_level = 0
-                            crash_kind = (
-                                "native GUI crash"
-                                if _is_access_violation_exit_code(return_code)
-                                else "unexpected GUI exit"
-                            )
-                            print(
-                                f"--- Detected {crash_kind} (exit code {return_code}). Restarting main_gui with full capability profile... ---",
-                                flush=True,
-                            )
-                            continue
+            # --- Auto-Restart Logic (GUI Only) ---
+            if script_name == "aiassistant.frontend.main_gui":
+                stability_level += 1
+                if stability_level > GUI_STABILITY_MAX_LEVEL:
+                    print(f"--- Main GUI failed {stability_level} times. Giving up. ---", flush=True)
+                else:
+                    crash_kind = (
+                        "native GUI crash" if _is_access_violation(return_code) else "unexpected GUI exit"
+                    )
+                    print(
+                        f"--- Detected {crash_kind} (exit code {return_code}). Restarting main_gui (attempt {stability_level})... ---",
+                        flush=True,
+                    )
+                    continue
 
-            with failures_lock:
-                failures.append((script_name, return_code))
-            print(f"ERROR: {script_name} failed with exit code {return_code}.", flush=True)
+            # --- Unrecoverable Failure Handling ---
             if script_name == "aiassistant.frontend.main_gui":
                 print(f"Diagnostic boot log: {_main_gui_boot_log_path()}", flush=True)
                 print(f"Process log: {log_path}", flush=True)
-
-            if not shutdown_requested.is_set():
-                shutdown_requested.set()
-                _terminate_running_processes("another script failed", exclude_script=script_name)
+                
+            _record_failure(script_name, f"exit code {return_code}")
             return
+
         except OSError as exc:
-            try:
-                log_file.flush()
-                log_file.close()
-            except Exception:
-                pass
-            with failures_lock:
-                failures.append((script_name, f"launch error: {exc}"))
-            print(f"ERROR: {script_name} failed to launch ({exc}).", flush=True)
-            if not shutdown_requested.is_set():
-                shutdown_requested.set()
-                _terminate_running_processes("another script failed", exclude_script=script_name)
+            _record_failure(script_name, f"launch error: {exc}")
             return
 
 
-def main():
+# ==========================================
+# MAIN ENTRY POINT
+# ==========================================
+def main() -> None:
     args = _parse_args()
     scripts = _resolve_modules(args.mode)
-    threads = []
+    threads: List[threading.Thread] = []
 
     print(f"Launch mode: {args.mode}")
+    
+    # Start all threads
     for script in scripts:
         print(f"--- Starting {script} ---", flush=True)
         thread = threading.Thread(target=run_script, args=(script,))
         threads.append(thread)
         thread.start()
 
+    # Block until all threads finish or user interrupts
     try:
         for thread in threads:
             thread.join()
+            
     except KeyboardInterrupt:
         shutdown_requested.set()
         print("\n--- Interrupt received. Stopping all scripts... ---", flush=True)
         _terminate_running_processes("user interrupt")
+        
         for thread in threads:
             thread.join()
+            
         print("Launcher interrupted by user.", flush=True)
         sys.exit(130)
 
+    # Report final status
     if failures:
         print("One or more scripts failed:")
         for script_name, code in failures:
-            print(f"- {script_name}: exit code {code}")
+            print(f"  - {script_name}: {code}")
         sys.exit(1)
 
     print("All scripts completed.")

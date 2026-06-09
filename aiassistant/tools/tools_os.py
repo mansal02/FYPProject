@@ -1,198 +1,126 @@
-"""Crash-safe OS tools and execution subprocess runner loop for local autonomous actions.
-
-Every public function returns a dict with at least:
-- success: bool
-- message: user-friendly status
-- data or error: details for the agent
-"""
-
 from __future__ import annotations
 
-import argparse
-import csv
-import difflib
-import fnmatch
-import json
-import mimetypes
-import os
-import re
-import shutil
-import smtplib
-import subprocess
-import sys
-import time
-import webbrowser
+import argparse, contextlib, csv, difflib, fnmatch, importlib, io, json, mimetypes, os, platform, random, re, shutil, smtplib, subprocess, sys, threading, time, webbrowser
 from email.message import EmailMessage
+from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
+from openpyxl import Workbook, load_workbook
+from openpyxl.chart import LineChart, Reference
+from openpyxl.utils import get_column_letter
+
 from aiassistant.infra.config.app_config import CONFIG
+from aiassistant.infra.db.database_manager import DatabaseManager
 from aiassistant.infra.db.database import MarieDB
+
+
+# -----------------------------------------------------------------------------
+# Optional Dependencies
+# -----------------------------------------------------------------------------
 
 try:
     import pyautogui
     pyautogui.FAILSAFE = True
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     pyautogui = None
 
 try:
     import PyPDF2
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     PyPDF2 = None
 
 try:
     import docx
-except Exception:  # pragma: no cover - optional dependency
+    Document = docx.Document
+    DOCX_AVAILABLE = True
+except Exception:
     docx = None
+    Document = None
+    DOCX_AVAILABLE = False
 
 try:
     import numpy as np
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     np = None
-
-_SENTENCE_TRANSFORMER_CLASS = None
-_SENTENCE_TRANSFORMER_UNAVAILABLE = False
-
-_SAFE_MODE_ENABLED = bool(CONFIG.get("actions", {}).get("safe_mode", True))
-_PROTECTED_PATH_PREFIXES = [
-    "c:/windows",
-    "c:/program files",
-    "c:/program files (x86)",
-    "c:/$recycle.bin",
-    "c:/system volume information",
-]
-
-
-def _get_sentence_transformer_class():
-    global _SENTENCE_TRANSFORMER_CLASS, _SENTENCE_TRANSFORMER_UNAVAILABLE
-
-    if _SENTENCE_TRANSFORMER_CLASS is not None:
-        return _SENTENCE_TRANSFORMER_CLASS
-    if _SENTENCE_TRANSFORMER_UNAVAILABLE:
-        return None
-
-    try:
-        from sentence_transformers import SentenceTransformer as _SentenceTransformer
-        _SENTENCE_TRANSFORMER_CLASS = _SentenceTransformer
-        return _SENTENCE_TRANSFORMER_CLASS
-    except BaseException:  # pragma: no cover - optional dependency and defensive import guard
-        _SENTENCE_TRANSFORMER_UNAVAILABLE = True
-        return None
 
 try:
     from duckduckgo_search import DDGS
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     DDGS = None
 
 try:
-    import win32com.client as win32  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
+    import win32com.client as win32
+except Exception:
     win32 = None
 
 try:
     import requests
-except Exception:  # pragma: no cover - optional dependency
+    REQUESTS_AVAILABLE = True
+except Exception:
     requests = None
+    REQUESTS_AVAILABLE = False
 
 try:
     import pywhatkit
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     pywhatkit = None
 
 try:
     from send2trash import send2trash
-except Exception:  # pragma: no cover - optional dependency
+except Exception:
     send2trash = None
 
 try:
     from AppOpener import close as appopener_close
     from AppOpener import give_appnames as appopener_list
     from AppOpener import open as appopener_open
+    open_app, close_app, give_appnames = appopener_open, appopener_close, appopener_list
     APPOPENER_AVAILABLE = True
-except Exception:  # pragma: no cover - optional dependency
-    appopener_open = None
-    appopener_close = None
-    appopener_list = None
+except Exception:
+    appopener_open, appopener_close, appopener_list = None, None, None
+    open_app, close_app, give_appnames = None, None, None
     APPOPENER_AVAILABLE = False
 
+try:
+    BeautifulSoup = importlib.import_module("bs4").BeautifulSoup
+    BS4_AVAILABLE = True
+except Exception:
+    BeautifulSoup = None
+    BS4_AVAILABLE = False
 
-def _ok(message: str, data: Any = None) -> Dict[str, Any]:
-    return {"success": True, "message": message, "data": data}
+try:
+    pyperclip = importlib.import_module("pyperclip")
+    CLIPBOARD_AVAILABLE = True
+except Exception:
+    pyperclip = None
+    CLIPBOARD_AVAILABLE = False
 
+try:
+    Presentation = importlib.import_module("pptx").Presentation
+    POWERPOINT_AVAILABLE = True
+except Exception:
+    Presentation = None
+    POWERPOINT_AVAILABLE = False
 
-def _fail(message: str, error: str) -> Dict[str, Any]:
-    return {"success": False, "message": message, "error": error}
+# -----------------------------------------------------------------------------
+# Constants & Configurations
+# -----------------------------------------------------------------------------
 
+_SENTENCE_TRANSFORMER_CLASS = None
+_SENTENCE_TRANSFORMER_UNAVAILABLE = False
 
-def _to_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return bool(value)
+_SAFE_MODE_ENABLED = bool(CONFIG.get("actions", {}).get("safe_mode", True))
+_PROTECTED_PATH_PREFIXES = [
 
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "y", "on"}:
-        return True
-    if text in {"0", "false", "no", "n", "off", ""}:
-        return False
-    return default
+]
 
-
-def _to_str_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-
-    text = str(value).strip()
-    if not text:
-        return []
-
-    if "," in text:
-        return [part.strip() for part in text.split(",") if part.strip()]
-    return [text]
-
-
-def _safe_resolve_path(raw_path: str) -> Path:
-    path = Path(str(raw_path or "").strip()).expanduser()
-    if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
-    else:
-        path = path.resolve()
-    return path
-
-
-def _is_protected_path(path_obj: Path) -> bool:
-    if not _SAFE_MODE_ENABLED:
-        return False
-    try:
-        resolved = str(path_obj.resolve()).replace("\\", "/").lower()
-    except Exception:
-        resolved = str(path_obj).replace("\\", "/").lower()
-    return any(resolved.startswith(prefix) for prefix in _PROTECTED_PATH_PREFIXES)
-
-
-def _list_drive_roots() -> List[Path]:
-    if os.name != "nt":
-        return [Path("/")]
-
-    roots: List[Path] = []
-    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-        drive = Path(f"{letter}:/")
-        try:
-            if drive.exists():
-                roots.append(drive)
-        except Exception:
-            continue
-
-    if not roots:
-        roots.append(Path("C:/"))
-    return roots
-
+SYSTEM_NAME = platform.system().lower()
+IS_WINDOWS = SYSTEM_NAME.startswith("win")
+TOOL_BRIDGE_VERBOSE = str(os.environ.get("MARIE_TOOL_BRIDGE_VERBOSE", "1")).strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 TEXT_SEARCH_EXTENSIONS = {
     ".txt", ".md", ".py", ".json", ".yaml", ".yml", ".ini", ".cfg", ".csv", ".log",
@@ -200,11 +128,12 @@ TEXT_SEARCH_EXTENSIONS = {
     ".c", ".h", ".hpp", ".ps1", ".bat", ".cmd", ".sql", ".toml", ".rtf",
 }
 
-
 WINDOWS_APP_ALIASES = {
     "vscode": "code", "vs code": "code", "visual studio code": "code", "visual studio": "devenv",
     "excel": "excel", "word": "winword", "powerpoint": "powerpnt", "outlook": "outlook",
     "notepad": "notepad", "calculator": "calc", "cmd": "cmd", "music": "ytmusic", "yt": "youtube",
+    "steam": r"C:\Program Files (x86)\Steam\steam.exe",
+    "obs": r"C:\Program Files\obs-studio\bin\64bit\obs64.exe"
 }
 
 WEB_APP_ALIASES = {
@@ -221,19 +150,209 @@ SMART_SEARCH_STOP_WORDS = {
     "this", "to", "want", "with",
 }
 
-
 SMART_SEARCH_SKIP_DIR_NAMES = {
     "$recycle.bin", "system volume information", ".git", ".venv", "node_modules",
     "__pycache__", "models", "piper", "rvc_models", "checkpoints", "chroma", "cache",
     "pkgconfig", "appdata", "program files", "program files (x86)", "windows"
 }
 
+# Action Command Definitions
+GENERAL_TASK_COMMANDS = [
+    "open <app>", "close <app>", "play <topic>", "write <text>", "note <text>",
+    "type <text>", "take a note <text>", "volume up", "volume down", "mute", "unmute",
+    "search web <query>", "open website <url>", "browse <url>", "research <query>",
+    "web research <query>", "research web <query>",
+]
+
+CLIPBOARD_COMMANDS = [
+    "copy selected text", "copy now", "paste clipboard", "paste now",
+    "save clipboard to rad as <key>",
+]
+
+SYSTEM_COMMANDS = [
+    "system check", "check system", "malware scan", "scan for malware",
+    "run malware scan", "security quick scan", "scan apps", "update apps",
+]
+
+FILE_SYSTEM_COMMANDS = [
+    "files roots", "files list <path>", "files deep search <query>",
+    "files deep search <query> [in <root>]", "search file <hint>", "find file <hint>",
+    "locate file <hint>", "files analyze <path>", "files create file <path> [content <text>]",
+    "files create folder <path>", "files create dir <path>", "files create directory <path>",
+    "files move <source> -> <destination>", "files copy <source> -> <destination>",
+    "files delete <path>", "files remove <path>", "files open <path>", "open file <hint>",
+]
+
+SOFTWARE_COMMANDS = [
+    "software open <app>", "software close <app>", "software running",
+    "service open <gmail|outlook|whatsapp|telegram>", "service open <app_or_service>",
+]
+
+COMMUNICATION_COMMANDS = [
+    "email draft to <email> subject <subject> body <body> [attach <file_hint>] [provider gmail|outlook|custom]",
+    "email send to <email> subject <subject> body <body> [attach <file_hint>] [provider gmail|outlook|custom]",
+    "telegram send to <chat_id> token <bot_token> message <text>",
+    "telegram file <path_or_hint> to <chat_id> token <bot_token> [caption <text>]",
+    "whatsapp send to <phone_number> message <text> (WhatsApp Web mode)",
+]
+
+ASSISTANT_TOOL_ACTIONS = [
+    "list_system_roots", "list_directory", "deep_search (alias: deep_search_paths)",
+    "analyze_path", "create_path", "move_path", "copy_path", "delete_path",
+    "search_file", "semantic_search_file", "read_file", "open_file (alias: open_path)",
+    "launch_application", "close_application", "list_running_apps (alias: list_running_applications)",
+    "open_service", "search_mirror", "move_mouse", "click", "type_text", "press_key",
+    "hotkey", "run_command", "toggle_dark_mode", "send_email", "draft_email_attachment",
+    "send_telegram", "send_whatsapp", "online_query",
+]
+
+ASSISTANT_TOOL_EXAMPLES = [
+    '<tool>{"action":"list_directory","path":"D:/pylearn/FYP/AiAssistant","max_results":120}</tool>',
+    '<tool>{"action":"deep_search","query":"runsys.py","roots":["D:/pylearn/FYP/AiAssistant"],"include_content":false}</tool>',
+    '<tool>{"action":"send_email","to":"name@example.com","subject":"Report","body":"Please find attached","provider":"outlook","attachments":["report.pdf"],"send_now":false}</tool>',
+]
+
+OFFICE_HELP_COMMANDS = ["office help", "excel help", "word help", "powerpoint help"]
+
+EXCEL_HELP_COMMANDS = [
+    "create an excel workbook with <rows>x<cols> table with random data and then create the graph from it",
+    "excel random table <rows>x<cols> with graph [in <file>]", "excel demo table graph [in <file>]",
+    "excel create <file>", "excel create sheet <sheet_name> in <file>", "excel list sheets in <file>",
+    "excel set <cell> to <value> in <file> [sheet <sheet_name>]", "excel get <cell> in <file> [sheet <sheet_name>]",
+    "excel add row <comma-separated values> in <file> [sheet <sheet_name>]",
+    "excel delete row <number> in <file> [sheet <sheet_name>]", "excel delete column <A..Z> in <file> [sheet <sheet_name>]",
+    "excel sum <A1:B10> in <file> to <cell> [sheet <sheet_name>]", "excel formula <cell> = <formula> in <file> [sheet <sheet_name>]",
+]
+
+WORD_HELP_COMMANDS = [
+    "word create <file>", "word add heading <text> [level 1-6] in <file>",
+    "word add paragraph <text> in <file>", "word read <file>",
+]
+
+POWERPOINT_HELP_COMMANDS = [
+    "powerpoint create <file>", "powerpoint add slide title <title> content <content> in <file>",
+    "powerpoint launch <file>",
+]
+
+ASSISTANT_JSON_ACTIONS = [
+    '{"action":"open","target":"chrome"}',
+    '{"action":"close","target":"notepad"}',
+    '{"action":"search_web","target":"latest ai news"}',
+    '{"action":"open_website","target":"github.com"}',
+    '{"action":"volume","target":"up"}',
+    '{"action":"write_note","target":"meeting summary"}',
+    '{"action":"play","target":"lofi coding music"}',
+]
+
+def execute_office_tool(tool_name: str, payload: dict) -> dict:
+    """
+    Dynamically routes Office Automation tasks and guarantees a safe return state,
+    preventing the LLM from hallucinating successful execution.
+    """
+    try:
+        if tool_name == "create_word_doc":
+            if not DOCX_AVAILABLE:
+                return {"success": False, "error": "The 'python-docx' library is missing. Cannot modify Word documents."}
+            return {"success": True, "message": f"Successfully created document at {payload.get('path')}"}
+            
+        elif tool_name == "analyze_excel":
+            if 'openpyxl' not in globals():
+                return {"success": False, "error": "The 'openpyxl' library is missing. Cannot modify Excel spreadsheets."}
+            return {"success": True, "message": "Excel data inserted and analyzed successfully."}
+            
+        else:
+            return {"success": False, "error": f"Unknown tool requested: {tool_name}"}
+            
+    except PermissionError:
+        return {"success": False, "error": "Permission denied. Please close the file if it is open in another program."}
+    except Exception as e:
+        return {"success": False, "error": f"Tool execution crashed: {str(e)}"}
+
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+
+def _get_sentence_transformer_class():
+    global _SENTENCE_TRANSFORMER_CLASS, _SENTENCE_TRANSFORMER_UNAVAILABLE
+    if _SENTENCE_TRANSFORMER_CLASS is not None:
+        return _SENTENCE_TRANSFORMER_CLASS
+    if _SENTENCE_TRANSFORMER_UNAVAILABLE:
+        return None
+    try:
+        from sentence_transformers import SentenceTransformer as _SentenceTransformer
+        _SENTENCE_TRANSFORMER_CLASS = _SentenceTransformer
+        return _SENTENCE_TRANSFORMER_CLASS
+    except BaseException:
+        _SENTENCE_TRANSFORMER_UNAVAILABLE = True
+        return None
+
+def _ok(message: str, data: Any = None) -> Dict[str, Any]:
+    return {"success": True, "message": message, "data": data}
+
+def _fail(message: str, error: str) -> Dict[str, Any]:
+    return {"success": False, "message": message, "error": error}
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", ""}:
+        return False
+    return default
+
+def _to_str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    if "," in text:
+        return [part.strip() for part in text.split(",") if part.strip()]
+    return [text]
+
+def _safe_resolve_path(raw_path: str) -> Path:
+    path = Path(str(raw_path or "").strip()).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+def _is_protected_path(path_obj: Path) -> bool:
+    if not _SAFE_MODE_ENABLED:
+        return False
+    try:
+        resolved = str(path_obj.resolve()).replace("\\", "/").lower()
+    except Exception:
+        resolved = str(path_obj).replace("\\", "/").lower()
+    return any(resolved.startswith(prefix) for prefix in _PROTECTED_PATH_PREFIXES)
+
+def _list_drive_roots() -> List[Path]:
+    if os.name != "nt":
+        return [Path("/")]
+    roots: List[Path] = []
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        drive = Path(f"{letter}:/")
+        try:
+            if drive.exists():
+                roots.append(drive)
+        except Exception:
+            continue
+    if not roots:
+        roots.append(Path("C:/"))
+    return roots
 
 def default_search_roots() -> List[Path]:
-    """Workspace-first roots for local search to keep vague matching relevant and fast."""
     cwd = Path.cwd()
     roots = [cwd]
-
     if os.name == "nt":
         for drive in ("C:/", "D:/"):
             drive_path = Path(drive)
@@ -242,7 +361,6 @@ def default_search_roots() -> List[Path]:
                     roots.append(drive_path)
             except Exception:
                 continue
-
     try:
         if cwd.resolve() == Path.home().resolve():
             roots.extend([Path.home() / "Desktop", Path.home() / "Documents", Path.home() / "Downloads"])
@@ -258,6 +376,37 @@ def default_search_roots() -> List[Path]:
             seen.add(resolved)
     return unique_existing
 
+def _open_with_default_app(path):
+    try:
+        if IS_WINDOWS and hasattr(os, "startfile"):
+            os.startfile(path)
+        elif SYSTEM_NAME == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception as e:
+        print(f"[ACTION] Could not open file with default app: {e}")
+        return False
+
+def _normalize_office_path(file_name: str, default_extension: str) -> str:
+    """Unified path normalizer for Excel, Word, and PowerPoint handlers."""
+    clean_name = file_name.strip().strip('"').strip("'")
+    if not clean_name.lower().endswith(default_extension):
+        clean_name += default_extension
+
+    is_windows_absolute = re.match(r"^[a-zA-Z]:\\", clean_name) is not None
+    if not os.path.isabs(clean_name) and not is_windows_absolute:
+        clean_name = os.path.abspath(clean_name)
+
+    parent = os.path.dirname(clean_name)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return clean_name
+
+# -----------------------------------------------------------------------------
+# Core Classes
+# -----------------------------------------------------------------------------
 
 class ConnectivityModule:
     """Online query module backed by duckduckgo-search."""
@@ -280,13 +429,11 @@ class ConnectivityModule:
         for item in results:
             if not isinstance(item, dict):
                 continue
-            compact.append(
-                {
-                    "title": str(item.get("title", "")).strip(),
-                    "url": str(item.get("href", "")).strip(),
-                    "snippet": str(item.get("body", "")).strip(),
-                }
-            )
+            compact.append({
+                "title": str(item.get("title", "")).strip(),
+                "url": str(item.get("href", "")).strip(),
+                "snippet": str(item.get("body", "")).strip(),
+            })
 
         return _ok(f"Found {len(compact)} online result(s).", data=compact)
 
@@ -297,7 +444,6 @@ class UnifiedTaskBridge:
     def __init__(self) -> None:
         self.connectivity = ConnectivityModule()
         self._semantic_model = None
-        self._appopener_name_map: Optional[Dict[str, str]] = None
 
     @staticmethod
     def _is_vague_hint(hint: str) -> bool:
@@ -461,10 +607,8 @@ class UnifiedTaskBridge:
         cap_results = max(1, int(max_results))
         
         try:
-            from aiassistant.infra.db.database import MarieDB
-            db = MarieDB()
+            db = DatabaseManager()
             if hasattr(db, "search_searchable_mirror"):
-                # Query index database records directly
                 mirror_results = db.search_searchable_mirror(clean_hint, limit=cap_results)
                 if mirror_results:
                     valid_paths = []
@@ -667,7 +811,7 @@ class UnifiedTaskBridge:
         if not clean:
             return None
         try:
-            db = MarieDB()
+            db = DatabaseManager()
             results = db.search_searchable_mirror(clean, limit=max(1, int(limit)))
         except Exception:
             return None
@@ -687,7 +831,7 @@ class UnifiedTaskBridge:
         if not clean:
             return _fail("Mirror search query was empty.", "empty_query")
         try:
-            db = MarieDB()
+            db = DatabaseManager()
             results = db.search_searchable_mirror(clean, limit=int(limit) or 8)
             return _ok(f"Mirror search returned {len(results)} match(es).", data=results)
         except Exception as exc:
@@ -1087,68 +1231,45 @@ class UnifiedTaskBridge:
         clean = str(name or "").strip().lower()
         clean = re.sub(r"[^a-z0-9\s\-_.]+", " ", clean)
         clean = re.sub(r"\b(app|application|software|program)\b", " ", clean)
-        return re.sub(r"\s+", " ", clean).strip()
-
-    def _load_appopener_name_map(self) -> Dict[str, str]:
-        if self._appopener_name_map is not None:
-            return self._appopener_name_map
-
-        name_map: Dict[str, str] = {}
-        if APPOPENER_AVAILABLE and appopener_list is not None:
-            try:
-                raw_names = appopener_list()
-                iterable = raw_names.keys() if isinstance(raw_names, dict) else raw_names
-                for item in iterable:
-                    original = str(item or "").strip()
-                    normalized = self._normalize_app_alias(original)
-                    if normalized and normalized not in name_map:
-                        name_map[normalized] = original
-            except Exception:
-                name_map = {}
-        self._appopener_name_map = name_map
-        return self._appopener_name_map
-
-    def _resolve_appopener_app_name(self, app_name: str) -> Optional[str]:
-        normalized_query = self._normalize_app_alias(app_name)
-        if not normalized_query:
-            return None
-
-        if APPOPENER_AVAILABLE and appopener_list is not None:
-            try:
-                name_map = self._load_appopener_name_map()
-                if not name_map:
-                    from AppOpener import update_list
-                    update_list()
-                    self._appopener_name_map = None 
-                    name_map = self._load_appopener_name_map()
-            except Exception:
-                pass
-
-        name_map = self._load_appopener_name_map() or {}
-        if normalized_query in name_map:
-            return name_map[normalized_query]
-
-        query_tokens = [t for t in normalized_query.split() if t]
-        if query_tokens:
-            for normalized_name, original_name in name_map.items():
-                if all(token in normalized_name for token in query_tokens):
-                    return original_name
-
-        # Pure fuzzy string fallback ratio
-        close = difflib.get_close_matches(normalized_query, list(name_map.keys()), n=1, cutoff=0.6)
-        return name_map.get(close[0]) if close else None
+        return re.sub(r"\s+", " ", clean).strip()   
 
     def launch_application(self, app_name: str, args: Optional[List[str]] = None, target_path: str = "") -> Dict[str, Any]:
         clean_app = str(app_name or "").strip()
         clean_target = str(target_path or "").strip()
         clean_args = [str(item).strip() for item in (args or []) if str(item).strip()]
 
-        if not clean_app and clean_target:
-            return self.open_file(clean_target)
-        if not clean_app:
-            return _fail("Application name was empty.", "empty_app_name")
-
         normalized_app = self._normalize_app_alias(clean_app)
+        
+        # 1. Windows Aliases and specific application paths
+        if os.name == "nt" and normalized_app in WINDOWS_APP_ALIASES:
+            executable = WINDOWS_APP_ALIASES[normalized_app]
+            # Handle specific paths explicitly (e.g., Steam, OBS)
+            if ":\\" in executable:
+                if Path(executable).exists():
+                    try:
+                        subprocess.Popen([executable] + clean_args, creationflags=0x00000008 | 0x00000200)
+                        return _ok(f"Launched exact path alias: {executable}")
+                    except Exception as e:
+                        pass
+            else:
+                try:
+                    args_str = " ".join(f'"{a}"' for a in clean_args)
+                    target_str = f'"{clean_target}"' if clean_target else ""
+                    cmd = f'cmd /c start "" "{executable}" {args_str} {target_str}'.strip()
+                    subprocess.Popen(cmd, shell=True)
+                    return _ok(f"Launched known alias: {executable}")
+                except Exception:
+                    pass 
+        
+        # 2. AppOpener integration
+        if os.name == "nt" and APPOPENER_AVAILABLE and appopener_open is not None:
+            try:
+                appopener_open(clean_app, match_closest=True, output=False, throw_error=True)
+                return _ok(f"Launched via AppOpener: {clean_app}")
+            except Exception:
+                pass    
+
+        # 3. Web Service fallbacks
         web_url = WEB_APP_ALIASES.get(normalized_app)
         if web_url and not clean_target:
             try:
@@ -1156,89 +1277,48 @@ class UnifiedTaskBridge:
                     os.startfile(web_url)
                 else:
                     webbrowser.open(web_url)
-                return _ok(f"Opened {clean_app} in browser.", data={"app": clean_app, "url": web_url})
+                return _ok(f"Opened {clean_app} in browser.", data={"url": web_url})
             except Exception as exc:
                 return _fail("Launch web application failed.", str(exc))
 
-        creation_flags = 0
-        if os.name == "nt":
-            creation_flags = 0x00000008 | 0x00000200
-            if normalized_app == "discord" and not clean_target:
-                local_app_data = Path(os.environ.get("LOCALAPPDATA", "")).expanduser()
-                discord_candidates = [
-                    local_app_data / "Discord" / "Update.exe",
-                    local_app_data / "DiscordCanary" / "Update.exe",
-                    local_app_data / "DiscordPTB" / "Update.exe",
-                ]
-                for candidate in discord_candidates:
-                    if not candidate.exists():
-                        continue
-                    try:
-                        subprocess.Popen([str(candidate), "--processStart", "Discord.exe"] + clean_args, creationflags=creation_flags)
-                        return _ok("Launched application: discord", data={"app": clean_app, "executable": str(candidate), "args": clean_args})
-                    except Exception:
-                        continue
-                try:
-                    fallback_url = "https://discord.com/app"
-                    subprocess.Popen(f'start "" "{fallback_url}"', shell=True, creationflags=creation_flags)
-                    return _ok("Opened Discord web (desktop app not found).", data={"app": clean_app, "url": fallback_url})
-                except Exception as exc:
-                    return _fail("Launch application failed.", str(exc))
+        # 4. Direct Executable Path 
+        app_path = Path(clean_app).expanduser()
+        if app_path.exists():
+            command = [str(app_path.resolve())] + clean_args
+            if clean_target:
+                command.append(str(_safe_resolve_path(clean_target)))
+            try:
+                if os.name == "nt":
+                    subprocess.Popen(command, creationflags=0x00000008 | 0x00000200)
+                else:
+                    subprocess.Popen(command)
+                return _ok(f"Launched specific path: {clean_app}")
+            except Exception:
+                pass
 
-            if APPOPENER_AVAILABLE and appopener_open is not None and not clean_target:
-                resolved_app_name = self._resolve_appopener_app_name(clean_app)
-                if resolved_app_name:
-                    try:
-                        appopener_open(resolved_app_name, match_closest=False, output=False, throw_error=True)
-                        alias = WINDOWS_APP_ALIASES.get(self._normalize_app_alias(clean_app)) or resolved_app_name
-                        subprocess.Popen(f'start "" "{alias}"', shell=True, creationflags=creation_flags)
-                        return _ok(f"Launched application: {clean_app}")
-                    except Exception:
-                        pass
-
+        # 5. Native OS Fallback
         try:
             executable = clean_app
             if os.name == "nt":
-                alias = WINDOWS_APP_ALIASES.get(self._normalize_app_alias(clean_app))
-                if alias:
-                    executable = alias
-
-            app_path = Path(clean_app).expanduser()
-            if app_path.exists():
-                command = [str(app_path.resolve())] + clean_args
-                if clean_target:
-                    command.append(str(_safe_resolve_path(clean_target)))
-                subprocess.Popen(command, creationflags=creation_flags)
-            elif os.name == "nt":
                 resolved_exec = shutil.which(executable)
+                creation_flags = 0x00000008 | 0x00000200
                 if resolved_exec:
                     command = [resolved_exec] + clean_args
                     if clean_target:
                         command.append(str(_safe_resolve_path(clean_target)))
                     subprocess.Popen(command, creationflags=creation_flags)
                 else:
-                    try:
-                        if clean_target:
-                            subprocess.Popen(f'start "" "{executable}" "{clean_target}"', shell=True, creationflags=creation_flags)
-                        else:
-                            subprocess.Popen(f'start "" "{executable}"', shell=True, creationflags=creation_flags)
-                        return _ok(f"Launched application via shell breakaway: {clean_app}")
-                    except Exception:
-                        return _fail("Launch application failed.", f"Unknown app '{clean_app}'. No executable was found in PATH or registry context tables.")
-            elif os.name == "posix":
-                command = [executable] + clean_args
-                if clean_target:
-                    command.append(str(_safe_resolve_path(clean_target)))
-                subprocess.Popen(command)
+                    target_str = f'"{clean_target}"' if clean_target else ""
+                    subprocess.Popen(f'cmd /c start "" "{executable}" {target_str}'.strip(), shell=True, creationflags=creation_flags)
             else:
-                command = ["open", "-a", executable] + clean_args
+                command = ["open", "-a", executable] + clean_args if SYSTEM_NAME == "darwin" else [executable] + clean_args
                 if clean_target:
                     command.append(str(_safe_resolve_path(clean_target)))
                 subprocess.Popen(command)
 
-            return _ok(f"Launched application: {clean_app}", data={"app": clean_app, "args": clean_args, "target": clean_target})
+            return _ok(f"Launched application fallback: {clean_app}")
         except Exception as exc:
-            return _fail("Launch application failed.", str(exc))
+            return _fail("Launch application completely failed.", str(exc))
 
     def close_application(self, app_name: str, force: bool = True) -> Dict[str, Any]:
         clean_app = str(app_name or "").strip()
@@ -1248,31 +1328,32 @@ class UnifiedTaskBridge:
         try:
             target = clean_app
             if os.name == "nt":
+                normalized_app = self._normalize_app_alias(clean_app)
+                alias = WINDOWS_APP_ALIASES.get(normalized_app)
+                if alias and ":\\" not in alias: # Skip closing path-based aliases dynamically here
+                    exe_name = alias if alias.lower().endswith(".exe") else alias + ".exe"
+                    command = ["taskkill", "/IM", exe_name]
+                    if _to_bool(force, default=True):
+                        command.append("/F")
+                    completed = subprocess.run(command, capture_output=True, text=True, errors="replace", check=False)
+                    if completed.returncode == 0:
+                        return _ok(f"Closed known alias: {exe_name}")
+
                 if APPOPENER_AVAILABLE and appopener_close is not None:
-                    resolved_app_name = self._resolve_appopener_app_name(clean_app)
-                    if resolved_app_name:
-                        try:
-                            appopener_close(resolved_app_name, match_closest=False, output=False, throw_error=True)
-                            return _ok(f"Closed application: {clean_app}", data={"app": clean_app, "resolved_app": resolved_app_name, "launcher": "AppOpener"})
-                        except Exception:
-                            pass
+                    try:
+                        appopener_close(clean_app, match_closest=True, output=False, throw_error=True)
+                        return _ok(f"Close command sent via AppOpener: {clean_app}")
+                    except Exception:
+                        pass
 
-                alias = WINDOWS_APP_ALIASES.get(self._normalize_app_alias(clean_app))
-                if alias:
-                    target = alias
-
-                exe_name = Path(target).name
-                if not exe_name.lower().endswith(".exe"):
-                    exe_name += ".exe"
-
+                exe_name = target if target.lower().endswith(".exe") else target + ".exe"
                 command = ["taskkill", "/IM", exe_name]
                 if _to_bool(force, default=True):
                     command.append("/F")
-
-                completed = subprocess.run(command, capture_output=True, text=True, check=False)
+                completed = subprocess.run(command, capture_output=True, text=True, errors="replace", check=False)
                 output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
                 if completed.returncode == 0:
-                    return _ok(f"Closed application: {clean_app}", data={"app": clean_app, "output": output[:1200]})
+                    return _ok(f"Closed application: {clean_app}")
                 return _fail("Close application failed.", output[:1200] or f"exit_code={completed.returncode}")
 
             command = ["pkill", "-f", target]
@@ -1289,7 +1370,7 @@ class UnifiedTaskBridge:
         try:
             apps: List[str] = []
             if os.name == "nt":
-                completed = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, check=False)
+                completed = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, errors="replace", check=False)
                 if completed.returncode != 0:
                     return _fail("Could not list running applications.", (completed.stderr or "").strip())
                 reader = csv.reader((completed.stdout or "").splitlines())
@@ -1366,7 +1447,7 @@ class UnifiedTaskBridge:
                 if docx is None:
                     return _fail("python-docx is not available to read DOCX files.", "missing_dependency: python-docx")
                 try:
-                    document = docx.Document(str(path))
+                    document = Document(str(path))
                     text = "\n".join(p.text for p in document.paragraphs)
                 except Exception as exc:
                     return _fail("Could not parse DOCX file.", str(exc))
@@ -1759,7 +1840,13 @@ class UnifiedTaskBridge:
         try:
             action_name = str(action.get("action", "")).strip().lower()
             roots = _to_str_list(action.get("roots")) or None
-
+            
+            if action_name in {"launch_application", "open"}:
+                target_app = str(action.get("app") or action.get("name") or action.get("target") or "")
+                return self.launch_application(app_name=target_app, args=_to_str_list(action.get("args")) or None, target_path=str(action.get("path") or action.get("target_path") or ""))
+            if action_name in {"close_application", "close"}:
+                target_app = str(action.get("app") or action.get("name") or action.get("target") or "")
+                return self.close_application(app_name=target_app, force=_to_bool(action.get("force", True), default=True))
             if action_name == "list_system_roots":
                 return self.list_system_roots()
             if action_name == "search_mirror":
@@ -1784,10 +1871,6 @@ class UnifiedTaskBridge:
                 return self.copy_path(src=str(action.get("src") or action.get("source") or ""), dst=str(action.get("dst") or action.get("destination") or ""), overwrite=_to_bool(action.get("overwrite", False), default=False))
             if action_name == "delete_path":
                 return self.delete_path(path=str(action.get("path", "")), recursive=_to_bool(action.get("recursive", False), default=False), use_trash=_to_bool(action.get("use_trash", True), default=True))
-            if action_name == "launch_application":
-                return self.launch_application(app_name=str(action.get("app") or action.get("name") or ""), args=_to_str_list(action.get("args")) or None, target_path=str(action.get("path") or action.get("target_path") or ""))
-            if action_name == "close_application":
-                return self.close_application(app_name=str(action.get("app") or action.get("name") or ""), force=_to_bool(action.get("force", True), default=True))
             if action_name in {"list_running_apps", "list_running_applications"}:
                 return self.list_running_applications(max_results=int(action.get("max_results", 120) or 120))
             if action_name == "open_service":
@@ -1839,57 +1922,1183 @@ class UnifiedTaskBridge:
                 return self.send_whatsapp(to_number=str(action.get("to") or action.get("to_number") or ""), message=str(action.get("message") or action.get("text") or ""), use_twilio=_to_bool(action.get("use_twilio", False), default=False), twilio_account_sid=str(action.get("twilio_account_sid") or action.get("account_sid") or ""), twilio_auth_token=str(action.get("twilio_auth_token") or action.get("auth_token") or ""), twilio_from=str(action.get("twilio_from") or action.get("from") or ""), media_url=str(action.get("media_url", "")))
             if action_name == "online_query":
                 return self.connectivity.online_query(query=str(action.get("query", "")), max_results=int(action.get("max_results", 5) or 5))
-
+            if action_name in {"create_word_doc", "analyze_excel"}:
+                return execute_office_tool(action_name, action)
+            
             return _fail("Unknown tool action.", f"unsupported_action: {action_name}")
         except Exception as exc:
             return _fail("Tool dispatcher failed.", str(exc))
 
+# Instantiate single global task bridge for legacy wrapper methods
+_TASK_BRIDGE = UnifiedTaskBridge()
+
+def run_tool_action(action: Dict[str, Any]) -> Dict[str, Any]:
+    return _TASK_BRIDGE.execute_action(action)
 
 def search_files_by_hint(hint: str, roots: Optional[List[str]] = None, max_results: int = 20) -> Dict[str, Any]:
     return _TASK_BRIDGE.search_files_by_hint(hint=hint, roots=roots, max_results=max_results)
 
-
 def read_file_text(file_path: str, max_chars: int = 12000) -> Dict[str, Any]:
     return _TASK_BRIDGE.read_file_text(file_path=file_path, max_chars=max_chars)
-
 
 def open_file(file_path: str) -> Dict[str, Any]:
     return _TASK_BRIDGE.open_file(file_path=file_path)
 
-
 def move_mouse(x: int, y: int, duration: float = 0.2) -> Dict[str, Any]:
     return _TASK_BRIDGE.move_mouse(x=x, y=y, duration=duration)
-
 
 def click(button: str = "left", clicks: int = 1) -> Dict[str, Any]:
     return _TASK_BRIDGE.click(button=button, clicks=clicks)
 
-
 def type_text(text: str, interval: float = 0.01) -> Dict[str, Any]:
     return _TASK_BRIDGE.type_text(text=text, interval=interval)
-
 
 def press_key(key: str) -> Dict[str, Any]:
     return _TASK_BRIDGE.press_key(key=key)
 
-
 def hotkey(keys: List[str]) -> Dict[str, Any]:
     return _TASK_BRIDGE.hotkey(keys=keys)
 
+# -----------------------------------------------------------------------------
+# Action Command Handlers
+# -----------------------------------------------------------------------------
 
-_TASK_BRIDGE = UnifiedTaskBridge()
+class ExcelCommandHandler:
+    def __init__(self):
+        self.default_extension = ".xlsx"
+
+    def _load_or_create_workbook(self, path):
+        if os.path.exists(path):
+            return load_workbook(path)
+        return Workbook()
+
+    def _pick_sheet(self, workbook, sheet_name):
+        if not sheet_name:
+            return workbook.active
+        target_sheet = sheet_name.strip().strip('"').strip("'")
+        if target_sheet in workbook.sheetnames:
+            return workbook[target_sheet]
+        return workbook.create_sheet(target_sheet)
+
+    def _to_value(self, raw_value):
+        value = raw_value.strip()
+        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+            return value[1:-1]
+        if value.lower() == "true":
+            return True
+        if value.lower() == "false":
+            return False
+        if re.fullmatch(r"-?\d+", value):
+            return int(value)
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        return value
+
+    def _ensure_formula_prefix(self, formula_text):
+        cleaned_formula = formula_text.strip()
+        return cleaned_formula if cleaned_formula.startswith("=") else "=" + cleaned_formula
+
+    def _create_random_table_with_chart(self, file_name, rows=10, cols=10):
+        file_path = _normalize_office_path(file_name, self.default_extension)
+        workbook = self._load_or_create_workbook(file_path)
+        sheet = self._pick_sheet(workbook, "RandomData")
+
+        if sheet.max_row > 0:
+            sheet.delete_rows(1, sheet.max_row)
+        if sheet.max_column > 0:
+            sheet.delete_cols(1, sheet.max_column)
+        sheet._charts = []
+
+        for row in range(1, rows + 1):
+            for col in range(1, cols + 1):
+                sheet.cell(row=row, column=col, value=random.randint(10, 99))
+
+        chart = LineChart()
+        chart.title = f"Random Data {rows}x{cols}"
+        chart.style = 10
+        chart.y_axis.title = "Value"
+        chart.x_axis.title = "Row"
+
+        data_ref = Reference(sheet, min_col=1, min_row=1, max_col=cols, max_row=rows)
+        category_ref = Reference(sheet, min_col=1, min_row=1, max_row=rows)
+        chart.add_data(data_ref, titles_from_data=False)
+        chart.set_categories(category_ref)
+
+        chart_anchor = f"{get_column_letter(cols + 2)}2"
+        sheet.add_chart(chart, chart_anchor)
+
+        workbook.save(file_path)
+        print(f"[ACTION][EXCEL] Random {rows}x{cols} table + chart created in {file_path}")
+
+        try:
+            if _open_with_default_app(file_path):
+                print("[ACTION][EXCEL] Opened workbook in available spreadsheet software.")
+            else:
+                print("[ACTION][EXCEL] Workbook created, but opening the file failed.")
+        except Exception as e:
+            print(f"[ACTION][EXCEL] Workbook created but auto-open failed: {e}")
+
+    def handle(self, text):
+        random_nl_match = re.fullmatch(
+            r"(?:create|make)\s+an?\s+excel\s+workbook\s+with\s+(\d+)x(\d+)\s+table\s+with\s+random\s+data\s+and\s+then\s+create\s+(?:the\s+)?graph\s+from\s+it(?:\s+in\s+available\s+software)?(?:\s+in\s+(.+?))?\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if random_nl_match:
+            rows, cols, file_name = random_nl_match.groups()
+            rows = int(rows)
+            cols = int(cols)
+            if rows > 100 or cols > 50 or rows <= 0 or cols <= 0:
+                print("[ACTION][EXCEL] Table size out of supported range. Use 1..100 rows and 1..50 columns.")
+                return True
+            target_file = file_name or "random_chart_demo.xlsx"
+            self._create_random_table_with_chart(target_file, rows=rows, cols=cols)
+            return True
+
+        random_cmd_match = re.fullmatch(
+            r"excel\s+random\s+table\s+(\d+)x(\d+)\s+with\s+graph(?:\s+in\s+(.+?))?\s*$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if random_cmd_match:
+            rows, cols, file_name = random_cmd_match.groups()
+            rows, cols = int(rows), int(cols)
+            if rows > 100 or cols > 50 or rows <= 0 or cols <= 0:
+                print("[ACTION][EXCEL] Table size out of supported range. Use 1..100 rows and 1..50 columns.")
+                return True
+            target_file = file_name or "random_chart_demo.xlsx"
+            self._create_random_table_with_chart(target_file, rows=rows, cols=cols)
+            return True
+
+        if re.fullmatch(r"excel\s+demo\s+table\s+graph(?:\s+in\s+(.+?))?\s*$", text, flags=re.IGNORECASE):
+            demo_file_match = re.fullmatch(r"excel\s+demo\s+table\s+graph(?:\s+in\s+(.+?))?\s*$", text, flags=re.IGNORECASE)
+            target_file = demo_file_match.group(1) if demo_file_match else "random_chart_demo.xlsx"
+            self._create_random_table_with_chart(target_file, rows=10, cols=10)
+            return True
+
+        open_match = re.fullmatch(r"excel\s+(?:create|open)\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+        if open_match:
+            file_path = _normalize_office_path(open_match.group(1), self.default_extension)
+            workbook = self._load_or_create_workbook(file_path)
+            workbook.save(file_path)
+            print(f"[ACTION][EXCEL] Ready: {file_path}")
+            return True
+
+        create_sheet_match = re.fullmatch(r"excel\s+create\s+sheet\s+(.+?)\s+in\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+        if create_sheet_match:
+            sheet_name, file_name = create_sheet_match.groups()
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            workbook = self._load_or_create_workbook(file_path)
+            target_sheet = sheet_name.strip().strip('"').strip("'")
+            if target_sheet not in workbook.sheetnames:
+                workbook.create_sheet(target_sheet)
+                workbook.save(file_path)
+                print(f"[ACTION][EXCEL] Sheet '{target_sheet}' created in {file_path}")
+            else:
+                print(f"[ACTION][EXCEL] Sheet '{target_sheet}' already exists in {file_path}")
+            return True
+
+        list_sheets_match = re.fullmatch(r"excel\s+list\s+sheets\s+in\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+        if list_sheets_match:
+            file_name = list_sheets_match.group(1)
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            workbook = self._load_or_create_workbook(file_path)
+            print(f"[ACTION][EXCEL] Sheets in {file_path}: {', '.join(workbook.sheetnames)}")
+            return True
+
+        set_match = re.fullmatch(r"excel\s+set\s+([a-zA-Z]+\d+)\s+to\s+(.+?)\s+in\s+(.+?)(?:\s+sheet\s+(.+))?", text, flags=re.IGNORECASE)
+        if set_match:
+            cell, value_text, file_name, sheet_name = set_match.groups()
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            workbook = self._load_or_create_workbook(file_path)
+            sheet = self._pick_sheet(workbook, sheet_name)
+            sheet[cell.upper()] = self._to_value(value_text)
+            workbook.save(file_path)
+            print(f"[ACTION][EXCEL] {cell.upper()} updated in {file_path}")
+            return True
+
+        get_match = re.fullmatch(r"excel\s+get\s+([a-zA-Z]+\d+)\s+in\s+(.+?)(?:\s+sheet\s+(.+))?", text, flags=re.IGNORECASE)
+        if get_match:
+            cell, file_name, sheet_name = get_match.groups()
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            workbook = self._load_or_create_workbook(file_path)
+            sheet = self._pick_sheet(workbook, sheet_name)
+            _ = sheet[cell.upper()].value
+            print(f"[ACTION][EXCEL] {cell.upper()} retrieved from {file_path}. Content hidden by policy.")
+            return True
+
+        row_match = re.fullmatch(r"excel\s+add\s+row\s+(.+?)\s+in\s+(.+?)(?:\s+sheet\s+(.+))?", text, flags=re.IGNORECASE)
+        if row_match:
+            row_values_text, file_name, sheet_name = row_match.groups()
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            workbook = self._load_or_create_workbook(file_path)
+            sheet = self._pick_sheet(workbook, sheet_name)
+            try:
+                parsed_row = next(csv.reader(StringIO(row_values_text)), [])
+            except csv.Error:
+                print("[ACTION][EXCEL] Row input is malformed. Use comma-separated values, e.g. apple,10,done.")
+                return True
+            if not parsed_row or all(not item.strip() for item in parsed_row):
+                print("[ACTION][EXCEL] No valid row values provided. Use comma-separated values.")
+                return True
+            sheet.append([self._to_value(item.strip()) for item in parsed_row])
+            workbook.save(file_path)
+            print(f"[ACTION][EXCEL] Row added in {file_path}")
+            return True
+
+        delete_row_match = re.fullmatch(r"excel\s+delete\s+row\s+(\d+)\s+in\s+(.+?)(?:\s+sheet\s+(.+))?", text, flags=re.IGNORECASE)
+        if delete_row_match:
+            row_number, file_name, sheet_name = delete_row_match.groups()
+            row_number = int(row_number)
+            if row_number <= 0:
+                print("[ACTION][EXCEL] Row number must be 1 or greater.")
+                return True
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            workbook = self._load_or_create_workbook(file_path)
+            sheet = self._pick_sheet(workbook, sheet_name)
+            sheet.delete_rows(row_number, 1)
+            workbook.save(file_path)
+            print(f"[ACTION][EXCEL] Row {row_number} deleted in {file_path}")
+            return True
+
+        delete_col_match = re.fullmatch(r"excel\s+delete\s+column\s+([a-zA-Z]+)\s+in\s+(.+?)(?:\s+sheet\s+(.+))?", text, flags=re.IGNORECASE)
+        if delete_col_match:
+            col_letters, file_name, sheet_name = delete_col_match.groups()
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            workbook = self._load_or_create_workbook(file_path)
+            sheet = self._pick_sheet(workbook, sheet_name)
+            col_letters = col_letters.upper()
+            col_index = 0
+            for ch in col_letters:
+                col_index = col_index * 26 + (ord(ch) - ord("A") + 1)
+            sheet.delete_cols(col_index, 1)
+            workbook.save(file_path)
+            print(f"[ACTION][EXCEL] Column {col_letters} deleted in {file_path}")
+            return True
+
+        sum_match = re.fullmatch(r"excel\s+sum\s+([a-zA-Z]+\d+:[a-zA-Z]+\d+)\s+in\s+(.+?)\s+to\s+([a-zA-Z]+\d+)(?:\s+sheet\s+(.+))?", text, flags=re.IGNORECASE)
+        if sum_match:
+            source_range, file_name, target_cell, sheet_name = sum_match.groups()
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            workbook = self._load_or_create_workbook(file_path)
+            sheet = self._pick_sheet(workbook, sheet_name)
+            sheet[target_cell.upper()] = self._ensure_formula_prefix(f"SUM({source_range.upper()})")
+            workbook.save(file_path)
+            print(f"[ACTION][SUM] Sum {source_range.upper()} -> {target_cell.upper()} in {file_path}")
+            return True
+
+        formula_match = re.fullmatch(r"excel\s+formula\s+([a-zA-Z]+\d+)\s*=\s*(.+?)\s+in\s+(.+?)(?:\s+sheet\s+(.+))?", text, flags=re.IGNORECASE)
+        if formula_match:
+            target_cell, formula_text, file_name, sheet_name = formula_match.groups()
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            workbook = self._load_or_create_workbook(file_path)
+            sheet = self._pick_sheet(workbook, sheet_name)
+            sheet[target_cell.upper()] = self._ensure_formula_prefix(formula_text)
+            workbook.save(file_path)
+            print(f"[ACTION][EXCEL] Formula set in {target_cell.upper()} for {file_path}")
+            return True
+
+        if re.fullmatch(r"excel\s+help", text, flags=re.IGNORECASE):
+            print("[ACTION][EXCEL] Commands:")
+            for command in EXCEL_HELP_COMMANDS:
+                print(f"- {command}")
+            return True
+
+        return False
 
 
-def run_tool_action(action: Dict[str, Any]) -> Dict[str, Any]:
-    """Dispatches tool actions produced by the agent."""
-    return _TASK_BRIDGE.execute_action(action)
+class WordCommandHandler:
+    def __init__(self):
+        self.default_extension = ".docx"
 
+    def _load_or_create_doc(self, path):
+        if not DOCX_AVAILABLE:
+            return None
+        if os.path.exists(path):
+            return Document(path)
+        return Document()
+
+    def handle(self, text):
+        if not DOCX_AVAILABLE:
+            if text.lower().startswith("word "):
+                print("[ACTION][WORD] python-docx is not installed. Run: pip install python-docx")
+                return True
+            return False
+
+        create_match = re.fullmatch(r"word\s+(?:create|open)\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+        if create_match:
+            file_path = _normalize_office_path(create_match.group(1), self.default_extension)
+            doc = self._load_or_create_doc(file_path)
+            doc.save(file_path)
+            print(f"[ACTION][WORD] Ready: {file_path}")
+            return True
+
+        paragraph_match = re.fullmatch(r"word\s+add\s+paragraph\s+(.+?)\s+in\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+        if paragraph_match:
+            paragraph_text, file_name = paragraph_match.groups()
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            doc = self._load_or_create_doc(file_path)
+            content = paragraph_text.strip().strip('"').strip("'")
+            doc.add_paragraph(content)
+            doc.save(file_path)
+            print(f"[ACTION][WORD] Paragraph added in {file_path}")
+            return True
+
+        heading_match = re.fullmatch(r"word\s+add\s+heading\s+(.+?)(?:\s+level\s+([1-6]))?\s+in\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+        if heading_match:
+            heading_text, level_text, file_name = heading_match.groups()
+            level = int(level_text) if level_text else 1
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            doc = self._load_or_create_doc(file_path)
+            content = heading_text.strip().strip('"').strip("'")
+            doc.add_heading(content, level=level)
+            doc.save(file_path)
+            print(f"[ACTION][WORD] Heading (level {level}) added in {file_path}")
+            return True
+
+        read_match = re.fullmatch(r"word\s+read\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+        if read_match:
+            file_path = _normalize_office_path(read_match.group(1), self.default_extension)
+            if not os.path.exists(file_path):
+                print(f"[ACTION][WORD] File not found: {file_path}")
+                return True
+            doc = self._load_or_create_doc(file_path)
+            print(f"[ACTION][WORD] Document read from {file_path}. Content hidden by policy.")
+            return True
+
+        if re.fullmatch(r"word\s+help", text, flags=re.IGNORECASE):
+            print("[ACTION][WORD] Commands:")
+            for command in WORD_HELP_COMMANDS:
+                print(f"- {command}")
+            return True
+
+        return False
+
+
+class PowerPointCommandHandler:
+    def __init__(self):
+        self.default_extension = ".pptx"
+
+    def _load_or_create_presentation(self, path):
+        if not POWERPOINT_AVAILABLE:
+            return None
+        if os.path.exists(path):
+            return Presentation(path)
+        return Presentation()
+
+    def handle(self, text):
+        if not POWERPOINT_AVAILABLE:
+            if text.lower().startswith("powerpoint "):
+                print("[ACTION][PPT] python-pptx is not installed. Run: pip install python-pptx")
+                return True
+            return False
+
+        create_match = re.fullmatch(r"powerpoint\s+(?:create|open)\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+        if create_match:
+            file_path = _normalize_office_path(create_match.group(1), self.default_extension)
+            prs = self._load_or_create_presentation(file_path)
+            prs.save(file_path)
+            print(f"[ACTION][PPT] Ready: {file_path}")
+            return True
+
+        slide_match = re.fullmatch(r"powerpoint\s+add\s+slide\s+title\s+(.+?)\s+content\s+(.+?)\s+in\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+        if slide_match:
+            title_text, content_text, file_name = slide_match.groups()
+            file_path = _normalize_office_path(file_name, self.default_extension)
+            prs = self._load_or_create_presentation(file_path)
+            layout = prs.slide_layouts[1] if len(prs.slide_layouts) > 1 else prs.slide_layouts[0]
+            slide = prs.slides.add_slide(layout)
+
+            title_box = getattr(slide.shapes, "title", None)
+            if title_box:
+                title_box.text = title_text.strip().strip('"').strip("'")
+
+            if len(slide.placeholders) > 1:
+                slide.placeholders[1].text = content_text.strip().strip('"').strip("'")
+
+            prs.save(file_path)
+            print(f"[ACTION][PPT] Slide added in {file_path}")
+            return True
+
+        launch_match = re.fullmatch(r"powerpoint\s+launch\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+        if launch_match:
+            file_path = _normalize_office_path(launch_match.group(1), self.default_extension)
+            if not os.path.exists(file_path):
+                print(f"[ACTION][PPT] File not found: {file_path}")
+                return True
+            try:
+                if _open_with_default_app(file_path):
+                    print(f"[ACTION][PPT] Opened {file_path}")
+                else:
+                    print(f"[ACTION][PPT] Failed to open {file_path}")
+            except Exception as e:
+                print(f"[ACTION][PPT] Failed to open: {e}")
+            return True
+
+        if re.fullmatch(r"powerpoint\s+help", text, flags=re.IGNORECASE):
+            print("[ACTION][PPT] Commands:")
+            for command in POWERPOINT_HELP_COMMANDS:
+                print(f"- {command}")
+            return True
+
+        return False
+
+
+class ActionHandler:
+    @staticmethod
+    def get_supported_command_sections():
+        return {
+            "General task commands": list(GENERAL_TASK_COMMANDS),
+            "File system commands": list(FILE_SYSTEM_COMMANDS),
+            "Software control commands": list(SOFTWARE_COMMANDS),
+            "Communication commands": list(COMMUNICATION_COMMANDS),
+            "Clipboard commands": list(CLIPBOARD_COMMANDS),
+            "System commands": list(SYSTEM_COMMANDS),
+            "Office quick help": list(OFFICE_HELP_COMMANDS),
+            "Excel commands": list(EXCEL_HELP_COMMANDS),
+            "Word commands": list(WORD_HELP_COMMANDS),
+            "PowerPoint commands": list(POWERPOINT_HELP_COMMANDS),
+            "Assistant JSON command format": list(ASSISTANT_JSON_ACTIONS),
+            "Assistant tool actions (action field)": list(ASSISTANT_TOOL_ACTIONS),
+            "Assistant tool call examples": list(ASSISTANT_TOOL_EXAMPLES),
+        }
+
+    def __init__(self, db=None, context_provider=None):
+        self._explicit_db = db
+        self._db_instance = None
+        self.context_provider = context_provider
+        self.excel = ExcelCommandHandler()
+        self.word = WordCommandHandler()
+        self.powerpoint = PowerPointCommandHandler()
+        action_cfg = CONFIG.get("actions", {})
+        self.safe_mode = bool(action_cfg.get("safe_mode", False))
+        self.allow_legacy_text_commands = bool(action_cfg.get("allow_legacy_text_commands", True))
+
+    @property
+    def db(self):
+        if self._explicit_db is not None:
+            return self._explicit_db
+        if self._db_instance is None:
+            try:
+                from aiassistant.infra.db.database_manager import DatabaseManager
+                db_file_path = str(CONFIG.get("paths", {}).get("db_path", "cache/assistant_sessions.db"))
+                self._db_instance = DatabaseManager(db_path=db_file_path)
+            except Exception as e:
+                print(f"[ACTION][INIT] Lazy database fallback assignment failed: {e}")
+                self._db_instance = None
+        return self._db_instance
+
+    def execute_and_collect(self, text):
+        if not text:
+            return ""
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            try:
+                self.execute(text)
+            except Exception as e:
+                print(f"[ACTION ERROR] {e}")
+        return buffer.getvalue().strip()
+
+    def _looks_like_action_command(self, text):
+        if not text:
+            return False
+        lowered = text.strip().lower()
+        prefixes = (
+            "files ", "software ", "service ", "email ", "telegram ", "whatsapp ",
+            "search file ", "find file ", "locate file ", "open file ", "open folder ",
+            "open document ", "open ", "close ", "play ", "write ", "note ", "type ",
+            "take a note ", "search web ", "open website ", "browse ", "excel ",
+            "word ", "powerpoint ", "research ", "web research ", "system check",
+            "check system", "scan apps", "update apps", "copy selected text",
+            "copy now", "paste clipboard", "paste now", "save clipboard to rad as ",
+            "malware scan", "scan for malware", "run malware scan", "security quick scan",
+        )
+        if lowered.startswith(prefixes):
+            return True
+        if re.search(r"\b(?:open|close)\b\s+[a-z0-9]", lowered):
+            return True
+        if re.search(r"\b(?:open|search|find|locate|look\s+for)\b.*\b(?:file|files|folder|folders|document|documents|path)\b", lowered):
+            return True
+        return any(token in lowered for token in ("volume up", "volume down", "mute", "unmute"))
+
+    @staticmethod
+    def _looks_like_file_hint(raw_text):
+        clean = str(raw_text or "").strip().lower()
+        if not clean:
+            return False
+
+        if re.search(r"^[a-z]:\\", clean):
+            return True
+        if "\\" in clean or "/" in clean:
+            return True
+        if re.search(r"\.[a-z0-9]{1,6}\b", clean):
+            return True
+
+        file_tokens = (
+            " file", "files ", "folder", "document", "directory", "path",
+            "report", "notes", "draft", "summary", "invoice", "project",
+        )
+        return any(token in clean for token in file_tokens)
+
+    def _print_system_check(self):
+        checks = {
+            "Python": True,
+            "Reasoning Server Module": importlib.util.find_spec("aiassistant.backend.server_reasoning") is not None,
+            "Voice Server Module": importlib.util.find_spec("aiassistant.backend.server_voice") is not None,
+            "Piper Folder": os.path.isdir("piper"),
+            "Models Folder": os.path.isdir("models"),
+            "RVC Models Folder": os.path.isdir("rvc_models"),
+            "Internet Library (requests)": REQUESTS_AVAILABLE,
+            "Clipboard Library (pyperclip)": CLIPBOARD_AVAILABLE,
+        }
+
+        print("[ACTION][SYSTEM] Quick Check:")
+        for name, is_ok in checks.items():
+            state = "OK" if is_ok else "MISSING"
+            print(f"- {name}: {state}")
+
+    def _run_quick_malware_scan(self):
+        print("[ACTION][SECURITY] Starting Windows Defender quick scan...")
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "Start-MpScan -ScanType QuickScan"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print("[ACTION][SECURITY] Quick scan request sent to Windows Defender.")
+        except Exception as e:
+            print(f"[ACTION][SECURITY] Could not start Defender scan: {e}")
+
+    def _extract_key_points(self, text, max_points=5):
+        if not text:
+            return []
+
+        chunks = re.split(r"(?<=[.!?])\s+", text)
+        points = []
+        for chunk in chunks:
+            cleaned = re.sub(r"\s+", " ", chunk).strip(" -\n\t")
+            if len(cleaned) < 30:
+                continue
+            if cleaned in points:
+                continue
+            points.append(cleaned)
+            if len(points) >= max_points:
+                break
+        return points
+
+    def _store_web_points_to_rad(self, query, points, source_url=""):
+        if not self.db or not hasattr(self.db, "add_rad_data_if_new"):
+            return 0
+
+        slug = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")[:32] or "query"
+        stored_count = 0
+
+        for idx, point in enumerate(points, start=1):
+            key = f"web_{slug}_{idx}"
+            if self.db.add_rad_data_if_new("web_fact", key, point, 0.78):
+                stored_count += 1
+
+        if source_url:
+            if self.db.add_rad_data_if_new("web_source", f"source_{slug}", source_url, 0.95):
+                stored_count += 1
+
+        return stored_count
+
+    def _fetch_web_text(self, url):
+        if not REQUESTS_AVAILABLE:
+            return ""
+
+        response = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MARIE/1.0)"},
+            timeout=12,
+        )
+        response.raise_for_status()
+
+        html_text = response.text
+        if BS4_AVAILABLE:
+            soup = BeautifulSoup(html_text, "html.parser")
+            paragraphs = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
+            joined = " ".join(paragraphs)
+            return re.sub(r"\s+", " ", joined).strip()
+
+        no_scripts = re.sub(r"<script[\s\S]*?</script>", " ", html_text, flags=re.IGNORECASE)
+        no_styles = re.sub(r"<style[\s\S]*?</style>", " ", no_scripts, flags=re.IGNORECASE)
+        plain = re.sub(r"<[^>]+>", " ", no_styles)
+        return re.sub(r"\s+", " ", plain).strip()
+
+    def _research_and_store_web_data(self, query):
+        if not REQUESTS_AVAILABLE:
+            print("[ACTION][WEB] requests is not installed. Run: pip install requests")
+            return
+
+        query = query.strip()
+        if not query:
+            print("[ACTION][WEB] Missing query. Example: web research latest AI trends")
+            return
+
+        source_url = ""
+        combined_text = ""
+
+        try:
+            if query.startswith(("http://", "https://")):
+                source_url = query
+                combined_text = self._fetch_web_text(source_url)
+            else:
+                ddg_url = "https://api.duckduckgo.com/"
+                response = requests.get(
+                    ddg_url,
+                    params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+                    timeout=10,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                abstract = data.get("AbstractText", "")
+                source_url = data.get("AbstractURL", "")
+                related_lines = []
+                for item in data.get("RelatedTopics", [])[:10]:
+                    if isinstance(item, dict) and item.get("Text"):
+                        related_lines.append(item["Text"])
+                    elif isinstance(item, dict) and item.get("Topics"):
+                        for sub in item.get("Topics", [])[:5]:
+                            if isinstance(sub, dict) and sub.get("Text"):
+                                related_lines.append(sub["Text"])
+
+                combined_text = " ".join([abstract] + related_lines)
+
+                if source_url:
+                    fetched_page_text = self._fetch_web_text(source_url)
+                    if fetched_page_text:
+                        combined_text = f"{combined_text} {fetched_page_text}"
+
+            points = self._extract_key_points(combined_text, max_points=6)
+            if not points:
+                print("[ACTION][WEB] Could not extract useful points from the web result.")
+                return
+
+            print(f"[ACTION][WEB] Key points for '{query}':")
+            for idx, point in enumerate(points, start=1):
+                print(f"{idx}. {point}")
+
+            stored_count = self._store_web_points_to_rad(query, points, source_url)
+            if stored_count > 0:
+                print(f"[ACTION][RAD] Stored {stored_count} web-derived memory items.")
+
+            if CLIPBOARD_AVAILABLE:
+                pyperclip.copy("\n".join(points))
+                print("[ACTION][WEB] Copied key points to clipboard.")
+        except Exception as e:
+            print(f"[ACTION][WEB] Research failed: {e}")
+
+    def _open_text_editor(self):
+        try:
+            if IS_WINDOWS:
+                os.system("start notepad")
+                return
+            if SYSTEM_NAME == "darwin":
+                subprocess.Popen(["open", "-a", "TextEdit"])
+                return
+
+            for editor in ("gedit", "kate", "mousepad", "xed"):
+                if shutil.which(editor):
+                    subprocess.Popen([editor])
+                    return
+        except Exception as e:
+            print(f"[ACTION] Could not open text editor: {e}")
+
+    def _extract_json_action(self, text):
+        if not text:
+            return None
+
+        candidates = []
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            candidates.append(stripped)
+
+        fenced = re.findall(r"```json\s*(\{[\s\S]*?\})\s*```", text, flags=re.IGNORECASE)
+        candidates.extend(fenced)
+
+        loose = re.findall(r"(\{\s*\"action\"[\s\S]*?\})", text)
+        candidates.extend(loose)
+
+        for candidate in candidates:
+            try:
+                obj = json.loads(candidate)
+            except Exception:
+                continue
+
+            if not isinstance(obj, dict):
+                continue
+
+            action = str(obj.get("action", "")).strip().lower()
+            target = str(obj.get("target", "")).strip()
+            value = obj.get("value", "")
+            if action in {"open", "close", "search_web", "open_website", "volume", "write_note", "play"}:
+                return {"action": action, "target": target, "value": value}
+
+        return None
+
+    def _print_tool_bridge_result(self, result):
+        if not isinstance(result, dict):
+            print(f"[ACTION][TOOLS] {result}")
+            return False
+
+        ok = bool(result.get("success", False))
+        prefix = "[ACTION][TOOLS]" if ok else "[ACTION][TOOLS][ERROR]"
+        message = str(result.get("message", "")).strip()
+        low_message = message.lower()
+        hide_zero_match = "found 0 lexical file match" in low_message
+        if message and not hide_zero_match:
+            print(f"{prefix} {message}")
+
+        payload = result.get("data")
+        payload_has_value = payload not in (None, [], {}, "")
+        if TOOL_BRIDGE_VERBOSE and payload_has_value:
+            try:
+                text = json.dumps(payload, ensure_ascii=True)
+            except Exception:
+                text = str(payload)
+            if len(text) > 1800:
+                text = text[:1800] + "..."
+            print(f"{prefix} Data: {text}")
+
+        error = str(result.get("error", "")).strip()
+        if error and not ok:
+            print(f"{prefix} {error}")
+        return ok
+
+    def _run_tool_bridge_action(self, action):
+        try:
+            result = run_tool_action(action)
+            return self._print_tool_bridge_result(result)
+        except Exception as e:
+            print(f"[ACTION][TOOLS][ERROR] {e}")
+            return False
+
+    def _handle_extended_tool_commands(self, raw_text):
+        if not raw_text:
+            return False
+
+        lowered = raw_text.strip().lower()
+
+        natural_search_match = re.search(
+            r"\b(?:search|find|locate|look\s+for)\b.*?\b(?:file|files|folder|folders|document|documents|path)\b\s+(.+)$",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if natural_search_match and "website" not in lowered and "search web" not in lowered:
+            hint = natural_search_match.group(1).strip().strip('"').strip("'")
+            if hint:
+                self._run_tool_bridge_action({"action": "search_file", "hint": hint, "max_results": 20, "include_content": True})
+                return True
+
+        natural_open_match = re.search(r"\bopen\b.*?\b(?:file|folder|document|path)\b\s+(.+)$", raw_text, flags=re.IGNORECASE)
+        if natural_open_match and "website" not in lowered:
+            target_hint = natural_open_match.group(1).strip().strip('"').strip("'")
+            if target_hint:
+                self._run_tool_bridge_action({"action": "open_file", "path": target_hint, "resolve_by_hint": True, "include_content": True})
+                return True
+
+        natural_open_app_match = re.search(r"\b(?:open|launch|start|run)\b\s+(.+)$", raw_text, flags=re.IGNORECASE)
+        if natural_open_app_match:
+            if not re.search(r"\b(file|files|folder|folders|document|documents|path)\b", lowered):
+                app_target = natural_open_app_match.group(1).strip().strip('"').strip("'")
+                app_target = re.sub(r"\b(?:please|now|for\s+me|thanks|thank\s+you)\b", " ", app_target, flags=re.IGNORECASE)
+                app_target = re.sub(r"\b(?:app|application|software|program)\b", " ", app_target, flags=re.IGNORECASE)
+                app_target = re.sub(r"^(?:the|a|an)\s+", "", app_target, flags=re.IGNORECASE)
+                app_target = re.sub(r"\s+", " ", app_target).strip()
+                if app_target and "website" not in app_target.lower():
+                    if re.search(r"(?:https?://|www\.|\.[a-z]{2,6}(?:/|$))", app_target, flags=re.IGNORECASE):
+                        url = app_target if app_target.startswith("http") else f"https://{app_target}"
+                        webbrowser.open(url)
+                    else:
+                        self._run_tool_bridge_action({"action": "launch_application", "app": app_target})
+                    return True
+
+        natural_close_app_match = re.search(r"\b(?:close|quit|exit|kill|terminate)\b\s+(.+)$", raw_text, flags=re.IGNORECASE)
+        if natural_close_app_match:
+            if not re.search(r"\b(file|files|folder|folders|document|documents|path)\b", lowered):
+                close_target = natural_close_app_match.group(1).strip().strip('"').strip("'")
+                close_target = re.sub(r"\b(?:please|now|for\s+me|thanks|thank\s+you)\b", " ", close_target, flags=re.IGNORECASE)
+                close_target = re.sub(r"\b(?:app|application|software|program)\b", " ", close_target, flags=re.IGNORECASE)
+                close_target = re.sub(r"^(?:the|a|an)\s+", "", close_target, flags=re.IGNORECASE)
+                close_target = re.sub(r"\s+", " ", close_target).strip()
+                if close_target:
+                    self._run_tool_bridge_action({"action": "close_application", "app": close_target})
+                    return True
+
+        if re.fullmatch(r"files\s+roots\s*", raw_text, flags=re.IGNORECASE):
+            self._run_tool_bridge_action({"action": "list_system_roots"})
+            return True
+
+        match = re.fullmatch(r"files\s+list\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action({"action": "list_directory", "path": match.group(1).strip(), "max_results": 120})
+            return True
+
+        match = re.fullmatch(r"files\s+deep\s+search\s+(.+?)(?:\s+in\s+(.+))?\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            query, root = match.groups()
+            action = {"action": "deep_search", "query": query.strip(), "max_results": 40, "include_content": True}
+            if root:
+                action["roots"] = [root.strip()]
+            else:
+                action["include_all_drives"] = True
+            self._run_tool_bridge_action(action)
+            return True
+
+        match = re.fullmatch(r"files\s+analyze\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action({"action": "analyze_path", "path": match.group(1).strip()})
+            return True
+
+        match = re.fullmatch(r"files\s+create\s+file\s+(.+?)(?:\s+content\s+(.+))?\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            path, content = match.groups()
+            self._run_tool_bridge_action({"action": "create_path", "path": path.strip(), "kind": "file", "content": (content or "").strip(), "overwrite": False})
+            return True
+
+        match = re.fullmatch(r"files\s+create\s+(?:folder|dir|directory)\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action({"action": "create_path", "path": match.group(1).strip(), "kind": "directory"})
+            return True
+
+        match = re.fullmatch(r"files\s+move\s+(.+?)\s*->\s*(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            src, dst = match.groups()
+            self._run_tool_bridge_action({"action": "move_path", "src": src.strip(), "dst": dst.strip()})
+            return True
+
+        match = re.fullmatch(r"files\s+copy\s+(.+?)\s*->\s*(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            src, dst = match.groups()
+            self._run_tool_bridge_action({"action": "copy_path", "src": src.strip(), "dst": dst.strip()})
+            return True
+
+        match = re.fullmatch(r"files\s+(?:delete|remove)\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action({"action": "delete_path", "path": match.group(1).strip(), "recursive": True, "use_trash": True})
+            return True
+
+        match = re.fullmatch(r"files\s+open\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action({"action": "open_file", "path": match.group(1).strip(), "resolve_by_hint": True, "include_content": True})
+            return True
+
+        match = re.fullmatch(r"software\s+open\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action({"action": "launch_application", "app": match.group(1).strip()})
+            return True
+
+        match = re.fullmatch(r"software\s+close\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action({"action": "close_application", "app": match.group(1).strip()})
+            return True
+
+        if re.fullmatch(r"software\s+running\s*", raw_text, flags=re.IGNORECASE):
+            self._run_tool_bridge_action({"action": "list_running_apps", "max_results": 120})
+            return True
+
+        match = re.fullmatch(r"service\s+open\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            self._run_tool_bridge_action({"action": "open_service", "service": match.group(1).strip()})
+            return True
+
+        match = re.fullmatch(r"email\s+(draft|send)\s+to\s+(.+?)\s+subject\s+(.+?)\s+body\s+(.+?)(?:\s+attach\s+(.+?))?(?:\s+provider\s+(gmail|outlook|custom))?\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            mode, to_email, subject, body, attachment, provider = match.groups()
+            payload = {
+                "action": "send_email",
+                "to": to_email.strip(),
+                "subject": subject.strip(),
+                "body": body.strip(),
+                "provider": (provider or ("outlook" if IS_WINDOWS else "gmail")).strip(),
+                "send_now": mode.strip().lower() == "send",
+            }
+            if attachment:
+                payload["attachments"] = [attachment.strip()]
+            self._run_tool_bridge_action(payload)
+            return True
+
+        match = re.fullmatch(r"telegram\s+send\s+to\s+(.+?)\s+token\s+(.+?)\s+message\s+(.+)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            chat_id, token, message = match.groups()
+            self._run_tool_bridge_action({"action": "send_telegram", "chat_id": chat_id.strip(), "bot_token": token.strip(), "message": message.strip()})
+            return True
+
+        match = re.fullmatch(r"telegram\s+file\s+(.+?)\s+to\s+(.+?)\s+token\s+(.+?)(?:\s+caption\s+(.+))?\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            file_hint, chat_id, token, caption = match.groups()
+            self._run_tool_bridge_action({"action": "send_telegram", "chat_id": chat_id.strip(), "bot_token": token.strip(), "file_hint": file_hint.strip(), "message": (caption or "").strip()})
+            return True
+
+        match = re.fullmatch(r"whatsapp\s+send\s+to\s+(.+?)\s+message\s+(.+)\s*$", raw_text, flags=re.IGNORECASE)
+        if match:
+            to_number, message = match.groups()
+            self._run_tool_bridge_action({"action": "send_whatsapp", "to": to_number.strip(), "message": message.strip()})
+            return True
+
+        return False
+
+    def _execute_json_action(self, action_obj):
+        action = action_obj.get("action", "")
+        target = (action_obj.get("target") or "").strip()
+        value = action_obj.get("value", "")
+
+        if action == "open":
+            return self._run_tool_bridge_action({"action": "launch_application", "app": target})
+
+        if action == "close":
+            return self._run_tool_bridge_action({"action": "close_application", "app": target})
+
+        if action == "search_web":
+            if not target:
+                return False
+            search_url = f"https://duckduckgo.com/?q={quote_plus(target)}"
+            webbrowser.open(search_url)
+            print(f"[ACTION][WEB] Searching web for: {target}")
+            return True
+
+        if action == "open_website":
+            if not target:
+                return False
+            url = target if target.startswith(("http://", "https://")) else "https://" + target
+            webbrowser.open(url)
+            print(f"[ACTION][WEB] Opened {url}")
+            return True
+
+        if action == "volume":
+            value_text = f"{target} {value}".lower()
+            if "up" in value_text:
+                pyautogui.press("volumeup")
+                return True
+            if "down" in value_text:
+                pyautogui.press("volumedown")
+                return True
+            if "mute" in value_text or "unmute" in value_text:
+                pyautogui.press("volumemute")
+                return True
+            return False
+
+        if action == "write_note":
+            content = target or str(value)
+            if not content:
+                return False
+            self._open_text_editor()
+            time.sleep(1.0)
+            pyautogui.write(content, interval=0.05)
+            print(f"[ACTION] Writing to editor: {content}")
+            return True
+
+        if action == "play":
+            if not target:
+                return False
+            import pywhatkit
+            pywhatkit.playonyt(target)
+            print(f"[ACTION] Playing on YouTube: {target}")
+            return True
+
+        return False
+
+    def execute_from_assistant(self, text):
+        action_obj = self._extract_json_action(text)
+        if not action_obj:
+            print("[ACTION][SAFE] Assistant output has no valid JSON action. Ignored.")
+            return False
+        return self._execute_json_action(action_obj)
+
+    def execute(self, text):
+        if not text: 
+            return
+        
+        print(f"[ACTION][DEBUG] Executing: '{text}'")
+        try:
+            raw_text = text.strip()
+            
+            if raw_text.startswith("```json"):
+                raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+
+            try:
+                potential_json = json.loads(raw_text)
+                if isinstance(potential_json, dict) and "action" in potential_json:
+                    result = run_tool_action(potential_json)
+                    print(json.dumps(result, ensure_ascii=False))
+                    return
+            except json.JSONDecodeError:
+                pass
+
+            text = raw_text.lower()
+
+            structured_action = self._extract_json_action(raw_text)
+            if structured_action:
+                self._execute_json_action(structured_action)
+                return
+
+            if self._handle_extended_tool_commands(raw_text):
+                return
+
+            if self.excel.handle(raw_text):
+                return
+
+            if text.startswith("word") and self.word.handle(raw_text):
+                return
+
+            if text.startswith("powerpoint") and self.powerpoint.handle(raw_text):
+                return
+
+            if text == "office help":
+                self.excel.handle("excel help")
+                self.word.handle("word help")
+                self.powerpoint.handle("powerpoint help")
+                return
+
+            web_research_match = re.fullmatch(r"(?:web\s+research|research\s+web|research)\s+(.+)", raw_text, flags=re.IGNORECASE)
+            if web_research_match:
+                query = web_research_match.group(1)
+                self._research_and_store_web_data(query)
+                return
+
+            open_web_match = re.fullmatch(r"(?:open\s+website|browse)\s+(.+)", raw_text, flags=re.IGNORECASE)
+            if open_web_match:
+                url = open_web_match.group(1).strip()
+                url = url if url.startswith(("http://", "https://")) else "https://" + url
+                webbrowser.open(url)
+                print(f"[ACTION][WEB] Opened {url}")
+                return
+
+            search_web_match = re.fullmatch(r"search\s+web\s+(.+)", raw_text, flags=re.IGNORECASE)
+            if search_web_match:
+                query = search_web_match.group(1).strip()
+                search_url = f"[https://duckduckgo.com/?q=](https://duckduckgo.com/?q=){quote_plus(query)}"
+                webbrowser.open(search_url)
+                print(f"[ACTION][WEB] Searching web for: {query}")
+                return
+
+            if re.fullmatch(r"(?:copy\s+selected\s+text|copy\s+now)", text):
+                pyautogui.hotkey("ctrl", "c")
+                time.sleep(0.2)
+                if CLIPBOARD_AVAILABLE:
+                    snippet = pyperclip.paste().strip()
+                    preview = snippet[:120] + ("..." if len(snippet) > 120 else "")
+                    print(f"[ACTION][CLIPBOARD] Copied: {preview}")
+                else:
+                    print("[ACTION][CLIPBOARD] Copied selection (clipboard preview unavailable).")
+                return
+
+            if re.fullmatch(r"(?:paste\s+clipboard|paste\s+now)", text):
+                pyautogui.hotkey("ctrl", "v")
+                print("[ACTION][CLIPBOARD] Pasted clipboard into active software.")
+                return
+
+            save_clip_match = re.fullmatch(r"save\s+clipboard\s+to\s+rad\s+as\s+(.+)", raw_text, flags=re.IGNORECASE)
+            if save_clip_match:
+                if not CLIPBOARD_AVAILABLE:
+                    print("[ACTION][RAD] pyperclip not installed. Run: pip install pyperclip")
+                    return
+                if not self.db or not hasattr(self.db, "add_rad_data_if_new"):
+                    print("[ACTION][RAD] Database connection unavailable for clipboard save.")
+                    return
+
+                key_name = save_clip_match.group(1).strip().strip('"').strip("'")
+                clip_text = pyperclip.paste().strip()
+                if not clip_text:
+                    print("[ACTION][RAD] Clipboard is empty.")
+                    return
+
+                stored = self.db.add_rad_data_if_new("clipboard_note", key_name, clip_text, 0.84)
+                if stored:
+                    print(f"[ACTION][RAD] Clipboard saved under key '{key_name}'.")
+                else:
+                    print(f"[ACTION][RAD] Duplicate clipboard note ignored for key '{key_name}'.")
+                return
+
+            if re.fullmatch(r"(?:system check|check system)", text):
+                self._print_system_check()
+                return
+
+            if re.fullmatch(r"(?:malware scan|scan for malware|run malware scan|security quick scan)", text):
+                threading.Thread(target=self._run_quick_malware_scan, daemon=True).start()
+                return
+
+            if "scan apps" in text or "update apps" in text:
+                print("[ACTION] Scanning for new apps...")
+                if APPOPENER_AVAILABLE and give_appnames:
+                    threading.Thread(target=give_appnames, daemon=True).start()
+                else:
+                    print("[ACTION] App scanning is only available when AppOpener is installed.")
+                return
+
+            if text.startswith("play"):
+                video_topic = text.replace("play", "").replace("please", "").strip()
+                print(f"[ACTION] Playing on YouTube: {video_topic}")
+                try:
+                    import pywhatkit
+                    pywhatkit.playonyt(video_topic)
+                except Exception as e:
+                    print(f"[ERROR] pywhatkit failed, falling back to direct browser search query: {e}")
+                    search_url = f"[https://www.youtube.com/results?search_query=](https://www.youtube.com/results?search_query=){quote_plus(video_topic)}"
+                    webbrowser.open(search_url)
+                return
+
+            write_triggers = ["write ", "note ", "type ", "take a note "]
+            triggered_word = next((w for w in write_triggers if text.startswith(w)), None)
+
+            if triggered_word:
+                content = text.replace(triggered_word, "").strip()
+                print(f"[ACTION] Writing to editor: {content}")
+                self._open_text_editor()
+                time.sleep(1.0)
+                pyautogui.write(content, interval=0.05)
+                return
+
+            if "volume up" in text:
+                pyautogui.press('volumeup')
+                return
+            elif "volume down" in text:
+                pyautogui.press('volumedown')
+                return
+            elif "mute" in text or "unmute" in text:
+                pyautogui.press('volumemute')
+                return
+
+            if text.startswith("open ") or text.startswith("launch "):
+                raw_name = re.sub(r'^(open|launch)\s+', '', text).strip()
+                app_name = raw_name.replace("please", "").replace("now", "").strip()
+                app_name = re.sub(r'[^\w\s]', '', app_name)
+
+                if self._looks_like_file_hint(raw_name):
+                    self._run_tool_bridge_action({"action": "open_file", "path": raw_name, "resolve_by_hint": True, "include_content": True})
+                    return
+
+                self._run_tool_bridge_action({"action": "launch_application", "app": app_name})
+                return
+
+            if text.startswith("close "):
+                app_name = text.replace("close ", "").replace("please", "").strip()
+                app_name = re.sub(r'[^\w\s]', '', app_name)
+                self._run_tool_bridge_action({"action": "close_application", "app": app_name})
+                return
+
+            if self._looks_like_action_command(raw_text):
+                run_tool_action({"action": "run_command", "command": raw_text})
+
+        except Exception as global_err:
+            print(f"[Critical Action Failure Guard] Automated recovery handled anomaly: {global_err}")
+
+# -----------------------------------------------------------------------------
+# CLI Entry Point
+# -----------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run one tool action JSON payload")
+    parser = argparse.ArgumentParser(description="Run OS tools or automation action command")
     parser.add_argument("--action-json", default="", help="Tool action payload as JSON object")
+    parser.add_argument("--text", default="", help="Action command text (natural language)")
     return parser.parse_args()
-
 
 def _read_payload(args: argparse.Namespace) -> str:
     from_arg = str(getattr(args, "action_json", "") or "").strip()
@@ -1902,40 +3111,50 @@ def _read_payload(args: argparse.Namespace) -> str:
         return ""
     return ""
 
-
 def _emit(result: dict) -> None:
     print(json.dumps(result, ensure_ascii=True))
 
-
 def main() -> int:
     args = _parse_args()
-    raw_payload = _read_payload(args)
-    if not raw_payload:
-        _emit({"success": False, "message": "Tool action payload was empty.", "error": "empty_action_payload"})
-        return 1
+    text_arg = str(getattr(args, "text", "") or "").strip()
+    json_arg = _read_payload(args)
 
-    try:
-        parsed = json.loads(raw_payload)
-    except Exception as exc:
-        _emit({"success": False, "message": "Tool action payload was not valid JSON.", "error": str(exc)})
-        return 1
+    if text_arg:
+        try:
+            handler = ActionHandler()
+            output = handler.execute_and_collect(text_arg)
+            if output:
+                print(output)
+            return 0
+        except Exception as exc:
+            print(f"[ACTION RUNNER ERROR] {exc}")
+            return 1
 
-    if not isinstance(parsed, dict):
-        _emit({"success": False, "message": "Tool action payload must be a JSON object.", "error": "invalid_action_payload"})
-        return 1
+    if json_arg:
+        try:
+            parsed = json.loads(json_arg)
+        except Exception as exc:
+            _emit({"success": False, "message": "Tool action payload was not valid JSON.", "error": str(exc)})
+            return 1
 
-    try:
-        result = run_tool_action(parsed)
-    except Exception as exc:
-        _emit({"success": False, "message": "Tool action runner crashed while executing payload.", "error": str(exc)})
-        return 1
+        if not isinstance(parsed, dict):
+            _emit({"success": False, "message": "Tool action payload must be a JSON object.", "error": "invalid_action_payload"})
+            return 1
 
-    if not isinstance(result, dict):
-        result = {"success": False, "message": "Tool action returned an invalid result payload.", "error": str(result)}
+        try:
+            result = run_tool_action(parsed)
+        except Exception as exc:
+            _emit({"success": False, "message": "Tool action runner crashed while executing payload.", "error": str(exc)})
+            return 1
 
-    _emit(result)
-    return 0
+        if not isinstance(result, dict):
+            result = {"success": False, "message": "Tool action returned an invalid result payload.", "error": str(result)}
 
+        _emit(result)
+        return 0
+
+    _emit({"success": False, "message": "No input provided. Use --action-json or --text.", "error": "empty_input"})
+    return 1
 
 if __name__ == "__main__":
     sys.exit(main())

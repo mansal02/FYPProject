@@ -4,7 +4,9 @@ import threading
 import time
 from pathlib import Path
 
+from aiassistant.infra.embeddings import get_marie_embedding_function
 from aiassistant.infra.config.app_config import CONFIG
+from aiassistant.infra.db.database_manager import DatabaseManager
 from aiassistant.infra.db.database import MarieDB
 
 try:
@@ -40,11 +42,16 @@ class LocalRAG:
             try:
                 self.persist_dir.mkdir(parents=True, exist_ok=True)
                 client = chromadb.PersistentClient(path=str(self.persist_dir))
-                self.collection = client.get_or_create_collection("marie_knowledge")
+                
+                # Fetch our accelerated embedding function
+                marie_ef = get_marie_embedding_function()
+                
+                self.collection = client.get_or_create_collection(
+                    name="marie_knowledge",
+                    embedding_function=marie_ef # <--- Chroma will now use this automatically
+                )
             except BaseException as exc:
-                self.collection = None
-                print(f"[RAG] Chroma init failed, disabling local RAG: {exc}")
-                self._attempt_reset()
+                print(f"[RAG] Failed to init ChromaDB: {exc}")
 
     def _attempt_reset(self):
         if not self.persist_dir.exists():
@@ -192,7 +199,7 @@ def _query_searchable_mirror(question, top_k):
     if not clean:
         return ""
     try:
-        db = MarieDB()
+        db = DatabaseManager()
         results = db.search_searchable_mirror(clean, limit=max(1, int(top_k)))
     except Exception:
         return ""
@@ -215,19 +222,6 @@ def _query_searchable_mirror(question, top_k):
 
 
 def get_rag_context(question, top_k=4):
-    """Retrieve RAG context with mid-tier optimization.
-    
-    Respects device-class top_k and lazy loading settings.
-    """
-    from aiassistant.infra.optimization import get_device_capabilities
-    
-    # Auto-adjust top_k for mid-tier devices
-    caps = get_device_capabilities()
-    profile = caps.optimization_profile
-    optimized_top_k = profile.get("top_k", 4)
-    if top_k > optimized_top_k:
-        top_k = optimized_top_k
-    
     memory_snippets = _query_memory_agent(question, top_k=max(1, int(top_k)))
     local_snippets = RAG.query(question, top_k=top_k)
     mirror_snippets = _query_searchable_mirror(question, top_k=max(1, int(top_k)))

@@ -1,33 +1,20 @@
-"""
-Background memory agent for local file learning.
-
-Features:
-- Watches a local folder for changed files.
-- Embeds file chunks with local Ollama model.
-- Stores vectors in persistent ChromaDB collection.
-- Exposes query helpers so the main assistant can retrieve context.
-"""
-
 from __future__ import annotations
-
-import argparse
-import hashlib
-import threading
-import time
+import argparse, hashlib, threading, time, queue
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+from aiassistant.infra.embeddings import get_marie_embedding_function
 from aiassistant.infra.config.app_config import CONFIG
 
 try:
     import chromadb
-except Exception as e:  # pragma: no cover - optional dependency
+except Exception as e:  
     print(f"[Warning] ChromaDB import failed: {e}")
     chromadb = None
 
 try:
     import ollama
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  
     ollama = None
 
 try:
@@ -35,8 +22,8 @@ try:
     from watchdog.observers import Observer
 
     WATCHDOG_AVAILABLE = True
-except Exception:  # pragma: no cover - optional dependency
-    FileSystemEventHandler = object  # type: ignore[assignment]
+except Exception:  
+    FileSystemEventHandler = object  
     Observer = None
     WATCHDOG_AVAILABLE = False
 
@@ -45,31 +32,28 @@ class MarieMemoryAgent:
     def __init__(self) -> None:
         cfg = CONFIG.get("memory_agent", {})
         self.enabled = bool(cfg.get("enabled", True))
-        self.watch_dir = Path(str(cfg.get("watch_dir", "./knowledge/memory_agent"))).resolve()
-        self.persist_dir = Path(str(cfg.get("persist_dir", "./cache/chroma_memory_agent"))).resolve()
-        self.collection_name = str(cfg.get("collection", "marie_memory_agent")).strip() or "marie_memory_agent"
-        self.embedding_model = str(cfg.get("embedding_model", "llama3.2:3b")).strip() or "llama3.2:3b"
-        self.chunk_size = max(260, int(cfg.get("chunk_size", 850)))
-        self.chunk_overlap = max(40, int(cfg.get("chunk_overlap", 120)))
-        self.default_top_k = max(1, int(cfg.get("top_k", 4)))
-        self.watch_extensions = {
-            str(ext).strip().lower() if str(ext).strip().startswith(".") else f".{str(ext).strip().lower()}"
-            for ext in (cfg.get("watch_extensions") or [".txt", ".md", ".py", ".json"])
-            if str(ext).strip()
-        }
+        self.watch_dir = Path(str(cfg.get("watch_dir", "./knowledge/memory_agent")))
+        self.persist_dir = Path(str(cfg.get("persist_dir", "./cache/chroma_db")))
+        self.chunk_size = int(cfg.get("chunk_size", 850))
+        self.chunk_overlap = int(cfg.get("chunk_overlap", 120))
+        self.watch_extensions = set(cfg.get("watch_extensions", [".txt", ".md"]))
+        self.embedding_model = str(cfg.get("embedding_model", "llama3.2:3b"))
+        self.collection_name = str(cfg.get("collection", "marie_knowledge"))
 
         self.watch_dir.mkdir(parents=True, exist_ok=True)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
-
         self._lock = threading.RLock()
         self._file_signatures: Dict[str, str] = {}
-        self._collection = None
+        
         self._client = None
-
+        self._collection = None
         if chromadb is not None:
             try:
                 self._client = chromadb.PersistentClient(path=str(self.persist_dir))
-                self._collection = self._client.get_or_create_collection(self.collection_name)
+                self._collection = self._client.get_or_create_collection(
+                    name=self.collection_name,
+                    embedding_function=get_marie_embedding_function()
+                )
             except Exception:
                 self._collection = None
 
@@ -78,7 +62,8 @@ class MarieMemoryAgent:
             try:
                 self._ollama_client = ollama.Client(host="http://127.0.0.1:11434")
             except Exception:
-                self._ollama_client = None
+                self._ollama_client = None 
+
 
     @property
     def is_ready(self) -> bool:
@@ -124,7 +109,6 @@ class MarieMemoryAgent:
         if payload is None:
             return []
 
-        # Newer ollama-python returns typed response objects.
         if hasattr(payload, "model_dump"):
             try:
                 payload = payload.model_dump()
@@ -370,7 +354,6 @@ def get_memory_agent() -> MarieMemoryAgent:
                 _MEMORY_AGENT = MarieMemoryAgent()
             except Exception as e:
                 print(f"[Warning] Memory agent initialization failed: {e}")
-                # Return a dummy agent that's not ready
                 agent = MarieMemoryAgent.__new__(MarieMemoryAgent)
                 agent.is_ready = False
                 _MEMORY_AGENT = agent
@@ -402,22 +385,22 @@ class _MemoryEventHandler(FileSystemEventHandler):
         except Exception:
             pass
 
-    def on_created(self, event) -> None:  # type: ignore[override]
+    def on_created(self, event) -> None: 
         if getattr(event, "is_directory", False):
             return
         self._try_process(str(event.src_path))
 
-    def on_modified(self, event) -> None:  # type: ignore[override]
+    def on_modified(self, event) -> None: 
         if getattr(event, "is_directory", False):
             return
         self._try_process(str(event.src_path))
 
-    def on_moved(self, event) -> None:  # type: ignore[override]
+    def on_moved(self, event) -> None:  
         if getattr(event, "is_directory", False):
             return
         self._try_process(str(event.dest_path))
 
-    def on_deleted(self, event) -> None:  # type: ignore[override]
+    def on_deleted(self, event) -> None:  
         if getattr(event, "is_directory", False):
             return
         try:

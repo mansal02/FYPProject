@@ -5,6 +5,7 @@ import threading
 import uuid
 
 import ollama
+from pyparsing import Optional
 import uvicorn
 from fastapi import Body, FastAPI
 from fastapi.responses import StreamingResponse
@@ -24,7 +25,7 @@ except Exception:
 
 try:
     import requests
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  
     requests = None
 
 app = FastAPI()
@@ -42,6 +43,15 @@ OLLAMA_SYSTEM_PROMPT = CONFIG["ollama"].get("system_prompt", "You are MARIE, a f
 RUNTIME_ONLINE_MODE = str(CONFIG.get("runtime", {}).get("online_mode", "auto")).strip().lower()
 RUNTIME_HYBRID_MODE = bool(CONFIG.get("runtime", {}).get("hybrid_mode", False))
 EXTERNAL_MODEL = str(CONFIG.get("runtime", {}).get("external_model", "gemini-2.0-flash")).strip()
+
+def _extract_json_command(text: str) -> Optional[dict]:
+    match = re.search(r'\{.*"action".*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except:
+            return None
+    return None
 
 
 def _toggle_voice_rvc(enabled: bool) -> None:
@@ -466,7 +476,7 @@ def chat_stream_endpoint(payload: dict = Body(...)):
         media_type="application/x-ndjson",
         headers={"X-MARIE-REQUEST-ID": request_id},
     )
-
+    
 
 @app.post("/chat/stop")
 def stop_chat_endpoint(payload: dict = Body(None)):

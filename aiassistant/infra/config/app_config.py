@@ -12,7 +12,7 @@ def _find_repo_root() -> Path:
         if (parent / "config.yaml").exists() and (parent / "requirements.txt").exists():
             return parent
     # Safe fallback: old behavior relative to this file.
-    return current.parent
+    return current.parents[3]
 
 
 ROOT_DIR = _find_repo_root()
@@ -22,12 +22,13 @@ _DEFAULT_CONFIG = {
     "paths": {
         "db_path": "./marie_data.db",
         "auto_login_file": "./.marie_autologin.json",
-        "default_live2d_model": "./models/kei/runtime/kei_vowels_pro.model3.json",
+        "default_live2d_model": "./models/Knight/knight.model3.json",
         "piper_dir": "./piper",
         "rvc_dir": "./rvc_models",
         "knowledge_dir": "./knowledge",
         "train_root": "D:/Train",
         "train_response_dir": "D:/Train/response",
+        "ROOT_DIR": "D:/",
     },
     "servers": {
         "reasoning_url": "http://127.0.0.1:8000/chat",
@@ -91,7 +92,7 @@ _DEFAULT_CONFIG = {
         "whisper_model_size": "base",
         "energy_threshold": 650,
         "whisper_device": "cpu",
-        "enable_faster_whisper": False,
+        "enable_faster_whisper": True,
         "wake_word": "hey",
         "always_listen_wake_word_only": True,
         "microphone_hotkey": "F4",
@@ -104,10 +105,9 @@ _DEFAULT_CONFIG = {
     "ui": {
         "theme": "dark",
         "transparent_face": False,
-        "enable_live2d": False,
+        "enable_live2d": True,
         "response_only_mode": False,
         "response_only_opacity": 0.88,
-        "enable_midtier_mode": False,
     },
     "features": {
         "camera_tracking": False,
@@ -125,12 +125,9 @@ _DEFAULT_CONFIG = {
         "hybrid_mode": False,
         "external_model": "gemini-2.0-flash",
         "online_mode": "offline",
-        "device_class": "auto",
-        "enable_aggressive_gc": False,
-        "model_unload_after_inference": True,
     },
     "actions": {
-        "safe_mode": True,
+        "safe_mode": False,
         "allow_legacy_text_commands": True,
     },
     "training": {
@@ -271,7 +268,7 @@ def load_config():
     config["ui"]["theme"] = os.environ.get("MARIE_UI_THEME", config["ui"].get("theme", "dark"))
     config["ui"]["enable_live2d"] = _as_bool(
         os.environ.get("MARIE_ENABLE_LIVE2D"),
-        config["ui"].get("enable_live2d", False),
+        config["ui"].get("enable_live2d", True),
     )
     config["ui"]["response_only_mode"] = _as_bool(
         os.environ.get("MARIE_RESPONSE_ONLY_MODE"),
@@ -281,8 +278,6 @@ def load_config():
         os.environ.get("MARIE_RESPONSE_ONLY_OPACITY"),
         config["ui"].get("response_only_opacity", 0.88),
     )
-    if _as_bool(os.environ.get("MARIE_DISABLE_LIVE2D"), False):
-        config["ui"]["enable_live2d"] = False
 
     config["voice"]["enable_openwakeword"] = _as_bool(
         os.environ.get("MARIE_ENABLE_OPENWAKEWORD"),
@@ -418,37 +413,6 @@ def load_config():
     config["memory"]["local_context_file"] = _resolve_path(config["memory"]["local_context_file"])
     config["memory_agent"]["watch_dir"] = _resolve_path(config["memory_agent"]["watch_dir"])
     config["memory_agent"]["persist_dir"] = _resolve_path(config["memory_agent"]["persist_dir"])
-
-    # Mid-tier device optimization overrides
-    config["ui"]["enable_midtier_mode"] = _as_bool(
-        os.environ.get("MARIE_ENABLE_MIDTIER_MODE"),
-        config["ui"].get("enable_midtier_mode", False),
-    )
-    config["runtime"]["device_class"] = os.environ.get(
-        "MARIE_DEVICE_CLASS",
-        config["runtime"].get("device_class", "auto"),
-    )
-    config["runtime"]["enable_aggressive_gc"] = _as_bool(
-        os.environ.get("MARIE_ENABLE_AGGRESSIVE_GC"),
-        config["runtime"].get("enable_aggressive_gc", False),
-    )
-    config["runtime"]["model_unload_after_inference"] = _as_bool(
-        os.environ.get("MARIE_MODEL_UNLOAD_AFTER_INFERENCE"),
-        config["runtime"].get("model_unload_after_inference", True),
-    )
-    config["ollama"]["quantization_enabled"] = os.environ.get(
-        "MARIE_OLLAMA_QUANTIZATION",
-        config["ollama"].get("quantization_enabled", False),
-    )
-    config["memory_agent"]["lazy_load"] = _as_bool(
-        os.environ.get("MARIE_MEMORY_AGENT_LAZY_LOAD"),
-        config["memory_agent"].get("lazy_load", False),
-    )
-    config["memory_agent"]["embedding_batch_size"] = _as_int(
-        os.environ.get("MARIE_MEMORY_AGENT_BATCH_SIZE"),
-        config["memory_agent"].get("embedding_batch_size", 32),
-    )
-
     return config
 
 

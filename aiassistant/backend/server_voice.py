@@ -3,12 +3,17 @@
 import uvicorn
 from fastapi import FastAPI
 
+from aiassistant.infra.voice.voice import MarieVoice
+
 app = FastAPI()
 
+voice_engine = MarieVoice()
 
-@app.get("/health")
-def health():
-    return {"status": "voice server disabled"}
+@app.post("/speak")
+def speak(payload: dict):
+    text = payload.get("text")
+    voice_engine.play_file(voice_engine.generate_speech(text))
+    return {"status": "speaking"}
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 paths:
   db_path: ./marie_data.db
   auto_login_file: ./.marie_autologin.json
-  default_live2d_model: ./models/kei/runtime/kei_vowels_pro.model3.json
+  default_live2d_model: ./models/Knight/knight.model3.json
   piper_dir: ./piper
   rvc_dir: ./rvc_models
   knowledge_dir: ./knowledge
   train_root: D:/Train
   train_response_dir: D:/Train/response
+  ROOT_DIR: ./
 
 servers:
   reasoning_url: http://127.0.0.1:8000/chat
@@ -25,7 +26,6 @@ ollama:
   num_predict: 360
   num_ctx: 2048
   temperature: 0.2
-  # Quantization settings for mid-tier optimization
   quantization_enabled: false  # Set to 'q4' or 'q5' for mid-tier devices
   system_prompt: |
     You are MARIE, a practical desktop assistant.
@@ -47,12 +47,10 @@ memory_agent:
   persist_dir: ./cache/chroma_memory_agent
   collection: marie_memory_agent
   embedding_model: llama3.2:3b
-  # Mid-tier optimization: reduce embeddings computation
-  embedding_batch_size: 32  # Process embeddings in batches
+  embedding_batch_size: 32
   top_k: 4
   chunk_size: 850
   chunk_overlap: 120
-  # Lazy load RAG if set to true (default false for compatibility)
   lazy_load: false
   watch_extensions:
     - .txt
@@ -85,11 +83,9 @@ voice:
 ui:
   theme: dark
   transparent_face: false
-  enable_live2d: false
+  enable_live2d: true
   response_only_mode: false
   response_only_opacity: 0.88
-  # Mid-tier mode: auto-detect and disable heavy features
-  enable_midtier_mode: false  # Set to true for auto mid-tier optimization
 
 features:
   camera_tracking: false
@@ -112,13 +108,9 @@ runtime:
   hybrid_mode: false
   external_model: gemini-2.0-flash
   online_mode: offline
-  # Mid-tier device settings
-  device_class: auto  # Options: auto, high_end, mid_tier, low_end
-  enable_aggressive_gc: false  # Garbage collection between requests
-  model_unload_after_inference: true  # Unload model after each response (saves VRAM)
 
 actions:
-  safe_mode: true
+  safe_mode: false
   allow_legacy_text_commands: true
 
 training:

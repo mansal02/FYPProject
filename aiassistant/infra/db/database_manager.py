@@ -9,13 +9,13 @@ faster prompts.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 import threading
-import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from aiassistant.infra.config.app_config import CONFIG
 
@@ -29,107 +29,117 @@ class DatabaseManager:
         )
         self.db_path = Path(configured_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         
+        # Use an RLock for safe, re-entrant thread locking across the instance
+        self._lock = threading.RLock()
+        self._rad_has_user_id = True
+
         try:
             self.conn.execute("PRAGMA journal_mode=WAL;")
             self.conn.execute("PRAGMA busy_timeout=5000;")  
         except sqlite3.Error as e:
             print(f"[Database Warning] Failed to initialize WAL safety layers: {e}")
-            
-        self._lock = threading.Lock()
-        self._rad_has_user_id = True
 
-        self._create_tables()  
+        self._create_tables()
+
+    # --- Utility Helpers ---
+
+    @staticmethod
+    def _now() -> str:
+        """Returns the current timestamp in ISO format."""
+        return datetime.now().isoformat(timespec="seconds")
+
+    @staticmethod
+    def _clean_str(val: any, default: str = "") -> str:
+        """Safely cleans and strips a string."""
+        return str(val or default).strip()
+
+    @staticmethod
+    def _hash_password(password: str) -> str:
+        return hashlib.sha256(password.encode("utf-8", errors="ignore")).hexdigest()
+
+    def safe_write_query(self, query: str, params: tuple = ()) -> bool:
+        """Ensures thread-safe writes preventing SQLite locks."""
+        with self._lock:
+            try:
+                self.conn.execute(query, params)
+                self.conn.commit()
+                return True
+            except sqlite3.OperationalError as e:
+                print(f"[DB ERROR] Locked or failed write: {e}")
+                self.conn.rollback()
+                return False
+
+    def _execute_read_all(self, query: str, params: tuple = ()) -> List[sqlite3.Row]:
+        """Helper to execute read queries safely."""
+        with self._lock:
+            return self.conn.execute(query, params).fetchall()
+
+    def _execute_read_one(self, query: str, params: tuple = ()) -> Optional[sqlite3.Row]:
+        """Helper to execute single read queries safely."""
+        with self._lock:
+            return self.conn.execute(query, params).fetchone()
+
+    # --- Schema Setup ---
 
     def _create_tables(self) -> None:
         schema = """
         CREATE TABLE IF NOT EXISTS assistant_sessions (
-            session_id TEXT PRIMARY KEY,
-            started_at TEXT NOT NULL,
-            label TEXT
+            session_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, label TEXT
         );
-
         CREATE TABLE IF NOT EXISTS assistant_interactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            timestamp TEXT NOT NULL,
-            role TEXT NOT NULL,
-            message TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+            timestamp TEXT NOT NULL, role TEXT NOT NULL, message TEXT NOT NULL,
             category TEXT NOT NULL DEFAULT 'chat',
             FOREIGN KEY(session_id) REFERENCES assistant_sessions(session_id)
         );
-
-        CREATE INDEX IF NOT EXISTS idx_assistant_interactions_session_id
-            ON assistant_interactions(session_id);
-
-        CREATE INDEX IF NOT EXISTS idx_assistant_interactions_timestamp
-            ON assistant_interactions(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_assistant_interactions_session_id ON assistant_interactions(session_id);
+        CREATE INDEX IF NOT EXISTS idx_assistant_interactions_timestamp ON assistant_interactions(timestamp);
 
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL, created_at TEXT NOT NULL
         );
-
         CREATE TABLE IF NOT EXISTS auth_sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            login_time TEXT NOT NULL,
-            logout_time TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            login_time TEXT NOT NULL, logout_time TEXT,
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
-
-        CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id
-            ON auth_sessions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id ON auth_sessions(user_id);
 
         CREATE TABLE IF NOT EXISTS user_preferences (
-            user_id INTEGER PRIMARY KEY,
-            preferred_voice TEXT DEFAULT 'system_default',
-            preferred_reasoning_model TEXT,
-            preferred_live2d_model TEXT,
-            tts_enabled INTEGER DEFAULT 1,
-            voice_input_enabled INTEGER DEFAULT 0,
-            rag_enabled INTEGER DEFAULT 1,
-            speaking_speed REAL DEFAULT 1.0,
-            system_prompt_behavior TEXT DEFAULT 'default',
-            system_prompt_custom TEXT DEFAULT '',
-            updated_at TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(id)
+            user_id INTEGER PRIMARY KEY, preferred_voice TEXT DEFAULT 'system_default',
+            preferred_reasoning_model TEXT, preferred_live2d_model TEXT,
+            tts_enabled INTEGER DEFAULT 1, voice_input_enabled INTEGER DEFAULT 0,
+            rag_enabled INTEGER DEFAULT 1, speaking_speed REAL DEFAULT 1.0,
+            system_prompt_behavior TEXT DEFAULT 'default', system_prompt_custom TEXT DEFAULT '',
+            updated_at TEXT, FOREIGN KEY(user_id) REFERENCES users(id)
         );
 
         CREATE TABLE IF NOT EXISTS rad_memory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            category TEXT NOT NULL,
-            key_data TEXT NOT NULL,
-            value_data TEXT NOT NULL,
-            confidence_score REAL DEFAULT 1.0,
-            created_at TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            category TEXT NOT NULL, key_data TEXT NOT NULL, value_data TEXT NOT NULL,
+            confidence_score REAL DEFAULT 1.0, created_at TEXT NOT NULL,
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
 
         CREATE TABLE IF NOT EXISTS searchable_mirror (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_path TEXT UNIQUE NOT NULL,
-            raw_text_or_data TEXT,
-            file_hash TEXT,
-            updated_at TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, file_path TEXT UNIQUE NOT NULL,
+            raw_text_or_data TEXT, file_hash TEXT, updated_at TEXT NOT NULL
         );
+        CREATE VIRTUAL TABLE IF NOT EXISTS searchable_mirror_fts USING fts5(
+            file_path, raw_text_or_data, content='searchable_mirror', content_rowid='id'
+        );
+        CREATE INDEX IF NOT EXISTS idx_searchable_mirror_path ON searchable_mirror(file_path);
 
         CREATE TABLE IF NOT EXISTS style_profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            scope TEXT UNIQUE NOT NULL,
-            profile_json TEXT,
-            updated_at TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT UNIQUE NOT NULL,
+            profile_json TEXT, updated_at TEXT NOT NULL
         );
-
-        CREATE INDEX IF NOT EXISTS idx_searchable_mirror_path
-            ON searchable_mirror(file_path);
-        CREATE INDEX IF NOT EXISTS idx_style_profiles_scope
-            ON style_profiles(scope);
+        CREATE INDEX IF NOT EXISTS idx_style_profiles_scope ON style_profiles(scope);
         """
         with self._lock:
             self.conn.executescript(schema)
@@ -137,185 +147,77 @@ class DatabaseManager:
             self.conn.commit()
 
     def _ensure_schema_migrations(self) -> None:
-        # Legacy databases may have an earlier rad_memory schema without user_id/created_at.
-        row = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='rad_memory'"
-        ).fetchone()
+        row = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='rad_memory'").fetchone()
         if not row:
             self._rad_has_user_id = True
             return
 
-        columns = {
-            col["name"]
-            for col in self.conn.execute("PRAGMA table_info(rad_memory)").fetchall()
-        }
+        columns = {col["name"] for col in self.conn.execute("PRAGMA table_info(rad_memory)").fetchall()}
 
         if "created_at" not in columns:
             self.conn.execute("ALTER TABLE rad_memory ADD COLUMN created_at TEXT")
-
-        now = datetime.now().isoformat(timespec="seconds")
-        self.conn.execute(
-            "UPDATE rad_memory SET created_at = COALESCE(created_at, ?) WHERE created_at IS NULL OR created_at = ''",
-            (now,),
-        )
+            self.conn.execute("UPDATE rad_memory SET created_at = COALESCE(created_at, ?) WHERE created_at IS NULL OR created_at = ''", (self._now(),))
 
         self._rad_has_user_id = "user_id" in columns
         if self._rad_has_user_id:
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_rad_memory_user_id ON rad_memory(user_id)"
-            )
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_rad_memory_user_id ON rad_memory(user_id)")
 
-        pref_row = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='user_preferences'"
-        ).fetchone()
+        pref_row = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_preferences'").fetchone()
         if pref_row:
-            pref_columns = {
-                col["name"]
-                for col in self.conn.execute("PRAGMA table_info(user_preferences)").fetchall()
-            }
+            pref_columns = {col["name"] for col in self.conn.execute("PRAGMA table_info(user_preferences)").fetchall()}
             if "system_prompt_behavior" not in pref_columns:
-                self.conn.execute(
-                    "ALTER TABLE user_preferences ADD COLUMN system_prompt_behavior TEXT DEFAULT 'default'"
-                )
+                self.conn.execute("ALTER TABLE user_preferences ADD COLUMN system_prompt_behavior TEXT DEFAULT 'default'")
             if "system_prompt_custom" not in pref_columns:
-                self.conn.execute(
-                    "ALTER TABLE user_preferences ADD COLUMN system_prompt_custom TEXT DEFAULT ''"
-                )
+                self.conn.execute("ALTER TABLE user_preferences ADD COLUMN system_prompt_custom TEXT DEFAULT ''")
 
-    @staticmethod
-    def _hash_password(password: str) -> str:
-        return hashlib.sha256(password.encode("utf-8", errors="ignore")).hexdigest()
+    # --- Session & Interactions ---
 
     def create_session(self, label: Optional[str] = None) -> str:
-        now = datetime.now()
-        session_id = now.strftime("%Y%m%d_%H%M%S_%f")
-        started_at = now.isoformat(timespec="seconds")
-
-        with self._lock:
-            self.conn.execute(
-                "INSERT INTO assistant_sessions (session_id, started_at, label) VALUES (?, ?, ?)",
-                (session_id, started_at, label),
-            )
-            self.conn.commit()
-
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.safe_write_query(
+            "INSERT INTO assistant_sessions (session_id, started_at, label) VALUES (?, ?, ?)",
+            (session_id, self._now(), label),
+        )
         return session_id
 
-    def log_interaction(
-        self,
-        session_id: str,
-        role: str,
-        message: str,
-        category: str = "chat",
-    ) -> None:
-        timestamp = datetime.now().isoformat(timespec="seconds")
-
-        with self._lock:
-            self.conn.execute(
-                """
-                INSERT INTO assistant_interactions (session_id, timestamp, role, message, category)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (session_id, timestamp, role, message, category),
-            )
-            self.conn.commit()
+    def log_interaction(self, session_id: str, role: str, message: str, category: str = "chat") -> None:
+        self.safe_write_query(
+            "INSERT INTO assistant_interactions (session_id, timestamp, role, message, category) VALUES (?, ?, ?, ?, ?)",
+            (session_id, self._now(), role, message, category)
+        )
 
     def get_recent_turns(self, session_id: str, turn_limit: int = 3) -> List[Dict[str, str]]:
-        """
-        Returns the most recent user/assistant messages for prompt context.
-
-        turn_limit=3 means up to 3 user turns + 3 assistant turns for speed.
-        """
         row_limit = max(1, turn_limit) * 2
-
-        with self._lock:
-            rows = self.conn.execute(
-                """
-                SELECT role, message, timestamp
-                                FROM assistant_interactions
-                WHERE session_id = ?
-                  AND role IN ('user', 'assistant')
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (session_id, row_limit),
-            ).fetchall()
-
-        # Reverse so prompts are oldest -> newest.
-        ordered_rows = list(reversed(rows))
-        return [
-            {
-                "role": row["role"],
-                "message": row["message"],
-                "timestamp": row["timestamp"],
-            }
-            for row in ordered_rows
-        ]
+        rows = self._execute_read_all(
+            """SELECT role, message, timestamp FROM assistant_interactions 
+               WHERE session_id = ? AND role IN ('user', 'assistant') ORDER BY id DESC LIMIT ?""",
+            (session_id, row_limit)
+        )
+        return [{"role": r["role"], "message": r["message"], "timestamp": r["timestamp"]} for r in reversed(rows)]
 
     def get_all_session_messages(self, session_id: str) -> List[Dict[str, str]]:
-        with self._lock:
-            rows = self.conn.execute(
-                """
-                SELECT role, message, category, timestamp
-                FROM assistant_interactions
-                WHERE session_id = ?
-                ORDER BY id ASC
-                """,
-                (session_id,),
-            ).fetchall()
-
-        return [
-            {
-                "role": row["role"],
-                "message": row["message"],
-                "category": row["category"],
-                "timestamp": row["timestamp"],
-            }
-            for row in rows
-        ]
+        rows = self._execute_read_all(
+            "SELECT role, message, category, timestamp FROM assistant_interactions WHERE session_id = ? ORDER BY id ASC",
+            (session_id,)
+        )
+        return [dict(r) for r in rows]
 
     def list_sessions(self, limit: int = 40) -> List[Dict[str, str]]:
-        """Returns recent sessions with quick interaction counts for UI history browsing."""
-        with self._lock:
-            rows = self.conn.execute(
-                """
-                SELECT
-                    s.session_id,
-                    s.started_at,
-                    COALESCE(s.label, '') AS label,
-                    COUNT(i.id) AS message_count
-                FROM assistant_sessions s
-                LEFT JOIN assistant_interactions i ON i.session_id = s.session_id
-                GROUP BY s.session_id, s.started_at, s.label
-                ORDER BY s.started_at DESC
-                LIMIT ?
-                """,
-                (max(1, int(limit)),),
-            ).fetchall()
-
-        return [
-            {
-                "session_id": row["session_id"],
-                "started_at": row["started_at"],
-                "label": row["label"],
-                "message_count": str(row["message_count"]),
-            }
-            for row in rows
-        ]
+        rows = self._execute_read_all(
+            """SELECT s.session_id, s.started_at, COALESCE(s.label, '') AS label, COUNT(i.id) AS message_count
+               FROM assistant_sessions s LEFT JOIN assistant_interactions i ON i.session_id = s.session_id
+               GROUP BY s.session_id, s.started_at, s.label ORDER BY s.started_at DESC LIMIT ?""",
+            (max(1, limit),)
+        )
+        return [{"session_id": r["session_id"], "started_at": r["started_at"], "label": r["label"], "message_count": str(r["message_count"])} for r in rows]
 
     def delete_session_history(self, session_id: str) -> bool:
-        clean_session_id = str(session_id or "").strip()
-        if not clean_session_id:
-            return False
+        clean_id = self._clean_str(session_id)
+        if not clean_id: return False
 
         with self._lock:
-            self.conn.execute(
-                "DELETE FROM assistant_interactions WHERE session_id = ?",
-                (clean_session_id,),
-            )
-            cursor = self.conn.execute(
-                "DELETE FROM assistant_sessions WHERE session_id = ?",
-                (clean_session_id,),
-            )
+            self.conn.execute("DELETE FROM assistant_interactions WHERE session_id = ?", (clean_id,))
+            cursor = self.conn.execute("DELETE FROM assistant_sessions WHERE session_id = ?", (clean_id,))
             self.conn.commit()
             return cursor.rowcount > 0
 
@@ -323,261 +225,136 @@ class DatabaseManager:
         with self._lock:
             self.conn.close()
 
-    # --- Searchable mirror ---
-    def save_searchable_mirror(self, file_path: str, raw_text: str, file_hash: str) -> None:
-        if not file_path or not raw_text:
-            return
-        now = datetime.now().isoformat(timespec="seconds")
-        with self._lock:
-            self.conn.execute(
-                """
-                INSERT INTO searchable_mirror (file_path, raw_text_or_data, file_hash, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(file_path) DO UPDATE SET
-                    raw_text_or_data=excluded.raw_text_or_data,
-                    file_hash=excluded.file_hash,
-                    updated_at=excluded.updated_at
-                """,
-                (str(file_path), str(raw_text), str(file_hash or ""), now),
-            )
-            self.conn.commit()
+    # --- Searchable Mirror ---
 
-    def get_searchable_mirror_hash(self, file_path: str) -> str | None:
-        clean = str(file_path or "").strip()
-        if not clean:
-            return None
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT file_hash FROM searchable_mirror WHERE file_path = ?",
-                (clean,),
-            ).fetchone()
-        if not row:
-            return None
-        return str(row["file_hash"] or "")
+    def save_searchable_mirror(self, file_path: str, raw_text: str, file_hash: str) -> None:
+        if not file_path or not raw_text: return
+        self.safe_write_query(
+            """INSERT INTO searchable_mirror (file_path, raw_text_or_data, file_hash, updated_at) VALUES (?, ?, ?, ?)
+               ON CONFLICT(file_path) DO UPDATE SET raw_text_or_data=excluded.raw_text_or_data, file_hash=excluded.file_hash, updated_at=excluded.updated_at""",
+            (str(file_path), str(raw_text), str(file_hash or ""), self._now())
+        )
+
+    def get_searchable_mirror_hash(self, file_path: str) -> Optional[str]:
+        clean_path = self._clean_str(file_path)
+        if not clean_path: return None
+        row = self._execute_read_one("SELECT file_hash FROM searchable_mirror WHERE file_path = ?", (clean_path,))
+        return str(row["file_hash"]) if row else None
 
     def search_searchable_mirror(self, query: str, limit: int = 8) -> List[Dict[str, str]]:
-        clean = str(query or "").strip()
-        if not clean:
-            return []
-        wildcard = f"%{clean}%"
-        with self._lock:
-            rows = self.conn.execute(
-                """
-                SELECT file_path, raw_text_or_data
-                FROM searchable_mirror
-                WHERE raw_text_or_data LIKE ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (wildcard, max(1, int(limit))),
-            ).fetchall()
+        clean_query = self._clean_str(query)
+        if not clean_query: return []
 
-        results: List[Dict[str, str]] = []
+        rows = self._execute_read_all(
+            "SELECT file_path, raw_text_or_data FROM searchable_mirror_fts WHERE searchable_mirror_fts MATCH ? ORDER BY rank LIMIT ?",
+            (f'"{clean_query}"', max(1, limit))
+        )
+
+        results = []
         for row in rows:
             raw = str(row["raw_text_or_data"] or "")
-            idx = raw.lower().find(clean.lower())
-            snippet = ""
-            if idx >= 0:
-                start = max(0, idx - 120)
-                end = min(len(raw), idx + 240)
-                snippet = raw[start:end].strip()
+            idx = raw.lower().find(clean_query.lower())
+            snippet = raw[max(0, idx - 120):min(len(raw), idx + 240)].strip() if idx >= 0 else ""
             results.append({"file_path": str(row["file_path"]), "snippet": snippet})
         return results
 
-    # --- Style profile ---
+    # --- Style Profiles ---
+
     def save_style_profile(self, scope: str, profile_json: Dict[str, object]) -> None:
-        clean_scope = str(scope or "default").strip() or "default"
-        now = datetime.now().isoformat(timespec="seconds")
-        payload = json.dumps(profile_json or {}, ensure_ascii=True)
-        with self._lock:
-            self.conn.execute(
-                """
-                INSERT INTO style_profiles (scope, profile_json, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(scope) DO UPDATE SET
-                    profile_json=excluded.profile_json,
-                    updated_at=excluded.updated_at
-                """,
-                (clean_scope, payload, now),
+        clean_scope = self._clean_str(scope, "default") or "default"
+        self.safe_write_query(
+            """INSERT INTO style_profiles (scope, profile_json, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(scope) DO UPDATE SET profile_json=excluded.profile_json, updated_at=excluded.updated_at""",
+            (clean_scope, json.dumps(profile_json or {}, ensure_ascii=True), self._now())
+        )
+
+    def get_style_profile(self, scope: str = "default") -> Optional[Dict[str, object]]:
+        clean_scope = self._clean_str(scope, "default") or "default"
+        row = self._execute_read_one("SELECT profile_json FROM style_profiles WHERE scope = ?", (clean_scope,))
+        if row and row["profile_json"]:
+            try:
+                return json.loads(row["profile_json"])
+            except json.JSONDecodeError:
+                pass
+        return None
+
+    # --- User Auth & Preferences ---
+
+    def register_user(self, username: str, password: str) -> Tuple[bool, str]:
+        user, pwd = self._clean_str(username), self._clean_str(password)
+        if not user or not pwd: return False, "Username and password cannot be empty."
+
+        try:
+            self.safe_write_query(
+                "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+                (user, self._hash_password(pwd), self._now())
             )
-            self.conn.commit()
-
-    def get_style_profile(self, scope: str = "default") -> Dict[str, object] | None:
-        clean_scope = str(scope or "default").strip() or "default"
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT profile_json FROM style_profiles WHERE scope = ?",
-                (clean_scope,),
-            ).fetchone()
-        if not row or not row["profile_json"]:
-            return None
-        try:
-            return json.loads(row["profile_json"])
-        except Exception:
-            return None
-
-    # --- User auth + preferences ---
-    def register_user(self, username: str, password: str) -> tuple[bool, str]:
-        clean_username = (username or "").strip()
-        clean_password = (password or "").strip()
-
-        if not clean_username or not clean_password:
-            return False, "Username and password cannot be empty."
-
-        now = datetime.now().isoformat(timespec="seconds")
-        pwd_hash = self._hash_password(clean_password)
-
-        try:
-            with self._lock:
-                self.conn.execute(
-                    "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-                    (clean_username, pwd_hash, now),
-                )
-                self.conn.commit()
             return True, "Account created successfully."
         except sqlite3.IntegrityError:
             return False, "Username already exists."
 
+    def _create_auth_session(self, user_id: int, username: str) -> Dict[str, object]:
+        """Helper to create an auth session and return unified response."""
+        self.safe_write_query(
+            "INSERT INTO auth_sessions (user_id, login_time) VALUES (?, ?)", 
+            (user_id, self._now())
+        )
+        return {"user_id": user_id, "username": username}
+
     def login_user(self, username: str, password: str) -> Optional[Dict[str, object]]:
-        clean_username = (username or "").strip()
-        clean_password = (password or "").strip()
-        if not clean_username or not clean_password:
-            return None
+        user, pwd = self._clean_str(username), self._clean_str(password)
+        if not user or not pwd: return None
 
-        pwd_hash = self._hash_password(clean_password)
-        login_time = datetime.now().isoformat(timespec="seconds")
-
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT id, username FROM users WHERE username = ? AND password_hash = ?",
-                (clean_username, pwd_hash),
-            ).fetchone()
-            if not row:
-                return None
-
-            user_id = int(row["id"])
-            self.conn.execute(
-                "INSERT INTO auth_sessions (user_id, login_time) VALUES (?, ?)",
-                (user_id, login_time),
-            )
-            self.conn.commit()
-
-        return {"user_id": user_id, "username": str(row["username"]) }
+        row = self._execute_read_one(
+            "SELECT id, username FROM users WHERE username = ? AND password_hash = ?",
+            (user, self._hash_password(pwd))
+        )
+        return self._create_auth_session(row["id"], row["username"]) if row else None
 
     def resume_user_session(self, user_id: int) -> Optional[Dict[str, object]]:
-        if not self.user_exists(user_id):
-            return None
-
-        login_time = datetime.now().isoformat(timespec="seconds")
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT username FROM users WHERE id = ?",
-                (user_id,),
-            ).fetchone()
-            if not row:
-                return None
-
-            self.conn.execute(
-                "INSERT INTO auth_sessions (user_id, login_time) VALUES (?, ?)",
-                (user_id, login_time),
-            )
-            self.conn.commit()
-
-        return {"user_id": int(user_id), "username": str(row["username"]) }
+        row = self._execute_read_one("SELECT username FROM users WHERE id = ?", (int(user_id),))
+        return self._create_auth_session(user_id, row["username"]) if row else None
 
     def logout_user(self, user_id: int) -> None:
-        logout_time = datetime.now().isoformat(timespec="seconds")
-        with self._lock:
-            self.conn.execute(
-                """
-                UPDATE auth_sessions
-                SET logout_time = ?
-                WHERE user_id = ? AND logout_time IS NULL
-                """,
-                (logout_time, int(user_id)),
-            )
-            self.conn.commit()
+        self.safe_write_query(
+            "UPDATE auth_sessions SET logout_time = ? WHERE user_id = ? AND logout_time IS NULL",
+            (self._now(), int(user_id))
+        )
 
     def user_exists(self, user_id: int) -> bool:
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT id FROM users WHERE id = ?",
-                (int(user_id),),
-            ).fetchone()
-        return bool(row)
+        return bool(self._execute_read_one("SELECT id FROM users WHERE id = ?", (int(user_id),)))
 
     def get_username(self, user_id: int) -> Optional[str]:
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT username FROM users WHERE id = ?",
-                (int(user_id),),
-            ).fetchone()
-        if not row:
-            return None
-        return str(row["username"])
+        row = self._execute_read_one("SELECT username FROM users WHERE id = ?", (int(user_id),))
+        return str(row["username"]) if row else None
 
     def save_user_preference(self, user_id: int, preference: Dict[str, object]) -> None:
-        if not preference:
-            return
+        if not preference: return
 
-        column_map = {
-            "preferred_voice": "preferred_voice",
-            "preferred_reasoning_model": "preferred_reasoning_model",
-            "preferred_live2d_model": "preferred_live2d_model",
-            "tts_enabled": "tts_enabled",
-            "voice_input_enabled": "voice_input_enabled",
-            "rag_enabled": "rag_enabled",
-            "speaking_speed": "speaking_speed",
-            "system_prompt_behavior": "system_prompt_behavior",
-            "system_prompt_custom": "system_prompt_custom",
-        }
-        bool_keys = {
-            "tts_enabled",
-            "voice_input_enabled",
-            "rag_enabled",
-        }
+        bool_keys = {"tts_enabled", "voice_input_enabled", "rag_enabled"}
+        updates, values = [], []
 
-        updates: List[str] = []
-        values: List[object] = []
-
-        for key, column in column_map.items():
-            if key not in preference:
-                continue
-
-            raw_value = preference.get(key)
-            if raw_value is None:
-                continue
+        for key, value in preference.items():
+            if value is None: continue
 
             if key in bool_keys:
-                value: object = 1 if bool(raw_value) else 0
+                parsed_val = 1 if bool(value) else 0
             elif key == "speaking_speed":
-                try:
-                    value = max(0.4, min(float(raw_value), 2.5))
-                except (TypeError, ValueError):
-                    continue
+                try: parsed_val = max(0.4, min(float(value), 2.5))
+                except (TypeError, ValueError): continue
             else:
-                value = str(raw_value).strip()
+                parsed_val = str(value).strip()
 
-            updates.append(f"{column} = ?")
-            values.append(value)
+            updates.append(f"{key} = ?")
+            values.append(parsed_val)
 
-        if not updates:
-            return
-
-        updated_at = datetime.now().isoformat(timespec="seconds")
-
+        if not updates: return
+        
+        updated_at = self._now()
         with self._lock:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO user_preferences (user_id, updated_at) VALUES (?, ?)",
-                (int(user_id), updated_at),
-            )
-            updates.append("updated_at = ?")
-            values.append(updated_at)
-            values.append(int(user_id))
-            self.conn.execute(
-                f"UPDATE user_preferences SET {', '.join(updates)} WHERE user_id = ?",
-                tuple(values),
-            )
+            self.conn.execute("INSERT OR IGNORE INTO user_preferences (user_id, updated_at) VALUES (?, ?)", (int(user_id), updated_at))
+            values.extend([updated_at, int(user_id)])
+            self.conn.execute(f"UPDATE user_preferences SET {', '.join(updates)}, updated_at = ? WHERE user_id = ?", tuple(values))
             self.conn.commit()
 
     def get_user_preference(self, user_id: int) -> Dict[str, object]:
@@ -585,170 +362,80 @@ class DatabaseManager:
             "preferred_voice": "system_default",
             "preferred_reasoning_model": str(CONFIG.get("ollama", {}).get("model", "qwen2.5-coder:7b")),
             "preferred_live2d_model": str(CONFIG.get("paths", {}).get("default_live2d_model", "")),
-            "tts_enabled": True,
-            "voice_input_enabled": False,
-            "rag_enabled": True,
+            "tts_enabled": True, "voice_input_enabled": False, "rag_enabled": True,
             "speaking_speed": float(CONFIG.get("voice", {}).get("speaking_speed", 1.0)),
-            "system_prompt_behavior": "default",
-            "system_prompt_custom": "",
+            "system_prompt_behavior": "default", "system_prompt_custom": "",
         }
 
-        with self._lock:
-            row = self.conn.execute(
-                """
-                SELECT
-                    preferred_voice,
-                    preferred_reasoning_model,
-                    preferred_live2d_model,
-                    tts_enabled,
-                    voice_input_enabled,
-                    rag_enabled,
-                    speaking_speed,
-                    system_prompt_behavior,
-                    system_prompt_custom
-                FROM user_preferences
-                WHERE user_id = ?
-                """,
-                (int(user_id),),
-            ).fetchone()
+        row = self._execute_read_one("SELECT * FROM user_preferences WHERE user_id = ?", (int(user_id),))
+        if not row: return defaults
 
-        if not row:
-            return defaults
+        res = dict(defaults)
+        res["preferred_voice"] = str(row["preferred_voice"] or defaults["preferred_voice"])
+        res["preferred_reasoning_model"] = str(row["preferred_reasoning_model"] or defaults["preferred_reasoning_model"])
+        res["preferred_live2d_model"] = str(row["preferred_live2d_model"] or defaults["preferred_live2d_model"])
+        
+        res["tts_enabled"] = bool(row["tts_enabled"]) if row["tts_enabled"] is not None else defaults["tts_enabled"]
+        res["voice_input_enabled"] = bool(row["voice_input_enabled"]) if row["voice_input_enabled"] is not None else defaults["voice_input_enabled"]
+        res["rag_enabled"] = bool(row["rag_enabled"]) if row["rag_enabled"] is not None else defaults["rag_enabled"]
+        
+        try: res["speaking_speed"] = max(0.4, min(float(row["speaking_speed"]), 2.5))
+        except (TypeError, ValueError): pass
 
-        def _to_bool(value: object, fallback: bool) -> bool:
-            if value is None:
-                return fallback
-            return bool(int(value))
+        res["system_prompt_behavior"] = str(row["system_prompt_behavior"] or defaults["system_prompt_behavior"]).strip() or "default"
+        res["system_prompt_custom"] = str(row["system_prompt_custom"] or defaults["system_prompt_custom"])
+        return res
 
-        result = dict(defaults)
-        result["preferred_voice"] = str(row["preferred_voice"] or defaults["preferred_voice"])
-        result["preferred_reasoning_model"] = str(row["preferred_reasoning_model"] or defaults["preferred_reasoning_model"])
-        result["preferred_live2d_model"] = str(row["preferred_live2d_model"] or defaults["preferred_live2d_model"])
-        result["tts_enabled"] = _to_bool(row["tts_enabled"], bool(defaults["tts_enabled"]))
-        result["voice_input_enabled"] = _to_bool(row["voice_input_enabled"], bool(defaults["voice_input_enabled"]))
-        result["rag_enabled"] = _to_bool(row["rag_enabled"], bool(defaults["rag_enabled"]))
+    # --- RAD Memory ---
 
-        try:
-            result["speaking_speed"] = max(0.4, min(float(row["speaking_speed"]), 2.5))
-        except (TypeError, ValueError):
-            result["speaking_speed"] = defaults["speaking_speed"]
+    def add_rad_data(self, user_id: int, category: str, key_data: str, value_data: str, confidence_score: float = 1.0) -> None:
+        cat = self._clean_str(category, "user_fact") or "user_fact"
+        kd, vd = self._clean_str(key_data), self._clean_str(value_data)
+        
+        if self._rad_has_user_id:
+            self.safe_write_query(
+                "INSERT INTO rad_memory (user_id, category, key_data, value_data, confidence_score, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (int(user_id), cat, kd, vd, float(confidence_score), self._now())
+            )
+        else:
+            self.safe_write_query(
+                "INSERT INTO rad_memory (category, key_data, value_data, confidence_score, created_at) VALUES (?, ?, ?, ?, ?)",
+                (cat, kd, vd, float(confidence_score), self._now())
+            )
 
-        result["system_prompt_behavior"] = str(row["system_prompt_behavior"] or defaults["system_prompt_behavior"]).strip() or "default"
-        result["system_prompt_custom"] = str(row["system_prompt_custom"] or defaults["system_prompt_custom"])
+    def add_rad_data_if_new(self, user_id: int, category: str, key_data: str, value_data: str, confidence_score: float = 1.0) -> bool:
+        cat = self._clean_str(category, "user_fact") or "user_fact"
+        kd, vd = self._clean_str(key_data), self._clean_str(value_data)
+        if not kd or not vd: return False
 
-        return result
+        query = "SELECT id FROM rad_memory WHERE lower(category) = lower(?) AND lower(key_data) = lower(?) AND lower(value_data) = lower(?)"
+        params = [cat, kd, vd]
 
-    # --- RAD memory ---
-    def add_rad_data(
-        self,
-        user_id: int,
-        category: str,
-        key_data: str,
-        value_data: str,
-        confidence_score: float = 1.0,
-    ) -> None:
-        now = datetime.now().isoformat(timespec="seconds")
-        with self._lock:
-            if self._rad_has_user_id:
-                self.conn.execute(
-                    """
-                    INSERT INTO rad_memory (user_id, category, key_data, value_data, confidence_score, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        int(user_id),
-                        (category or "user_fact").strip() or "user_fact",
-                        (key_data or "").strip(),
-                        (value_data or "").strip(),
-                        float(confidence_score),
-                        now,
-                    ),
-                )
-            else:
-                self.conn.execute(
-                    """
-                    INSERT INTO rad_memory (category, key_data, value_data, confidence_score, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        (category or "user_fact").strip() or "user_fact",
-                        (key_data or "").strip(),
-                        (value_data or "").strip(),
-                        float(confidence_score),
-                        now,
-                    ),
-                )
-            self.conn.commit()
+        if self._rad_has_user_id:
+            query += " AND user_id = ?"
+            params.append(int(user_id))
 
-    def add_rad_data_if_new(
-        self,
-        user_id: int,
-        category: str,
-        key_data: str,
-        value_data: str,
-        confidence_score: float = 1.0,
-    ) -> bool:
-        clean_category = (category or "user_fact").strip() or "user_fact"
-        clean_key = (key_data or "").strip()
-        clean_value = (value_data or "").strip()
-        if not clean_key or not clean_value:
+        if self._execute_read_one(query + " LIMIT 1", tuple(params)):
             return False
 
-        with self._lock:
-            if self._rad_has_user_id:
-                row = self.conn.execute(
-                    """
-                    SELECT id FROM rad_memory
-                    WHERE user_id = ?
-                      AND lower(category) = lower(?)
-                      AND lower(key_data) = lower(?)
-                      AND lower(value_data) = lower(?)
-                    LIMIT 1
-                    """,
-                    (int(user_id), clean_category, clean_key, clean_value),
-                ).fetchone()
-            else:
-                row = self.conn.execute(
-                    """
-                    SELECT id FROM rad_memory
-                    WHERE lower(category) = lower(?)
-                      AND lower(key_data) = lower(?)
-                      AND lower(value_data) = lower(?)
-                    LIMIT 1
-                    """,
-                    (clean_category, clean_key, clean_value),
-                ).fetchone()
-
-            if row:
-                return False
-
-        self.add_rad_data(
-            user_id=user_id,
-            category=clean_category,
-            key_data=clean_key,
-            value_data=clean_value,
-            confidence_score=confidence_score,
-        )
+        self.add_rad_data(user_id, cat, kd, vd, confidence_score)
         return True
 
     @staticmethod
-    def _extract_important_facts(text: str) -> List[tuple[str, str, float]]:
-        clean = (text or "").strip()
-        if not clean:
-            return []
+    def _extract_important_facts(text: str) -> List[Tuple[str, str, float]]:
+        clean = str(text or "").strip()
+        if not clean: return []
 
+        facts = []
         lowered = clean.lower()
-        facts: List[tuple[str, str, float]] = []
 
-        explicit_prefixes = ["remember that", "remember", "note that", "important", "store this"]
-        for prefix in explicit_prefixes:
+        for prefix in ["remember that", "remember", "note that", "important", "store this"]:
             if lowered.startswith(prefix):
-                note = clean[len(prefix):].strip(" .,:;")
-                if note:
+                if note := clean[len(prefix):].strip(" .,:;"):
                     facts.append(("remembered_note", note, 0.96))
                 break
 
-        pattern_rules = [
+        patterns = [
             (r"\bmy name is\s+([a-zA-Z][a-zA-Z\s\.'-]{1,40})", "name", 0.98),
             (r"\bi am\s+(\d{1,3})\s+years old\b", "age", 0.97),
             (r"\bmy birthday is\s+([a-zA-Z0-9\s,/-]{2,40})", "birthday", 0.96),
@@ -757,163 +444,82 @@ class DatabaseManager:
             (r"\bi prefer\s+([a-zA-Z0-9\s\.,'-]{2,70})", "preference", 0.88),
         ]
 
-        for pattern, key, confidence in pattern_rules:
-            match = re.search(pattern, clean, flags=re.IGNORECASE)
-            if not match:
-                continue
-            value = match.group(1).strip(" .")
-            if value:
-                facts.append((key, value, confidence))
+        for pattern, key, conf in patterns:
+            if match := re.search(pattern, clean, flags=re.IGNORECASE):
+                if val := match.group(1).strip(" ."): facts.append((key, val, conf))
 
-        favorite_match = re.search(
-            r"\bmy favorite\s+([a-zA-Z\s]{2,24})\s+is\s+([a-zA-Z0-9\s\.,'-]{1,60})",
-            clean,
-            flags=re.IGNORECASE,
-        )
-        if favorite_match:
-            topic = re.sub(r"\s+", "_", favorite_match.group(1).strip().lower())
-            value = favorite_match.group(2).strip(" .")
-            if topic and value:
-                facts.append((f"favorite_{topic}", value, 0.91))
+        if match := re.search(r"\bmy favorite\s+([a-zA-Z\s]{2,24})\s+is\s+([a-zA-Z0-9\s\.,'-]{1,60})", clean, flags=re.IGNORECASE):
+            topic = re.sub(r"\s+", "_", match.group(1).strip().lower())
+            if val := match.group(2).strip(" ."): facts.append((f"favorite_{topic}", val, 0.91))
 
         return facts
 
     @staticmethod
-    def _extract_assistant_points(assistant_text: str) -> List[tuple[str, str, float]]:
-        clean = (assistant_text or "").strip()
-        if not clean:
-            return []
+    def _extract_assistant_points(assistant_text: str) -> List[Tuple[str, str, float]]:
+        clean = str(assistant_text or "").strip()
+        if not clean: return []
 
-        points: List[tuple[str, str, float]] = []
-        lines = [line.strip() for line in clean.splitlines() if line.strip()]
-        for line in lines:
-            collapsed = line.strip("-*• ")
-            if ":" not in collapsed:
-                continue
+        points = []
+        for line in filter(None, (ln.strip() for ln in clean.splitlines())):
+            if ":" not in (collapsed := line.strip("-*• ")): continue
+            k, v = collapsed.split(":", 1)
+            key = re.sub(r"[^a-z0-9]+", "_", k.lower()).strip("_")
+            val = v.strip(" .")
 
-            key_part, value_part = collapsed.split(":", 1)
-            key = re.sub(r"[^a-z0-9]+", "_", key_part.lower()).strip("_")
-            value = value_part.strip(" .")
-            if not key or not value:
-                continue
-            if len(key) > 36 or len(value) < 6:
-                continue
-
-            points.append((f"assistant_{key}", value, 0.72))
-            if len(points) >= 5:
-                break
-
+            if 0 < len(key) <= 36 and len(val) >= 6:
+                points.append((f"assistant_{key}", val, 0.72))
+                if len(points) >= 5: break
         return points
 
-    def auto_store_important_conversation_data(
-        self,
-        user_id: int,
-        user_text: str,
-        assistant_text: str = "",
-    ) -> List[Dict[str, str]]:
-        if user_id is None:
-            return []
+    def auto_store_important_conversation_data(self, user_id: int, user_text: str, assistant_text: str = "") -> List[Dict[str, str]]:
+        if not user_id: return []
 
-        candidates: List[tuple[str, str, float]] = []
-        candidates.extend(self._extract_important_facts(user_text))
-        candidates.extend(self._extract_assistant_points(assistant_text))
+        candidates = self._extract_important_facts(user_text) + self._extract_assistant_points(assistant_text)
+        stored, seen = [], set()
 
-        stored: List[Dict[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for key, value, confidence in candidates:
-            pair = (key, value)
-            if pair in seen:
-                continue
-            seen.add(pair)
+        for key, value, conf in candidates:
+            if (key, value) in seen: continue
+            seen.add((key, value))
 
-            if self.add_rad_data_if_new(
-                user_id=int(user_id),
-                category="auto_fact",
-                key_data=key,
-                value_data=value,
-                confidence_score=confidence,
-            ):
+            if self.add_rad_data_if_new(int(user_id), "auto_fact", key, value, conf):
                 stored.append({"key": key, "value": value})
-
         return stored
 
     def get_rad_data(self, user_id: int, limit: int = 300) -> List[Dict[str, object]]:
-        with self._lock:
-            if self._rad_has_user_id:
-                rows = self.conn.execute(
-                    """
-                    SELECT id, category, key_data, value_data, confidence_score, created_at
-                    FROM rad_memory
-                    WHERE user_id = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                    """,
-                    (int(user_id), max(1, int(limit))),
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    """
-                    SELECT id, category, key_data, value_data, confidence_score, created_at
-                    FROM rad_memory
-                    ORDER BY id DESC
-                    LIMIT ?
-                    """,
-                    (max(1, int(limit)),),
-                ).fetchall()
-
-        return [
-            {
-                "id": int(row["id"]),
-                "category": str(row["category"]),
-                "key_data": str(row["key_data"]),
-                "value_data": str(row["value_data"]),
-                "confidence_score": float(row["confidence_score"]),
-                "created_at": str(row["created_at"]),
-            }
-            for row in rows
-        ]
+        query = "SELECT id, category, key_data, value_data, confidence_score, created_at FROM rad_memory"
+        params = []
+        
+        if self._rad_has_user_id:
+            query += " WHERE user_id = ?"
+            params.append(int(user_id))
+            
+        rows = self._execute_read_all(query + " ORDER BY id DESC LIMIT ?", tuple(params + [max(1, limit)]))
+        return [dict(r) for r in rows]
 
     def delete_rad_data(self, user_id: int, rad_id: int) -> bool:
+        query = "DELETE FROM rad_memory WHERE id = ?"
+        params = [int(rad_id)]
+        
+        if self._rad_has_user_id:
+            query += " AND user_id = ?"
+            params.append(int(user_id))
+            
         with self._lock:
-            if self._rad_has_user_id:
-                cursor = self.conn.execute(
-                    "DELETE FROM rad_memory WHERE id = ? AND user_id = ?",
-                    (int(rad_id), int(user_id)),
-                )
-            else:
-                cursor = self.conn.execute(
-                    "DELETE FROM rad_memory WHERE id = ?",
-                    (int(rad_id),),
-                )
+            cursor = self.conn.execute(query, tuple(params))
             self.conn.commit()
             return cursor.rowcount > 0
-        
+
     def build_memory_context(self, user_id: int, session_id: Optional[str] = None) -> str:
-        """
-        Combines RAD memory + prior conversation turns for continuity.
-        Integrates cleanly with worker pipeline evaluations.
-        """
         rad_limit = int(CONFIG.get("memory", {}).get("rad_limit", 220))
         turn_limit = int(CONFIG.get("memory", {}).get("recent_turn_limit", 10))
         max_context_chars = int(CONFIG.get("memory", {}).get("max_context_chars", 9000))
-        
-        # Pull long term facts
-        rad_rows = self.get_rad_data(user_id, limit=rad_limit)
-        rad_context = "\n".join([f"{r['key_data']}: {r['value_data']}" for r in reversed(rad_rows)])
 
-        # Pull short term session memory window
-        turn_context = ""
-        if session_id:
-            turn_rows = self.get_recent_turns(session_id, turn_limit=turn_limit)
-            turn_context = "\n".join([f"{t['role'].title()}: {t['message']}" for t in turn_rows])
+        rad_context = "\n".join(f"{r['key_data']}: {r['value_data']}" for r in reversed(self.get_rad_data(user_id, rad_limit)))
+        turn_context = "\n".join(f"{t['role'].title()}: {t['message']}" for t in self.get_recent_turns(session_id, turn_limit)) if session_id else ""
 
         chunks = []
-        if rad_context: 
-            chunks.append("Known memory:\n" + rad_context)
-        if turn_context: 
-            chunks.append("Recent conversation:\n" + turn_context)
+        if rad_context: chunks.append(f"Known memory:\n{rad_context}")
+        if turn_context: chunks.append(f"Recent conversation:\n{turn_context}")
 
         context = "\n\n".join(chunks)
-        if len(context) <= max_context_chars:
-            return context
-        return context[-max_context_chars:]    
+        return context if len(context) <= max_context_chars else context[-max_context_chars:]

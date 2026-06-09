@@ -5,6 +5,7 @@ import sys
 import math
 import time
 import random
+import live2d
 
 # --- LIVE2D IMPORT ---
 try:
@@ -14,7 +15,7 @@ except ImportError:
     sys.exit()
 
 # --- CONFIGURATION ---
-MODEL_PATH = r"C:\FYPProject\models\kei\runtime\kei_vowels_pro.model3.json"
+MODEL_PATH = r"./models/Knight/knight.model3.json"  
 WINDOW_WIDTH = 800
 WINDOW_HEIGHT = 600
 
