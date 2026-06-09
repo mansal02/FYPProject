@@ -2347,6 +2347,44 @@ class PowerPointCommandHandler:
 
 
 class ActionHandler:
+    # --- PRE-COMPILED REGEX OPTIMIZATION ---
+    # Compiling these once saves significant CPU overhead during rapid tool execution
+    NATURAL_SEARCH_RX = re.compile(r"\b(?:search|find|locate|look\s+for)\b.*?\b(?:file|files|folder|folders|document|documents|path)\b\s+(.+)$", re.IGNORECASE)
+    NATURAL_OPEN_RX = re.compile(r"\bopen\b.*?\b(?:file|folder|document|path)\b\s+(.+)$", re.IGNORECASE)
+    NATURAL_LAUNCH_RX = re.compile(r"\b(?:open|launch|start|run)\b\s+(.+)$", re.IGNORECASE)
+    NATURAL_CLOSE_RX = re.compile(r"\b(?:close|quit|exit|kill|terminate)\b\s+(.+)$", re.IGNORECASE)
+    
+    CMD_FILES_ROOTS_RX = re.compile(r"files\s+roots\s*", re.IGNORECASE)
+    CMD_FILES_LIST_RX = re.compile(r"files\s+list\s+(.+?)\s*$", re.IGNORECASE)
+    CMD_FILES_SEARCH_RX = re.compile(r"files\s+deep\s+search\s+(.+?)(?:\s+in\s+(.+))?\s*$", re.IGNORECASE)
+    CMD_FILES_ANALYZE_RX = re.compile(r"files\s+analyze\s+(.+?)\s*$", re.IGNORECASE)
+    CMD_FILES_CREATE_RX = re.compile(r"files\s+create\s+file\s+(.+?)(?:\s+content\s+(.+))?\s*$", re.IGNORECASE)
+    CMD_FILES_MKDIR_RX = re.compile(r"files\s+create\s+(?:folder|dir|directory)\s+(.+?)\s*$", re.IGNORECASE)
+    CMD_FILES_MOVE_RX = re.compile(r"files\s+move\s+(.+?)\s*->\s*(.+?)\s*$", re.IGNORECASE)
+    CMD_FILES_COPY_RX = re.compile(r"files\s+copy\s+(.+?)\s*->\s*(.+?)\s*$", re.IGNORECASE)
+    CMD_FILES_DEL_RX = re.compile(r"files\s+(?:delete|remove)\s+(.+?)\s*$", re.IGNORECASE)
+    CMD_FILES_OPEN_RX = re.compile(r"files\s+open\s+(.+?)\s*$", re.IGNORECASE)
+    
+    CMD_SOFT_OPEN_RX = re.compile(r"software\s+open\s+(.+?)\s*$", re.IGNORECASE)
+    CMD_SOFT_CLOSE_RX = re.compile(r"software\s+close\s+(.+?)\s*$", re.IGNORECASE)
+    CMD_SOFT_RUN_RX = re.compile(r"software\s+running\s*", re.IGNORECASE)
+    CMD_SVC_OPEN_RX = re.compile(r"service\s+open\s+(.+?)\s*$", re.IGNORECASE)
+    
+    CMD_EMAIL_RX = re.compile(r"email\s+(draft|send)\s+to\s+(.+?)\s+subject\s+(.+?)\s+body\s+(.+?)(?:\s+attach\s+(.+?))?(?:\s+provider\s+(gmail|outlook|custom))?\s*$", re.IGNORECASE)
+    CMD_TG_SEND_RX = re.compile(r"telegram\s+send\s+to\s+(.+?)\s+token\s+(.+?)\s+message\s+(.+)\s*$", re.IGNORECASE)
+    CMD_TG_FILE_RX = re.compile(r"telegram\s+file\s+(.+?)\s+to\s+(.+?)\s+token\s+(.+?)(?:\s+caption\s+(.+))?\s*$", re.IGNORECASE)
+    CMD_WA_SEND_RX = re.compile(r"whatsapp\s+send\s+to\s+(.+?)\s+message\s+(.+)\s*$", re.IGNORECASE)
+
+    # General main execute regexes
+    CMD_WEB_RESEARCH_RX = re.compile(r"(?:web\s+research|research\s+web|research)\s+(.+)", re.IGNORECASE)
+    CMD_OPEN_WEB_RX = re.compile(r"(?:open\s+website|browse)\s+(.+)", re.IGNORECASE)
+    CMD_SEARCH_WEB_RX = re.compile(r"search\s+web\s+(.+)", re.IGNORECASE)
+    CMD_SAVE_CLIP_RX = re.compile(r"save\s+clipboard\s+to\s+rad\s+as\s+(.+)", re.IGNORECASE)
+    CMD_COPY_TEXT_RX = re.compile(r"(?:copy\s+selected\s+text|copy\s+now)", re.IGNORECASE)
+    CMD_PASTE_TEXT_RX = re.compile(r"(?:paste\s+clipboard|paste\s+now)", re.IGNORECASE)
+    CMD_SYS_CHECK_RX = re.compile(r"(?:system check|check system)", re.IGNORECASE)
+    CMD_MALWARE_SCAN_RX = re.compile(r"(?:malware scan|scan for malware|run malware scan|security quick scan)", re.IGNORECASE)
+
     @staticmethod
     def get_supported_command_sections():
         return {
@@ -2686,28 +2724,23 @@ class ActionHandler:
 
         lowered = raw_text.strip().lower()
 
-        natural_search_match = re.search(
-            r"\b(?:search|find|locate|look\s+for)\b.*?\b(?:file|files|folder|folders|document|documents|path)\b\s+(.+)$",
-            raw_text,
-            flags=re.IGNORECASE,
-        )
-        if natural_search_match and "website" not in lowered and "search web" not in lowered:
-            hint = natural_search_match.group(1).strip().strip('"').strip("'")
-            if hint:
-                self._run_tool_bridge_action({"action": "search_file", "hint": hint, "max_results": 20, "include_content": True})
-                return True
+        if match := self.NATURAL_SEARCH_RX.search(raw_text):
+            if "website" not in lowered and "search web" not in lowered:
+                hint = match.group(1).strip().strip('"').strip("'")
+                if hint:
+                    self._run_tool_bridge_action({"action": "search_file", "hint": hint, "max_results": 20, "include_content": True})
+                    return True
 
-        natural_open_match = re.search(r"\bopen\b.*?\b(?:file|folder|document|path)\b\s+(.+)$", raw_text, flags=re.IGNORECASE)
-        if natural_open_match and "website" not in lowered:
-            target_hint = natural_open_match.group(1).strip().strip('"').strip("'")
-            if target_hint:
-                self._run_tool_bridge_action({"action": "open_file", "path": target_hint, "resolve_by_hint": True, "include_content": True})
-                return True
+        if match := self.NATURAL_OPEN_RX.search(raw_text):
+            if "website" not in lowered:
+                target_hint = match.group(1).strip().strip('"').strip("'")
+                if target_hint:
+                    self._run_tool_bridge_action({"action": "open_file", "path": target_hint, "resolve_by_hint": True, "include_content": True})
+                    return True
 
-        natural_open_app_match = re.search(r"\b(?:open|launch|start|run)\b\s+(.+)$", raw_text, flags=re.IGNORECASE)
-        if natural_open_app_match:
+        if match := self.NATURAL_LAUNCH_RX.search(raw_text):
             if not re.search(r"\b(file|files|folder|folders|document|documents|path)\b", lowered):
-                app_target = natural_open_app_match.group(1).strip().strip('"').strip("'")
+                app_target = match.group(1).strip().strip('"').strip("'")
                 app_target = re.sub(r"\b(?:please|now|for\s+me|thanks|thank\s+you)\b", " ", app_target, flags=re.IGNORECASE)
                 app_target = re.sub(r"\b(?:app|application|software|program)\b", " ", app_target, flags=re.IGNORECASE)
                 app_target = re.sub(r"^(?:the|a|an)\s+", "", app_target, flags=re.IGNORECASE)
@@ -2720,10 +2753,9 @@ class ActionHandler:
                         self._run_tool_bridge_action({"action": "launch_application", "app": app_target})
                     return True
 
-        natural_close_app_match = re.search(r"\b(?:close|quit|exit|kill|terminate)\b\s+(.+)$", raw_text, flags=re.IGNORECASE)
-        if natural_close_app_match:
+        if match := self.NATURAL_CLOSE_RX.search(raw_text):
             if not re.search(r"\b(file|files|folder|folders|document|documents|path)\b", lowered):
-                close_target = natural_close_app_match.group(1).strip().strip('"').strip("'")
+                close_target = match.group(1).strip().strip('"').strip("'")
                 close_target = re.sub(r"\b(?:please|now|for\s+me|thanks|thank\s+you)\b", " ", close_target, flags=re.IGNORECASE)
                 close_target = re.sub(r"\b(?:app|application|software|program)\b", " ", close_target, flags=re.IGNORECASE)
                 close_target = re.sub(r"^(?:the|a|an)\s+", "", close_target, flags=re.IGNORECASE)
@@ -2732,17 +2764,15 @@ class ActionHandler:
                     self._run_tool_bridge_action({"action": "close_application", "app": close_target})
                     return True
 
-        if re.fullmatch(r"files\s+roots\s*", raw_text, flags=re.IGNORECASE):
+        if self.CMD_FILES_ROOTS_RX.fullmatch(raw_text):
             self._run_tool_bridge_action({"action": "list_system_roots"})
             return True
 
-        match = re.fullmatch(r"files\s+list\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_FILES_LIST_RX.fullmatch(raw_text):
             self._run_tool_bridge_action({"action": "list_directory", "path": match.group(1).strip(), "max_results": 120})
             return True
 
-        match = re.fullmatch(r"files\s+deep\s+search\s+(.+?)(?:\s+in\s+(.+))?\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_FILES_SEARCH_RX.fullmatch(raw_text):
             query, root = match.groups()
             action = {"action": "deep_search", "query": query.strip(), "max_results": 40, "include_content": True}
             if root:
@@ -2752,65 +2782,54 @@ class ActionHandler:
             self._run_tool_bridge_action(action)
             return True
 
-        match = re.fullmatch(r"files\s+analyze\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_FILES_ANALYZE_RX.fullmatch(raw_text):
             self._run_tool_bridge_action({"action": "analyze_path", "path": match.group(1).strip()})
             return True
 
-        match = re.fullmatch(r"files\s+create\s+file\s+(.+?)(?:\s+content\s+(.+))?\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_FILES_CREATE_RX.fullmatch(raw_text):
             path, content = match.groups()
             self._run_tool_bridge_action({"action": "create_path", "path": path.strip(), "kind": "file", "content": (content or "").strip(), "overwrite": False})
             return True
 
-        match = re.fullmatch(r"files\s+create\s+(?:folder|dir|directory)\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_FILES_MKDIR_RX.fullmatch(raw_text):
             self._run_tool_bridge_action({"action": "create_path", "path": match.group(1).strip(), "kind": "directory"})
             return True
 
-        match = re.fullmatch(r"files\s+move\s+(.+?)\s*->\s*(.+?)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_FILES_MOVE_RX.fullmatch(raw_text):
             src, dst = match.groups()
             self._run_tool_bridge_action({"action": "move_path", "src": src.strip(), "dst": dst.strip()})
             return True
 
-        match = re.fullmatch(r"files\s+copy\s+(.+?)\s*->\s*(.+?)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_FILES_COPY_RX.fullmatch(raw_text):
             src, dst = match.groups()
             self._run_tool_bridge_action({"action": "copy_path", "src": src.strip(), "dst": dst.strip()})
             return True
 
-        match = re.fullmatch(r"files\s+(?:delete|remove)\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_FILES_DEL_RX.fullmatch(raw_text):
             self._run_tool_bridge_action({"action": "delete_path", "path": match.group(1).strip(), "recursive": True, "use_trash": True})
             return True
 
-        match = re.fullmatch(r"files\s+open\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_FILES_OPEN_RX.fullmatch(raw_text):
             self._run_tool_bridge_action({"action": "open_file", "path": match.group(1).strip(), "resolve_by_hint": True, "include_content": True})
             return True
 
-        match = re.fullmatch(r"software\s+open\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_SOFT_OPEN_RX.fullmatch(raw_text):
             self._run_tool_bridge_action({"action": "launch_application", "app": match.group(1).strip()})
             return True
 
-        match = re.fullmatch(r"software\s+close\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_SOFT_CLOSE_RX.fullmatch(raw_text):
             self._run_tool_bridge_action({"action": "close_application", "app": match.group(1).strip()})
             return True
 
-        if re.fullmatch(r"software\s+running\s*", raw_text, flags=re.IGNORECASE):
+        if self.CMD_SOFT_RUN_RX.fullmatch(raw_text):
             self._run_tool_bridge_action({"action": "list_running_apps", "max_results": 120})
             return True
 
-        match = re.fullmatch(r"service\s+open\s+(.+?)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_SVC_OPEN_RX.fullmatch(raw_text):
             self._run_tool_bridge_action({"action": "open_service", "service": match.group(1).strip()})
             return True
 
-        match = re.fullmatch(r"email\s+(draft|send)\s+to\s+(.+?)\s+subject\s+(.+?)\s+body\s+(.+?)(?:\s+attach\s+(.+?))?(?:\s+provider\s+(gmail|outlook|custom))?\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_EMAIL_RX.fullmatch(raw_text):
             mode, to_email, subject, body, attachment, provider = match.groups()
             payload = {
                 "action": "send_email",
@@ -2825,20 +2844,17 @@ class ActionHandler:
             self._run_tool_bridge_action(payload)
             return True
 
-        match = re.fullmatch(r"telegram\s+send\s+to\s+(.+?)\s+token\s+(.+?)\s+message\s+(.+)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_TG_SEND_RX.fullmatch(raw_text):
             chat_id, token, message = match.groups()
             self._run_tool_bridge_action({"action": "send_telegram", "chat_id": chat_id.strip(), "bot_token": token.strip(), "message": message.strip()})
             return True
 
-        match = re.fullmatch(r"telegram\s+file\s+(.+?)\s+to\s+(.+?)\s+token\s+(.+?)(?:\s+caption\s+(.+))?\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_TG_FILE_RX.fullmatch(raw_text):
             file_hint, chat_id, token, caption = match.groups()
             self._run_tool_bridge_action({"action": "send_telegram", "chat_id": chat_id.strip(), "bot_token": token.strip(), "file_hint": file_hint.strip(), "message": (caption or "").strip()})
             return True
 
-        match = re.fullmatch(r"whatsapp\s+send\s+to\s+(.+?)\s+message\s+(.+)\s*$", raw_text, flags=re.IGNORECASE)
-        if match:
+        if match := self.CMD_WA_SEND_RX.fullmatch(raw_text):
             to_number, message = match.groups()
             self._run_tool_bridge_action({"action": "send_whatsapp", "to": to_number.strip(), "message": message.strip()})
             return True
@@ -2851,12 +2867,19 @@ class ActionHandler:
         value = action_obj.get("value", "")
 
         if action == "open":
-            return self._run_tool_bridge_action({"action": "launch_application", "app": target})
+            import AppOpener, openpyxl, docx, pptx, pyautogui 
+            if not target:
+                return False
+            app_name = AppOpener.identify_app(target)
+            if app_name:
+                return self._run_tool_bridge_action({"action": "launch_application", "app": app_name})
 
         if action == "close":
             return self._run_tool_bridge_action({"action": "close_application", "app": target})
 
         if action == "search_web":
+            import webbrowser # <-- Lazy Loaded
+            from urllib.parse import quote_plus
             if not target:
                 return False
             search_url = f"https://duckduckgo.com/?q={quote_plus(target)}"
@@ -2865,6 +2888,7 @@ class ActionHandler:
             return True
 
         if action == "open_website":
+            import webbrowser # <-- Lazy Loaded
             if not target:
                 return False
             url = target if target.startswith(("http://", "https://")) else "https://" + target
@@ -2873,6 +2897,7 @@ class ActionHandler:
             return True
 
         if action == "volume":
+            import pyautogui # <-- Lazy Loaded
             value_text = f"{target} {value}".lower()
             if "up" in value_text:
                 pyautogui.press("volumeup")
@@ -2886,6 +2911,7 @@ class ActionHandler:
             return False
 
         if action == "write_note":
+            import pyautogui # <-- Lazy Loaded
             content = target or str(value)
             if not content:
                 return False
@@ -2896,9 +2922,9 @@ class ActionHandler:
             return True
 
         if action == "play":
+            import pywhatkit # <-- Lazy Loaded
             if not target:
                 return False
-            import pywhatkit
             pywhatkit.playonyt(target)
             print(f"[ACTION] Playing on YouTube: {target}")
             return True
@@ -2957,29 +2983,26 @@ class ActionHandler:
                 self.powerpoint.handle("powerpoint help")
                 return
 
-            web_research_match = re.fullmatch(r"(?:web\s+research|research\s+web|research)\s+(.+)", raw_text, flags=re.IGNORECASE)
-            if web_research_match:
-                query = web_research_match.group(1)
+            if match := self.CMD_WEB_RESEARCH_RX.fullmatch(raw_text):
+                query = match.group(1)
                 self._research_and_store_web_data(query)
                 return
 
-            open_web_match = re.fullmatch(r"(?:open\s+website|browse)\s+(.+)", raw_text, flags=re.IGNORECASE)
-            if open_web_match:
-                url = open_web_match.group(1).strip()
+            if match := self.CMD_OPEN_WEB_RX.fullmatch(raw_text):
+                url = match.group(1).strip()
                 url = url if url.startswith(("http://", "https://")) else "https://" + url
                 webbrowser.open(url)
                 print(f"[ACTION][WEB] Opened {url}")
                 return
 
-            search_web_match = re.fullmatch(r"search\s+web\s+(.+)", raw_text, flags=re.IGNORECASE)
-            if search_web_match:
-                query = search_web_match.group(1).strip()
+            if match := self.CMD_SEARCH_WEB_RX.fullmatch(raw_text):
+                query = match.group(1).strip()
                 search_url = f"[https://duckduckgo.com/?q=](https://duckduckgo.com/?q=){quote_plus(query)}"
                 webbrowser.open(search_url)
                 print(f"[ACTION][WEB] Searching web for: {query}")
                 return
 
-            if re.fullmatch(r"(?:copy\s+selected\s+text|copy\s+now)", text):
+            if self.CMD_COPY_TEXT_RX.fullmatch(text):
                 pyautogui.hotkey("ctrl", "c")
                 time.sleep(0.2)
                 if CLIPBOARD_AVAILABLE:
@@ -2990,13 +3013,12 @@ class ActionHandler:
                     print("[ACTION][CLIPBOARD] Copied selection (clipboard preview unavailable).")
                 return
 
-            if re.fullmatch(r"(?:paste\s+clipboard|paste\s+now)", text):
+            if self.CMD_PASTE_TEXT_RX.fullmatch(text):
                 pyautogui.hotkey("ctrl", "v")
                 print("[ACTION][CLIPBOARD] Pasted clipboard into active software.")
                 return
 
-            save_clip_match = re.fullmatch(r"save\s+clipboard\s+to\s+rad\s+as\s+(.+)", raw_text, flags=re.IGNORECASE)
-            if save_clip_match:
+            if match := self.CMD_SAVE_CLIP_RX.fullmatch(raw_text):
                 if not CLIPBOARD_AVAILABLE:
                     print("[ACTION][RAD] pyperclip not installed. Run: pip install pyperclip")
                     return
@@ -3004,7 +3026,7 @@ class ActionHandler:
                     print("[ACTION][RAD] Database connection unavailable for clipboard save.")
                     return
 
-                key_name = save_clip_match.group(1).strip().strip('"').strip("'")
+                key_name = match.group(1).strip().strip('"').strip("'")
                 clip_text = pyperclip.paste().strip()
                 if not clip_text:
                     print("[ACTION][RAD] Clipboard is empty.")
@@ -3017,11 +3039,11 @@ class ActionHandler:
                     print(f"[ACTION][RAD] Duplicate clipboard note ignored for key '{key_name}'.")
                 return
 
-            if re.fullmatch(r"(?:system check|check system)", text):
+            if self.CMD_SYS_CHECK_RX.fullmatch(text):
                 self._print_system_check()
                 return
 
-            if re.fullmatch(r"(?:malware scan|scan for malware|run malware scan|security quick scan)", text):
+            if self.CMD_MALWARE_SCAN_RX.fullmatch(text):
                 threading.Thread(target=self._run_quick_malware_scan, daemon=True).start()
                 return
 

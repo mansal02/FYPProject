@@ -1027,11 +1027,13 @@ class AgentFactory:
 # 10. MAIN EXECUTION ENGINE (OfflineAgentCore)
 # =====================================================================
 class OfflineAgentCore:
-    def __init__(self, db: Optional[DatabaseManager] = None, config: Optional[AgentConfig] = None) -> None:
+    
+    def __init__(self, db: Optional[DatabaseManager] = None, config: Optional[AgentConfig] = None, user_id: int = 0) -> None:
         self.db = db or DatabaseManager()
         self.config = config or AgentConfig()
-        self.config.reasoning_model = FORCED_REASONING_MODEL
+        self.user_id = user_id or 1
 
+        self.config.reasoning_model = FORCED_REASONING_MODEL
         self.session_id = self.db.create_session(label="offline_desktop_assistant")
         self.stop_event = threading.Event()
         self.rag_enabled = bool(self.config.rag_enabled)
@@ -1198,6 +1200,11 @@ class OfflineAgentCore:
         if ltm_text:
             system_prompt += "\n\nLong-Term Memory:\n" + ltm_text
 
+        if hasattr(self.db, "build_memory_context"):
+            db_memory = self.db.build_memory_context(getattr(self, 'user_id', 0), self.session_id)
+            if db_memory:
+                system_prompt += "\n\nDatabase Knowledge:\n" + db_memory
+
         messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
         for item in recent_history:
             role = item.get("role", "user")
@@ -1206,6 +1213,21 @@ class OfflineAgentCore:
                 messages.append({"role": role, "content": content})
 
         context_sections = [f"User request: {user_text}"]
+        
+        if hasattr(self.db, "search_searchable_mirror"):
+            # Query the SQLite FTS mirror using the user's text
+            mirror_results = self.db.search_searchable_mirror(user_text, limit=3)
+            if mirror_results:
+                mirror_texts = []
+                for res in mirror_results:
+                    path = res.get("file_path", "")
+                    snip = res.get("snippet", "")
+                    if path and snip:
+                        mirror_texts.append(f"File: {path}\nSnippet: {snip}")
+                
+                if mirror_texts:
+                    context_sections.append("Indexed File Content:\n" + "\n---\n".join(mirror_texts))
+
         if rag_context:
             context_sections.append(f"Local knowledge snippets (RAG):\n{rag_context}\nUse only if relevant and do not invent citations.")
         if crew_context:

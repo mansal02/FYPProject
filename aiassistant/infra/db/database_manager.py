@@ -257,6 +257,14 @@ class DatabaseManager:
             snippet = raw[max(0, idx - 120):min(len(raw), idx + 240)].strip() if idx >= 0 else ""
             results.append({"file_path": str(row["file_path"]), "snippet": snippet})
         return results
+    
+    def list_all_searchable_mirror(self, limit: int = 100) -> List[Dict[str, str]]:
+        """Retrieves all entries from the searchable_mirror table."""
+        rows = self._execute_read_all(
+            "SELECT file_path, raw_text_or_data FROM searchable_mirror ORDER BY id DESC LIMIT ?",
+            (max(1, int(limit)),)
+        )
+        return [{"file_path": str(r["file_path"]), "snippet": str(r["raw_text_or_data"] or "")[:240]} for r in rows]
 
     # --- Style Profiles ---
 

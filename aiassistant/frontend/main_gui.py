@@ -8,7 +8,7 @@ runners to prevent UI freezing.
 from __future__ import annotations
 
 # === Imports ===
-import argparse, faulthandler, html, json, math, os, re, subprocess, sys, time, threading, pyautogui, openpyxl
+import argparse, faulthandler,contextlib, io, html, json, math, os, re, subprocess, sys, time, threading, pyautogui, openpyxl
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -20,11 +20,39 @@ from PyQt5.QtWidgets import (
     QMessageBox, QPushButton, QTabWidget, QTableWidget, QTableWidgetItem, QTextEdit,
     QVBoxLayout, QWidget,
 )
-
+from aiassistant.tools.tools_os import ActionHandler
 from aiassistant.core.llm_core import AgentConfig, OfflineAgentCore
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.doc_indexer import build_default_indexer
 from aiassistant.infra.db.database_manager import DatabaseManager
+
+class FastNativeActionWorker(QThread):
+    """
+    Executes actions directly in memory using a pre-warmed ActionHandler.
+    Zero subprocess cold-start latency.
+    """
+    finished_action = pyqtSignal(bool, str)
+    
+    def __init__(self, raw_text=None, json_cmd=None):
+        super().__init__()
+        self.raw_text = raw_text
+        self.json_cmd = json_cmd
+        # Instantiate the handler once so it stays warm
+        self.handler = ActionHandler() 
+        
+    def run(self):
+        try:
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                if self.json_cmd:
+                    self.handler._execute_json_action(self.json_cmd)
+                elif self.raw_text:
+                    self.handler.execute(self.raw_text)
+            
+            output = buffer.getvalue().strip()
+            self.finished_action.emit(True, output or "[ACTION] Executed instantly.")
+        except Exception as e:
+            self.finished_action.emit(False, f"[ACTION ERROR] {e}")
 
 
 def _bootstrap_env_bool(name: str, default: bool = False) -> bool:
@@ -224,14 +252,85 @@ def run_json_tool_isolated(action_payload: Dict, timeout_sec: int = 55) -> tuple
 class JsonActionWorker(QThread):
     """Asynchronous runner to execute JSON-based shell utility tools."""
     finished_action = pyqtSignal(bool, str)
+    error_occurred = pyqtSignal(str)
 
-    def __init__(self, action_cmd: Dict) -> None:
+    def __init__(self, action_cmd: dict, timeout_sec: int = 55) -> None:
         super().__init__()
         self.action_cmd = action_cmd
+        self.timeout_sec = timeout_sec
+        self._is_cancelled = False
+        self._process = None
+        
+    def cancel(self) -> None:
+        """Gracefully interrupts the running subprocess if the user stops the agent."""
+        self._is_cancelled = True
+        if self._process:
+            try:
+                self._process.kill()
+            except Exception:
+                pass
 
     def run(self) -> None:
-        ok, result = run_json_tool_isolated(self.action_cmd)
-        self.finished_action.emit(ok, result)
+        from aiassistant.infra.config.app_config import ROOT_DIR
+        
+        command = [sys.executable, "-m", "aiassistant.tools.tools_os", "--action-json", json.dumps(self.action_cmd)]
+        child_env = os.environ.copy()
+        child_env["PYTHONPATH"] = str(ROOT_DIR)
+
+        try:
+            # Using Popen allows us to terminate it mid-flight if canceled
+            self._process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(ROOT_DIR),
+                env=child_env
+            )
+
+            try:
+                stdout, stderr = self._process.communicate(timeout=self.timeout_sec)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                stdout, stderr = self._process.communicate()
+                self.finished_action.emit(False, "[ACTION] Command timed out in isolated runner.")
+                return
+
+            # Check if we were aborted during execution
+            if self._is_cancelled:
+                self.finished_action.emit(False, "[ACTION] Execution cancelled by user.")
+                return
+
+            stdout_text = (stdout or "").strip()
+            stderr_text = (stderr or "").strip()
+
+            # Parse the last valid JSON line output from tools_os.py
+            for line in reversed(stdout_text.splitlines()):
+                try:
+                    result = json.loads(line)
+                    if isinstance(result, dict) and "success" in result:
+                        msg = result.get("message", "")
+                        data = result.get("data", "")
+                        err = result.get("error", "")
+                        if result["success"]:
+                            self.finished_action.emit(True, f"{msg} {data}".strip())
+                        else:
+                            self.finished_action.emit(False, f"{msg} {err}".strip())
+                        return
+                except json.JSONDecodeError:
+                    continue
+
+            # Fallback if no valid JSON was found
+            output = "\n".join(part for part in [stdout_text, stderr_text] if part).strip()
+            ok = self._process.returncode == 0
+            fallback_msg = output or (f"[ACTION] Exited with code {self._process.returncode}." if not ok else "")
+            
+            self.finished_action.emit(ok, fallback_msg)
+
+        except Exception as exc:
+            self.error_occurred.emit(f"[ACTION] Isolated runner failed to start: {exc}")
+        finally:
+            self._process = None
 
 # === Worker Threads ===
 class AgentWorker(QThread):
@@ -380,6 +479,7 @@ class AssistantMainWindow(QMainWindow):
                 hybrid_mode=False,
                 online_mode="offline",
             ),
+            user_id=self.current_user_id or 1,
         )
         self.agent.set_system_prompt_behavior("default", "")
         self.allow_legacy_text_actions = bool(CONFIG.get("actions", {}).get("allow_legacy_text_commands", True))
@@ -724,7 +824,18 @@ class AssistantMainWindow(QMainWindow):
         
         self.input_line.clear()
         self._append_chat("You", message)
-
+        
+        temp_handler = ActionHandler()
+        if temp_handler._looks_like_action_command(message) and not self.response_only_mode:
+            self._set_status_core("Executing instantly...")
+            
+            # Spin up the warm memory worker instead of an LLM call
+            self.fast_worker = FastNativeActionWorker(raw_text=message)
+            self.fast_worker.finished_action.connect(self._on_action_completed)
+            self.fast_worker.start()
+            return
+        self._set_status_core("Thinking...")
+        
         if self.worker and self.worker.isRunning():
             return
 
@@ -783,6 +894,7 @@ class AssistantMainWindow(QMainWindow):
         self._set_status_core("Cancellation Requested...")
         self.chat_box.append("<p style='color: #ff4d6d;'><b>System:</b> Halting active inference tasks cooperatively...</p>")
         QTimer.singleShot(800, lambda: self._set_status_core("Stopped"))
+        if self.json_action_worker: self.json_action_worker.cancel()
 
     def on_resume_clicked(self) -> None:
         self.agent.reset_stop()
@@ -862,7 +974,7 @@ class AssistantMainWindow(QMainWindow):
         if selected_category == "Searchable Mirror":
             self.rad_table.setColumnCount(2)
             self.rad_table.setHorizontalHeaderLabels(["File Path", "Snippet"])
-            results = self.db.search_searchable_mirror("%", limit=300)
+            results = self.db.list_all_searchable_mirror(limit=100)
             
             for idx, row in enumerate(results):
                 self.rad_table.insertRow(idx)
@@ -871,7 +983,7 @@ class AssistantMainWindow(QMainWindow):
         else:
             self.rad_table.setColumnCount(6)
             self.rad_table.setHorizontalHeaderLabels(["ID", "Category", "Key", "Value", "Confidence", "Created"])
-            rows = self.db.get_rad_data(self.current_user_id, limit=300)
+            rows = self.db.get_rad_data(self.current_user_id, limit=100)
             filtered_rows = [r for r in rows if r.get("category") == selected_category]
             
             for idx, row in enumerate(filtered_rows):
