@@ -105,6 +105,18 @@ SYSTEM_PROMPT = (
     "Do not include JSON or tool syntax in normal user-facing replies. "
     "For simple requests, answer in easy plain language and keep it direct. "
     "For complex requests, provide enough detail to be useful without over-explaining."
+    "If the user uploads FILE DATA in JSON format, analyze the data strictly based on their prompt. "
+    "If they ask a question, answer it concisely in the chat. "
+    "If they ask to 'create a report', 'generate a summary file', or 'export to word/excel', use the `<tool>` format to trigger the 'create_word_doc' or 'analyze_excel' tool with the analyzed findings. "
+    "If the user asks to create a report from the data, use the tool format: "
+    "<tool>{\"action\": \"create_word_doc\", \"filename\": \"report.docx\", \"title\": \"Summary\", \"content\": \"[Your detailed analysis here]\"}</tool>"
+    "If the user uploaded a file and asks to generate a report, use the following tools based on the format requested: "
+    "For Word (.docx): "
+    "<tool>{\"action\": \"create_word_doc\", \"filename\": \"report.docx\", \"title\": \"Summary\", \"content\": \"[Text]\"}</tool> "
+    "For PDF (.pdf): "
+    "<tool>{\"action\": \"create_pdf_report\", \"filename\": \"report.pdf\", \"title\": \"Summary\", \"content\": \"[Text]\"}</tool> "
+    "For Excel (.xlsx): "
+    "<tool>{\"action\": \"create_excel_report\", \"filename\": \"data.xlsx\", \"table_data\": [{\"Col1\": \"Val1\", \"Col2\": \"Val2\"}, {\"Col1\": \"Val3\", \"Col2\": \"Val4\"}]}</tool>"
 )
 
 FILE_RESPONSE_GUARD = (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse, contextlib, csv, difflib, fnmatch, importlib, io, json, mimetypes, os, platform, random, re, shutil, smtplib, subprocess, sys, threading, time, webbrowser
+import pandas as pd
 from email.message import EmailMessage
 from io import StringIO
 from pathlib import Path
@@ -13,7 +14,6 @@ from openpyxl.utils import get_column_letter
 
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.db.database_manager import DatabaseManager
-from aiassistant.infra.db.database import MarieDB
 
 
 # -----------------------------------------------------------------------------
@@ -269,25 +269,103 @@ def search_local_files(query: str, limit: int = 5) -> str:
 
 def execute_office_tool(tool_name: str, payload: dict) -> dict:
     """
-    Dynamically routes Office Automation tasks and guarantees a safe return state,
-    preventing the LLM from hallucinating successful execution.
+    Dynamically routes Office Automation tasks, generates Word, PDF, or Excel files,
+    and opens them on the user's screen.
     """
     try:
+        # 1. Define the universal drop location (Desktop/MARIE_Reports)
+        save_dir = Path.home() / "Desktop" / "MARIE_Reports"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # --- WORD EXPORT ---
         if tool_name == "create_word_doc":
             if not DOCX_AVAILABLE:
-                return {"success": False, "error": "The 'python-docx' library is missing. Cannot modify Word documents."}
-            return {"success": True, "message": f"Successfully created document at {payload.get('path')}"}
+                return {"success": False, "error": "The 'python-docx' library is missing."}
             
-        elif tool_name == "analyze_excel":
-            if 'openpyxl' not in globals():
-                return {"success": False, "error": "The 'openpyxl' library is missing. Cannot modify Excel spreadsheets."}
-            return {"success": True, "message": "Excel data inserted and analyzed successfully."}
+            filename = payload.get("filename", "MARIE_Report.docx")
+            if not filename.endswith(".docx"): filename += ".docx"
+            filepath = save_dir / filename
+
+            doc = Document()
+            doc.add_heading(payload.get("title", "Data Analysis Report"), 0)
+            
+            for paragraph_text in payload.get("content", "").split('\n'):
+                if paragraph_text.strip(): doc.add_paragraph(paragraph_text.strip())
+            
+            doc.save(str(filepath))
+            if hasattr(os, 'startfile'): os.startfile(str(filepath))
+            return {"success": True, "message": f"Word report generated at {filepath}"}
+            
+        # --- PDF EXPORT ---
+        elif tool_name == "create_pdf_report":
+            try:
+                from fpdf import FPDF
+            except ImportError:
+                return {"success": False, "error": "The 'fpdf' library is missing. Run: pip install fpdf"}
+
+            filename = payload.get("filename", "MARIE_Report.pdf")
+            if not filename.endswith(".pdf"): filename += ".pdf"
+            filepath = save_dir / filename
+
+            pdf = FPDF()
+            pdf.add_page()
+            
+            # Title
+            pdf.set_font("Arial", 'B', 16)
+            pdf.cell(0, 10, txt=payload.get("title", "Data Analysis Report"), ln=True, align='C')
+            
+            # Content
+            pdf.set_font("Arial", size=12)
+            pdf.ln(10)
+            
+            # FPDF uses Latin-1, so we encode/decode to prevent unicode crashing
+            content = payload.get("content", "No analysis content provided.")
+            clean_content = content.encode('latin-1', 'replace').decode('latin-1')
+            pdf.multi_cell(0, 10, txt=clean_content)
+            
+            pdf.output(str(filepath))
+            if hasattr(os, 'startfile'): os.startfile(str(filepath))
+            return {"success": True, "message": f"PDF report generated at {filepath}"}
+
+        # --- EXCEL EXPORT ---
+        elif tool_name == "create_excel_report":
+            if 'openpyxl' not in globals() and 'openpyxl' not in sys.modules:
+                return {"success": False, "error": "The 'openpyxl' library is missing."}
+                
+            filename = payload.get("filename", "MARIE_Data.xlsx")
+            if not filename.endswith(".xlsx"): filename += ".xlsx"
+            filepath = save_dir / filename
+
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Analysis Report"
+
+            table_data = payload.get("table_data", [])
+            if not table_data:
+                ws.append(["Notice", "No structured data provided for Excel export."])
+            else:
+                # Dynamically write rows based on the LLM's JSON list
+                for row in table_data:
+                    if isinstance(row, dict):
+                        # Write headers if it's the first row
+                        if ws.max_row == 1 and not ws.cell(1,1).value:
+                            ws.append(list(row.keys()))
+                        ws.append(list(row.values()))
+                    elif isinstance(row, list):
+                        ws.append(row)
+                    else:
+                        ws.append([str(row)])
+
+            wb.save(str(filepath))
+            if hasattr(os, 'startfile'): os.startfile(str(filepath))
+            return {"success": True, "message": f"Excel report generated at {filepath}"}
             
         else:
             return {"success": False, "error": f"Unknown tool requested: {tool_name}"}
             
     except PermissionError:
-        return {"success": False, "error": "Permission denied. Please close the file if it is open in another program."}
+        return {"success": False, "error": "Permission denied. Please close the file if it is currently open."}
     except Exception as e:
         return {"success": False, "error": f"Tool execution crashed: {str(e)}"}
 
@@ -426,6 +504,108 @@ def _normalize_office_path(file_name: str, default_extension: str) -> str:
     if parent:
         os.makedirs(parent, exist_ok=True)
     return clean_name
+
+def convert_file_to_json(file_path: str, max_chars: int = 15000) -> dict:
+    """Converts supported files (.xlsx, .docx, .pdf) into a JSON structure."""
+    path = Path(file_path).expanduser().resolve()
+    if not path.exists():
+        return {"error": "File not found"}
+
+    ext = path.suffix.lower()
+    file_data = {"filename": path.name, "type": ext, "content": None}
+
+    try:
+        # 1. Handle Excel
+        if ext in {".xlsx", ".xls", ".csv"}:
+            if ext == ".csv":
+                df = pd.read_csv(path)
+            else:
+                df = pd.read_excel(path, sheet_name=None)
+                
+            if isinstance(df, dict): # Multiple sheets
+                sheet_data = {}
+                for sheet_name, sheet_df in df.items():
+                    sheet_data[sheet_name] = json.loads(sheet_df.to_json(orient="records"))
+                file_data["content"] = sheet_data
+            else:
+                file_data["content"] = json.loads(df.to_json(orient="records"))
+
+        # 2. Handle PDF
+        elif ext == ".pdf":
+            import PyPDF2
+            with path.open("rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                pages = []
+                for i, page in enumerate(reader.pages):
+                    text = page.extract_text()
+                    if text: pages.append({"page": i+1, "text": text.strip()})
+                file_data["content"] = pages
+
+        # 3. Handle Word
+        elif ext in {".doc", ".docx"}:
+            import docx
+            doc = docx.Document(str(path))
+            paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            file_data["content"] = {"paragraphs": paragraphs}
+
+        else:
+            # Fallback to plain text
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            file_data["content"] = text
+
+        # Truncate to prevent context window overflow
+        json_str = json.dumps(file_data)
+        if len(json_str) > max_chars:
+            file_data["content"] = "Content truncated due to length. " + json_str[:max_chars]
+            
+        return {"success": True, "data": file_data}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    
+    
+    
+def action_create_word_doc(payload: dict) -> dict:
+    """
+    Creates a Word document from LLM output, saves it to the Desktop, 
+    and opens it automatically.
+    """
+    # 1. Define the drop location (Desktop/MARIE_Reports)
+    save_dir = Path.home() / "Desktop" / "MARIE_Reports"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    filename = payload.get("filename", "Data_Analysis_Report.docx")
+    filepath = save_dir / filename
+
+    content = payload.get("content", "No content provided.")
+    title = payload.get("title", "MARIE Analysis Report")
+
+    # 2. Generate the Document
+    if DOCX_AVAILABLE:
+        try:
+            doc = Document()
+            doc.add_heading(title, 0)
+            
+            # Split content by newlines to make actual paragraphs
+            for paragraph_text in content.split('\n'):
+                if paragraph_text.strip():
+                    doc.add_paragraph(paragraph_text.strip())
+            
+            doc.save(str(filepath))
+            
+            # 3. Automatically open the file for the user (Windows)
+            if hasattr(os, 'startfile'):
+                os.startfile(str(filepath))
+                
+            return {
+                "success": True, 
+                "message": f"Report successfully generated at {filepath}. It should now be open on your screen."
+            }
+        except Exception as e:
+            return {"success": False, "message": f"Failed to save document: {str(e)}"}
+    else:
+        return {"success": False, "message": "python-docx library is not installed."}
+    
 
 # -----------------------------------------------------------------------------
 # Core Classes
@@ -1440,15 +1620,13 @@ class UnifiedTaskBridge:
                 return _fail(f"Failed to open {clean}.", str(exc))
         return self.launch_application(clean)
 
-    def read_file_text(self, file_path: str, max_chars: int = 12000) -> Dict[str, Any]:
+    def read_file_text(self, file_path: str, max_chars: int = 15000) -> Dict[str, Any]:
         try:
             path = Path(file_path).expanduser().resolve()
             if not path.exists() or not path.is_file():
                 return _fail("File was not found.", f"missing_file: {path}")
 
-            office_exts = {".doc", ".docx", ".xlsx", ".xls", ".csv", ".pdf"}
-            if path.suffix.lower() in office_exts:
-                return _ok("File content hidden by policy for office documents.", data={"path": str(path)})
+            # Note: The restrictive 'office_exts' policy block has been removed so MARIE can actually read the files.
 
             suffix = path.suffix.lower()
             if suffix == ".pdf":
@@ -1466,7 +1644,8 @@ class UnifiedTaskBridge:
                         text = "\n".join(pages_text)
                 except Exception as exc:
                     return _fail("Could not parse PDF file.", str(exc))
-            elif suffix == ".docx":
+                    
+            elif suffix in {".doc", ".docx"}:
                 if docx is None:
                     return _fail("python-docx is not available to read DOCX files.", "missing_dependency: python-docx")
                 try:
@@ -1858,6 +2037,7 @@ class UnifiedTaskBridge:
             return _ok("Opened WhatsApp Web compose window.", data={"url": url})
         except Exception as exc:
             return _fail("Failed to open WhatsApp Web.", str(exc))
+            
 
     def execute_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -1945,7 +2125,7 @@ class UnifiedTaskBridge:
                 return self.send_whatsapp(to_number=str(action.get("to") or action.get("to_number") or ""), message=str(action.get("message") or action.get("text") or ""), use_twilio=_to_bool(action.get("use_twilio", False), default=False), twilio_account_sid=str(action.get("twilio_account_sid") or action.get("account_sid") or ""), twilio_auth_token=str(action.get("twilio_auth_token") or action.get("auth_token") or ""), twilio_from=str(action.get("twilio_from") or action.get("from") or ""), media_url=str(action.get("media_url", "")))
             if action_name == "online_query":
                 return self.connectivity.online_query(query=str(action.get("query", "")), max_results=int(action.get("max_results", 5) or 5))
-            if action_name in {"create_word_doc", "analyze_excel"}:
+            if action_name in {"create_word_doc", "create_pdf_report", "create_excel_report, analyze_excel, analyze_word_doc, analyze_pdf"}:
                 return execute_office_tool(action_name, action)
             
             return _fail("Unknown tool action.", f"unsupported_action: {action_name}")

@@ -133,73 +133,44 @@ class MarieMemoryAgent:
 
         return []
 
+    def _get_embedding_payload(self, text_or_list):
+        """Unified embedding call replacing redundant blocks."""
+        client = self._ollama_client or ollama
+        if not client: return None
+        
+        for method_name in ("embed", "embeddings"):
+            if hasattr(client, method_name):
+                try:
+                    method = getattr(client, method_name)
+                    # 'embeddings' strictly wants string prompt, 'embed' wants list or string input
+                    if method_name == "embeddings" and isinstance(text_or_list, list):
+                        if len(text_or_list) == 1:
+                            return method(model=self.embedding_model, prompt=text_or_list[0])
+                        return None
+                    
+                    kwargs = {"model": self.embedding_model}
+                    if method_name == "embed": kwargs["input"] = text_or_list
+                    else: kwargs["prompt"] = text_or_list
+                    return method(**kwargs)
+                except Exception:
+                    pass
+        return None
+
     def _embed_batch(self, texts: Sequence[str]) -> List[List[float]]:
-        if not texts or ollama is None:
-            return []
+        """Batches embeddings, utilizing the unified helper to prevent repetitive loops."""
+        if not texts or ollama is None: return []
 
-        payload = None
-        if self._ollama_client is not None and hasattr(self._ollama_client, "embed"):
-            try:
-                payload = self._ollama_client.embed(model=self.embedding_model, input=list(texts))
-            except Exception:
-                payload = None
-
-        if payload is None and self._ollama_client is not None and hasattr(self._ollama_client, "embeddings"):
-            try:
-                if len(texts) == 1:
-                    payload = self._ollama_client.embeddings(model=self.embedding_model, prompt=texts[0])
-            except Exception:
-                payload = None
-
-        if payload is None and hasattr(ollama, "embed"):
-            try:
-                payload = ollama.embed(model=self.embedding_model, input=list(texts))
-            except Exception:
-                payload = None
-
-        if payload is None and hasattr(ollama, "embeddings"):
-            try:
-                if len(texts) == 1:
-                    payload = ollama.embeddings(model=self.embedding_model, prompt=texts[0])
-            except Exception:
-                payload = None
-
+        payload = self._get_embedding_payload(list(texts))
         vectors = self._extract_embeddings(payload)
         if len(vectors) == len(texts):
             return vectors
 
-        # Fallback for runtimes that only support single-text embedding calls.
-        one_by_one: List[List[float]] = []
+        # Fallback one-by-one if batching fails
+        one_by_one = []
         for text in texts:
-            single_payload = None
-
-            if self._ollama_client is not None and hasattr(self._ollama_client, "embed"):
-                try:
-                    single_payload = self._ollama_client.embed(model=self.embedding_model, input=text)
-                except Exception:
-                    single_payload = None
-
-            if single_payload is None and self._ollama_client is not None and hasattr(self._ollama_client, "embeddings"):
-                try:
-                    single_payload = self._ollama_client.embeddings(model=self.embedding_model, prompt=text)
-                except Exception:
-                    single_payload = None
-
-            if single_payload is None and hasattr(ollama, "embed"):
-                try:
-                    single_payload = ollama.embed(model=self.embedding_model, input=text)
-                except Exception:
-                    single_payload = None
-
-            if single_payload is None and hasattr(ollama, "embeddings"):
-                try:
-                    single_payload = ollama.embeddings(model=self.embedding_model, prompt=text)
-                except Exception:
-                    single_payload = None
-
-            single_vec = self._extract_embeddings(single_payload)
-            if not single_vec:
-                return []
+            single = self._get_embedding_payload(text)
+            single_vec = self._extract_embeddings(single)
+            if not single_vec: return []
             one_by_one.append(single_vec[0])
 
         return one_by_one

@@ -8,7 +8,7 @@ runners to prevent UI freezing.
 from __future__ import annotations
 
 # === Imports ===
-import argparse, faulthandler,contextlib, io, html, json, math, os, re, subprocess, sys, time, threading, pyautogui, openpyxl
+import argparse, faulthandler,contextlib, io, html, json, math, os, re, subprocess, sys, time, threading, pyautogui, openpyxl, mimetypes, docx, pptx
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -248,6 +248,28 @@ def run_json_tool_isolated(action_payload: Dict, timeout_sec: int = 55) -> tuple
             
     output = "\n".join(part for part in [stdout_text, stderr_text] if part).strip()
     return completed.returncode == 0, output or (f"[ACTION] Exited with code {completed.returncode}." if completed.returncode != 0 else "")
+
+class DropLineEdit(QLineEdit):
+    """Custom QLineEdit that accepts drag-and-drop files."""
+    file_dropped = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            file_path = urls[0].toLocalFile()
+            self.file_dropped.emit(file_path)
+            self.setText(f'[File Attached: {os.path.basename(file_path)}] ')
+            event.acceptProposedAction()
 
 class JsonActionWorker(QThread):
     """Asynchronous runner to execute JSON-based shell utility tools."""
@@ -569,6 +591,7 @@ class AssistantMainWindow(QMainWindow):
         self._build_settings_tab()
         self._build_rad_tab()
         self._build_help_tab()
+        
 
     def _build_chat_tab(self) -> None:
         layout = QHBoxLayout(self.chat_tab)
@@ -628,9 +651,12 @@ class AssistantMainWindow(QMainWindow):
         right_layout.addWidget(self.chat_box, stretch=1)
 
         controls_row = QHBoxLayout()
-        self.input_line = QLineEdit()
-        self.input_line.setPlaceholderText("Type a command...")
+        self.input_line = DropLineEdit()
+        self.input_line.setPlaceholderText("Type a command or drop a file here...")
         self.input_line.returnPressed.connect(self.on_send_clicked)
+        self.attached_file_path = None
+        self.input_line.file_dropped.connect(self._on_file_dropped)
+        
         controls_row.addWidget(self.input_line, stretch=1)
 
         self.send_btn = QPushButton("Send")
@@ -688,6 +714,9 @@ class AssistantMainWindow(QMainWindow):
             daemon=True
         )
         self.indexer_thread.start()    
+        
+    def _on_file_dropped(self, file_path: str):
+        self.attached_file_path = file_path    
 
     def _build_history_tab(self) -> None:
         layout = QVBoxLayout(self.history_tab)
@@ -782,11 +811,48 @@ class AssistantMainWindow(QMainWindow):
         row.addWidget(refresh_btn)
         layout.addLayout(row)
 
-    def _build_help_tab(self) -> None:
+    def _build_help_tab(self):
+        self.help_tab = QWidget()
         layout = QVBoxLayout(self.help_tab)
         help_text = QTextEdit()
         help_text.setReadOnly(True)
-        help_text.setHtml("<h2>System Guide</h2><p>MARIE processes commands locally using optimized language architectures.</p>")
+        
+        html_content = """
+        <h2>MARIE System Guide & Commands</h2>
+        <p>Welcome to your personal AI assistant! Here is a cheat sheet on how to interact with the system.</p>
+
+        <h3>🎤 Voice & Audio Controls</h3>
+        <ul>
+            <li><b>Wake Word:</b> Say <i>"Hey Marie"</i> followed by your command to wake her up.</li>
+            <li><b>Toggle Mic:</b> Press <b>F4</b> to manually turn the microphone on or off.</li>
+            <li><b>Emotional Output:</b> Depending on context, MARIE can sound <i>happy, sad, angry, excited, or flustered</i>. Her voice physics (speed and pitch) adapt automatically!</li>
+        </ul>
+
+        <h3>💻 OS & Desktop Control</h3>
+        <p>MARIE can automate desktop tasks. Try saying or typing things like:</p>
+        <ul>
+            <li><i>"Open Google Chrome"</i> or <i>"Launch Spotify"</i></li>
+            <li><i>"Mute the volume"</i> or <i>"Set the volume to 50%"</i></li>
+            <li><i>"Search the web for the latest Python news"</i></li>
+            <li><i>"Play [Song Name] on YouTube"</i></li>
+        </ul>
+
+        <h3>📅 Office & Automation</h3>
+        <p>If Microsoft Office tools are enabled:</p>
+        <ul>
+            <li><b>Meetings:</b> <i>"Schedule a 30-minute meeting with john@example.com tomorrow at 2 PM about the new project."</i></li>
+            <li><b>Documents:</b> <i>"Create a Word document and write a note about my daily schedule."</i></li>
+        </ul>
+
+        <h3>🧠 Memory & Knowledge Base (RAG)</h3>
+        <ul>
+            <li><b>Teach Her Facts:</b> <i>"Remember that my favorite food is pizza."</i> or <i>"Note that I live in Kuala Lumpur."</i></li>
+            <li><b>Query Memory:</b> <i>"What is my favorite food?"</i></li>
+            <li><b>Local File Reading:</b> Drop PDFs, Word docs, CSVs, or Text files into the <code>knowledge/</code> or <code>D:/Train/</code> folders. The idle indexer will automatically read them in the background so you can ask her questions about those files later.</li>
+        </ul>
+        """
+        
+        help_text.setHtml(html_content)
         layout.addWidget(help_text)
 
     # --- 3. Live2D & Avatar Setup ---
@@ -860,6 +926,13 @@ class AssistantMainWindow(QMainWindow):
         message = self.input_line.text().strip()
         if not message: return
         
+        # FIX: Global safeguard to prevent overwriting *any* running thread
+        if (self.worker and self.worker.isRunning()) or \
+           (getattr(self, 'fast_worker', None) and self.fast_worker.isRunning()) or \
+           (self.action_worker and self.action_worker.isRunning()):
+            self._set_status_core("Please wait, task in progress...")
+            return
+        
         self.input_line.clear()
         self._append_chat("You", message)
         
@@ -872,10 +945,29 @@ class AssistantMainWindow(QMainWindow):
             self.fast_worker.finished_action.connect(self._on_action_completed)
             self.fast_worker.start()
             return
+            
         self._set_status_core("Thinking...")
         
-        if self.worker and self.worker.isRunning():
-            return
+        if hasattr(self, 'attached_file_path') and self.attached_file_path:
+            # Import our new converter
+            from aiassistant.tools.tools_os import convert_file_to_json
+            
+            self._set_status_core("Converting file to JSON...")
+            file_json_result = convert_file_to_json(self.attached_file_path)
+            
+            if file_json_result.get("success"):
+                json_string = json.dumps(file_json_result["data"])
+                # Append the JSON payload secretly to the message context
+                message = f"{message}\n\n[USER UPLOADED FILE DATA (JSON)]:\n{json_string}"
+            else:
+                self._append_chat("System", f"Failed to read file: {file_json_result.get('error')}")
+            
+            # Clear attachment after processing
+            self.attached_file_path = None
+        
+        # Render clean message to UI (hide the massive JSON payload from the chatbox)
+        clean_ui_message = message.split("\n\n[USER UPLOADED FILE DATA")[0]
+        self._append_chat("You", clean_ui_message)
 
         self.agent.reset_stop()
         self._latest_user_text = message
@@ -896,6 +988,7 @@ class AssistantMainWindow(QMainWindow):
         
         self.worker.start()
         self._set_status_core("Thinking")
+        
 
     def on_token_streamed(self, token: str) -> None:
         """Appends individual characters/tokens without adding newline breaks."""
@@ -1102,6 +1195,32 @@ class AssistantMainWindow(QMainWindow):
         self.json_action_worker = JsonActionWorker(cmd)
         self.json_action_worker.finished_action.connect(self._on_action_completed)
         self.json_action_worker.start()
+        
+    def closeEvent(self, event):
+        """Safely stops all QThreads so they don't get destroyed while running when the app closes."""
+        self._set_status_core("Shutting down...")
+        
+        # Wait for agent worker to safely exit
+        if getattr(self, 'worker', None) and self.worker.isRunning():
+            self.agent.stop() # Tell underlying LLM loop to abort
+            self.worker.quit()
+            self.worker.wait()
+            
+        # Wait for action workers
+        if getattr(self, 'fast_worker', None) and self.fast_worker.isRunning():
+            self.fast_worker.quit()
+            self.fast_worker.wait()
+            
+        if getattr(self, 'action_worker', None) and self.action_worker.isRunning():
+            self.action_worker.quit()
+            self.action_worker.wait()
+            
+        if getattr(self, 'json_action_worker', None) and self.json_action_worker.isRunning():
+            self.json_action_worker.cancel() # Trigger subprocess kill
+            self.json_action_worker.quit()
+            self.json_action_worker.wait()
+            
+        super().closeEvent(event)
 
 # === Entry Point ===
 def main() -> None:
