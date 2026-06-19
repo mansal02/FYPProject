@@ -8,17 +8,17 @@ RVC_DIR = CONFIG["paths"]["rvc_dir"]
 # --- THE ULTIMATE CHARACTER DATABASE ---
 CHARACTERS = {
     # =========================================================================
-    # CHARACTER 1: AGNES TACHYON (The Mad Scientist)
+    # CHARACTER 1
     # =========================================================================
-    "tachyon": {
+    "voice_01": {
         "name": "English UK Bright",
         "piper_model": "en_GB-jenny_dioco-medium.onnx",
         "speaker_id": 0,
         
         # --- RVC SETTINGS (Disabled/Commented) ---
         "rvc_enable": True,
-        "rvc_model": "Tachyon.pth",
-        "rvc_index": "Tachyon.index",
+        "rvc_model": "voice_01.pth",
+        "rvc_index": "voice_01.index",
         "pitch_shift": 0,
         
         "emotions": {
@@ -30,8 +30,6 @@ CHARACTERS = {
             "curious":   {"speed": 1.00, "pitch_shift": 2}, 
             "concerned": {"speed": 0.90, "pitch_shift": -1}, 
             "explaining":{"speed": 0.95, "pitch_shift": 0}, 
-
-            # --- HIGH ENERGY ---
             "manic":     {"speed": 1.15, "pitch_shift": 4}, 
             "eureka":    {"speed": 1.10, "pitch_shift": 3}, 
             "panic":     {"speed": 1.15, "pitch_shift": 2}, 
@@ -39,15 +37,11 @@ CHARACTERS = {
             "happy":     {"speed": 1.00, "pitch_shift": 1},
             "laugh":     {"speed": 1.05, "pitch_shift": 2},
             "surprised": {"speed": 1.10, "pitch_shift": 3}, 
-
-            # --- LOW ENERGY ---
             "lazy":      {"speed": 0.80, "pitch_shift": -3}, 
             "tired":     {"speed": 0.75, "pitch_shift": -2},
             "bored":     {"speed": 0.80, "pitch_shift": -2},
             "sigh":      {"speed": 0.70, "pitch_shift": -4},
             "whisper":   {"speed": 0.85, "pitch_shift": -1},
-
-            # --- SOCIAL / DARK ---
             "smug":      {"speed": 0.90, "pitch_shift": 0},   
             "mocking":   {"speed": 0.95, "pitch_shift": 1},   
             "serious":   {"speed": 0.85, "pitch_shift": -1},
@@ -58,36 +52,30 @@ CHARACTERS = {
     },
 
     # =========================================================================
-    # CHARACTER 2: JEANNE ALTER (The Dragon Witch)
+    # CHARACTER 2
     # =========================================================================
-    "jalter": {
+    "voice_02": {
         "name": "English US Warm",
         "piper_model": "en_US-libritts-high.onnx",
         "speaker_id": 19, 
         
         # --- RVC SETTINGS (Disabled/Commented) ---
         "rvc_enable": True,
-        "rvc_model": "jalter.pth", 
-        "rvc_index": "jalter.index",
+        "rvc_model": "voice_02.pth", 
+        "rvc_index": "voice_02.index",
         "pitch_shift": -2, 
 
         "emotions": {
-            # --- NEUTRAL / COOL ---
             "default":   {"speed": 0.90, "pitch_shift": -2}, 
             "friendly":  {"speed": 0.95, "pitch_shift": -1}, 
             "curious":   {"speed": 0.95, "pitch_shift": -1}, 
             "bored":     {"speed": 0.80, "pitch_shift": -2},
             "smug":      {"speed": 0.85, "pitch_shift": -1}, 
-
-            # --- AGGRESSIVE ---
             "angry":     {"speed": 1.00, "pitch_shift": -1}, 
             "rage":      {"speed": 1.10, "pitch_shift": 1},  
             "command":   {"speed": 0.85, "pitch_shift": -4}, 
             "disgust":   {"speed": 0.75, "pitch_shift": -3}, 
             "annoyed":   {"speed": 0.90, "pitch_shift": -2}, 
-
-            # --- TSUNDERE / VULNERABLE ---
-            "tsundere":  {"speed": 1.05, "pitch_shift": 3},  
             "flustered": {"speed": 1.00, "pitch_shift": 1},  
             "shy":       {"speed": 0.95, "pitch_shift": 0},  
             "sad":       {"speed": 0.75, "pitch_shift": -1}, 
@@ -97,17 +85,17 @@ CHARACTERS = {
     },
 
     # =========================================================================
-    # CHARACTER 3: HATSUNE MIKU (The Virtual Idol)
+    # CHARACTER 3
     # =========================================================================
-    "miku": {
+    "voice_03": {
         "name": "English US Clear",
         "piper_model": "en_US-lessac-medium.onnx",
         "speaker_id": 0,
         
         # --- RVC SETTINGS (Disabled/Commented) ---
         "rvc_enable": True,
-        "rvc_model": "miku.pth",      
-        "rvc_index": "miku.index",    
+        "rvc_model": "voice_03.pth",      
+        "rvc_index": "voice_03.index",    
         "pitch_shift": 4,             
 
         "emotions": {
@@ -115,16 +103,12 @@ CHARACTERS = {
             "default":   {"speed": 1.00, "pitch_shift": 4},
             "friendly":  {"speed": 1.05, "pitch_shift": 5}, 
             "curious":   {"speed": 1.05, "pitch_shift": 5}, 
-
-            # --- HIGH ENERGY ---
             "happy":     {"speed": 1.05, "pitch_shift": 5},
             "excited":   {"speed": 1.10, "pitch_shift": 6}, 
             "sing":      {"speed": 0.95, "pitch_shift": 4}, 
             "shout":     {"speed": 1.15, "pitch_shift": 5}, 
             "cheer":     {"speed": 1.10, "pitch_shift": 6}, 
             "cute":      {"speed": 1.05, "pitch_shift": 6}, 
-
-            # --- DIGITAL / NEGATIVE ---
             "system":    {"speed": 0.90, "pitch_shift": 2}, 
             "robot":     {"speed": 0.85, "pitch_shift": 0}, 
             "confused":  {"speed": 0.90, "pitch_shift": 3}, 
@@ -140,8 +124,8 @@ def get_character_data(char_id):
     char_id = char_id.lower()
     
     if char_id not in CHARACTERS:
-        print(f"[DB ERROR] Character '{char_id}' not found. Defaulting to Tachyon.")
-        char_id = "tachyon"
+        print(f"[DB ERROR] Character '{char_id}' not found. Defaulting to voice_01.")
+        char_id = "voice_01"
     
     data = CHARACTERS[char_id]
     model_path = os.path.join(PIPER_DIR, data["piper_model"])

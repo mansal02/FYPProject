@@ -11,17 +11,17 @@ from aiassistant.infra.config.app_config import CONFIG
 
 try:
     import PyPDF2
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  
     PyPDF2 = None
 
 try:
     import docx
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  
     docx = None
 
 try:
     import openpyxl
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  
     openpyxl = None
 
 

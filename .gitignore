@@ -18,7 +18,7 @@ env/
 
 # --- Large AI Models & Assets ---
 models/
-rvc_models/
+rvc/
 piper/
 checkpoints/
 node_modules/
@@ -41,3 +41,5 @@ Thumbs.db
 dist/
 build/
 *.spec
+
+*.index

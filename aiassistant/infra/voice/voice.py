@@ -1,51 +1,38 @@
-import os
-import subprocess
-import pygame
-import threading
-import time
-import random
-import re
-import queue
-import glob
+import os, subprocess,pygame, threading, time, random, re, queue, glob
+import sounddevice as sd
+import soundfile as sf
 from aiassistant.infra.config.app_config import CONFIG
 from aiassistant.infra.voice.voice_db import get_character_data, PIPER_DIR
 
 PIPER_EXE = os.path.join(PIPER_DIR, "piper.exe")
 
 class MarieVoice:
-    def __init__(self, default_char="tachyon"):
+    def __init__(self, default_char="voice_01"):
         print(f"[AUDIO] Initializing Piper Engine...")
         if not os.path.exists(PIPER_EXE):
-            raise FileNotFoundError("piper.exe not found!")
+            raise FileNotFoundError(f"piper.exe not found at {PIPER_EXE}!")
 
-        # Create a cache folder to avoid file conflicts
         self.cache_dir = os.path.join(os.path.dirname(__file__), "cache")
         os.makedirs(self.cache_dir, exist_ok=True)
         self._clear_cache()
-
-        # Audio System
-        try:
-            # Init mixer with standard settings; Sound() handles resampling automatically
+        
+        # 1. Properly set up initial character variables
+        self.set_voice(default_char)
+        
+        # 2. Initialize Pygame Mixer and create the required audio channel
+        if not pygame.mixer.get_init():
             pygame.mixer.init()
-            # We use a dedicated Channel for voice to separate it from potential SFX
-            self.channel = pygame.mixer.Channel(0)
-        except Exception as e:
-            print(f"[AUDIO] Mixer Error: {e}")
+        self.channel = pygame.mixer.Channel(0)
 
-        # Threading & Queues
         self.speech_queue = queue.Queue()
         self.is_running = True
         self.is_speaking = False
         self.stop_requested = False
         self.current_process = None
         
-
-        self.worker_thread = threading.Thread(target=self._process_queue, daemon=True)
-        self.worker_thread.start()
-
-        self.set_voice(default_char)
-        print("[AUDIO] Engine Ready.")
-        self._warmup()
+        # 3. FIX: Point target to the actual loop function '_process_queue'
+        threading.Thread(target=self._process_queue, daemon=True).start()
+        
 
     def set_voice(self, char_id):
         self.char_data, self.model_path = get_character_data(char_id)
@@ -219,13 +206,19 @@ class MarieVoice:
             return None
 
     def play_file(self, filepath):
-        """Plays any WAV file (Raw or RVC converted)."""
+        """Plays the WAV file seamlessly without locking the main thread."""
         if not os.path.exists(filepath): return
         
         try:
-            sound = pygame.mixer.Sound(filepath)
-            self.channel.play(sound)
-            while self.channel.get_busy():
-                pygame.time.Clock().tick(30)
+            self.is_speaking = True
+            # Read file into memory
+            data, fs = sf.read(filepath, dtype='float32')
+            
+            # Play and wait asynchronously
+            sd.play(data, fs)
+            sd.wait() # Waits until this specific audio file finishes
+            
         except Exception as e:
-            print(f"[PLAY ERROR] {e}")        
+            print(f"[AUDIO] Playback Error: {e}")
+        finally:
+            self.is_speaking = False       

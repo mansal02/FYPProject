@@ -5,6 +5,7 @@ import threading
 import uuid
 
 import ollama
+from typing import Optional
 import uvicorn
 from fastapi import Body, FastAPI
 from fastapi.responses import StreamingResponse
@@ -12,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from aiassistant.core.llm_core import run_crew_assist, run_multi_agent_round
 from aiassistant.backend.streaming_utils import drain_complete_sentences
 from aiassistant.infra.config.app_config import CONFIG
-from aiassistant.infra.db.database import MarieDB
+from aiassistant.infra.db.database_manager import DatabaseManager
 from aiassistant.infra.rag_memory import get_rag_context
 
 # Mid-tier optimization: Apply quantization settings
@@ -24,11 +25,11 @@ except Exception:
 
 try:
     import requests
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  
     requests = None
 
 app = FastAPI()
-db = MarieDB()
+db = DatabaseManager()
 
 os.environ.setdefault("OLLAMA_FLASH_ATTENTION", "1")
 os.environ.setdefault("OLLAMA_KV_CACHE_TYPE", "q4_0")
@@ -41,8 +42,16 @@ OLLAMA_TEMPERATURE = float(CONFIG["ollama"].get("temperature", 0.2))
 OLLAMA_SYSTEM_PROMPT = CONFIG["ollama"].get("system_prompt", "You are MARIE, a friendly assistant.")
 RUNTIME_ONLINE_MODE = str(CONFIG.get("runtime", {}).get("online_mode", "auto")).strip().lower()
 RUNTIME_HYBRID_MODE = bool(CONFIG.get("runtime", {}).get("hybrid_mode", False))
-EXTERNAL_MODEL = str(CONFIG.get("runtime", {}).get("external_model", "gemini-2.0-flash")).strip()
+EXTERNAL_MODEL = str(CONFIG.get("runtime", {}).get("external_model", "gemini-2.5-flash")).strip()
 
+def _extract_json_command(text: str) -> Optional[dict]:
+    match = re.search(r'\{.*"action".*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except:
+            return None
+    return None
 
 def _toggle_voice_rvc(enabled: bool) -> None:
     if requests is None:
@@ -62,18 +71,8 @@ _cancel_map = {}
 _cancel_lock = threading.RLock()
 
 _SENTIMENT_TAGS = {
-    "happy",
-    "sad",
-    "angry",
-    "excited",
-    "surprised",
-    "confused",
-    "neutral",
-    "concerned",
-    "friendly",
-    "serious",
-    "annoyed",
-    "bored",
+    "happy", "sad", "angry", "excited", "surprised", "confused", 
+    "neutral", "concerned", "friendly", "serious", "annoyed", "bored",
 }
 _SENTIMENT_KEYWORDS = {
     "happy": {"happy", "great", "awesome", "love", "fantastic", "glad", "delight"},
@@ -85,11 +84,9 @@ _SENTIMENT_KEYWORDS = {
     "concerned": {"concerned", "worried", "issue", "problem"},
 }
 
-
 def _truncate_memory_context(memory_context, max_lines=60, max_chars=7000):
     if not memory_context:
         return ""
-
     lines = [line for line in memory_context.splitlines() if line.strip()]
     recent = lines[-max_lines:]
     joined = "\n".join(recent)
@@ -97,13 +94,11 @@ def _truncate_memory_context(memory_context, max_lines=60, max_chars=7000):
         return joined
     return joined[-max_chars:]
 
-
 def _normalize_online_mode(mode: str) -> str:
     clean = str(mode or "").strip().lower()
     if clean not in {"auto", "online", "offline"}:
         return "auto"
     return clean
-
 
 def _resolve_online_mode(payload: dict) -> str:
     if isinstance(payload, dict):
@@ -113,11 +108,9 @@ def _resolve_online_mode(payload: dict) -> str:
             return "online" if bool(payload.get("use_online")) else "offline"
     return _normalize_online_mode(RUNTIME_ONLINE_MODE)
 
-
 def _should_use_crew(prompt: str, settings: dict) -> bool:
     if not isinstance(settings, dict) or not settings.get("enabled", False):
         return False
-
     router = str(settings.get("router", "complex_only")).strip().lower()
     if router == "always":
         return True
@@ -128,62 +121,41 @@ def _should_use_crew(prompt: str, settings: dict) -> bool:
         return False
     return _is_complex_reasoning_request(prompt)
 
-
 def _is_complex_reasoning_request(text: str) -> bool:
     lowered = (text or "").lower()
     words = re.findall(r"[a-zA-Z0-9_]+", lowered)
     if len(words) >= 36:
         return True
-
-    triggers = {
-        "analyze",
-        "compare",
-        "architecture",
-        "strategy",
-        "tradeoff",
-        "design",
-        "optimize",
-        "debug plan",
-        "step-by-step",
-        "root cause",
-    }
+    triggers = {"analyze", "compare", "architecture", "strategy", "tradeoff", "design", "optimize", "debug plan", "step-by-step", "root cause"}
     hits = sum(1 for token in triggers if token in lowered)
     return hits >= 2
-
 
 def _chunk_text(text: str, size: int = 24):
     if not text:
         return []
     return [text[idx : idx + size] for idx in range(0, len(text), size)]
 
-
 def _extract_sentiment_tag(text: str) -> str:
     if not text:
         return "neutral"
-
     match = re.search(r"\[([a-zA-Z]+)\]", text)
     if match:
         tag = match.group(1).lower()
         if tag in _SENTIMENT_TAGS:
             return tag
-
     lowered = text.lower()
     scores = {}
     for sentiment, keywords in _SENTIMENT_KEYWORDS.items():
         hits = sum(1 for token in keywords if token in lowered)
         if hits:
             scores[sentiment] = hits
-
     if not scores:
         return "neutral"
-
     return max(scores.items(), key=lambda item: item[1])[0]
-
 
 def _gemini_generate_text(prompt: str, temperature: float) -> str:
     if requests is None:
         return ""
-
     api_key = (
         os.environ.get("GOOGLE_API_KEY", "").strip()
         or os.environ.get("GEMINI_API_KEY", "").strip()
@@ -191,28 +163,13 @@ def _gemini_generate_text(prompt: str, temperature: float) -> str:
     )
     if not api_key:
         return ""
-
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{EXTERNAL_MODEL}:generateContent"
     payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": prompt}],
-            }
-        ],
-        "generationConfig": {
-            "temperature": float(temperature),
-            "maxOutputTokens": 640,
-        },
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": float(temperature), "maxOutputTokens": 640},
     }
-
     try:
-        response = requests.post(
-            url,
-            params={"key": api_key},
-            json=payload,
-            timeout=28,
-        )
+        response = requests.post(url, params={"key": api_key}, json=payload, timeout=28)
         if response.status_code >= 400:
             return ""
         data = response.json()
@@ -226,7 +183,58 @@ def _gemini_generate_text(prompt: str, temperature: float) -> str:
     except Exception:
         return ""
 
-
+def _auto_extract_memory_async(user_text: str):
+    """Runs a fast background LLM pass to extract facts and save to DB."""
+    if not user_text or len(user_text.strip()) < 5:
+        return  # Skip very short generic messages
+        
+    extraction_prompt = (
+        "Extract any permanent facts, user preferences, or ongoing tasks from this message. "
+        "Output ONLY a valid JSON dictionary with keys 'category' (fact, preference, or task), "
+        "'key' (a short 1-3 word summary), and 'value'. If there is nothing to save, output empty JSON {}."
+        f"\nMessage: {user_text}"
+    )
+    
+    try:
+        # 1. FIX: Instantiate a local DB connection strictly for this thread
+        from aiassistant.infra.db.database_manager import DatabaseManager
+        local_db = DatabaseManager()
+        
+        response = ollama.chat(
+            model=CONFIG.get("ollama", {}).get("fast_model", "qwen2.5:3b"), 
+            messages=[{"role": "user", "content": extraction_prompt}],
+            options={"temperature": 0.1, "num_predict": 150}
+        )
+        
+        result_text = response.get("message", {}).get("content", "").strip()
+        
+        # 2. FIX: Use Regex to aggressively strip out conversational filler
+        import re
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        
+        if not json_match:
+            print(f"[MEMORY WARN] Model failed to output JSON. Raw output: {result_text}")
+            return
+            
+        data = json.loads(json_match.group(0))
+        
+        # If it's not an empty dictionary, save it
+        if data and "category" in data and "key" in data and "value" in data:
+            if hasattr(local_db, "add_rad_data_if_new"):
+                local_db.add_rad_data_if_new(
+                    category=str(data["category"]).lower(),
+                    key=str(data["key"]),
+                    value=str(data["value"]),
+                    confidence=0.9
+                )
+                print(f"[MEMORY SUCCESS] Saved to Database -> {data['category']}: {data['key']}")
+            else:
+                print("[MEMORY ERROR] add_rad_data_if_new method missing in DatabaseManager.")
+                
+    except Exception as e:
+        # 3. FIX: Expose the error so we can actually see why it fails
+        print(f"[MEMORY THREAD CRASH] {str(e)}")
+        
 def get_marie_response_stream(prompt, memory_context="", online_mode="auto"):
     """Streams responses from Ollama with memory context injected."""
     try:
@@ -235,10 +243,13 @@ def get_marie_response_stream(prompt, memory_context="", online_mode="auto"):
             return
 
         system_instructions = OLLAMA_SYSTEM_PROMPT
+        
+        # Safely fetch style profile if the DB method exists
         try:
-            style_profile = db.get_style_profile("train_root")
+            style_profile = db.get_style_profile("train_root") if hasattr(db, "get_style_profile") else None
         except Exception:
             style_profile = None
+            
         if isinstance(style_profile, dict):
             formal = str(style_profile.get("formal", "")).strip()
             casual = str(style_profile.get("casual", "")).strip()
@@ -261,8 +272,10 @@ def get_marie_response_stream(prompt, memory_context="", online_mode="auto"):
         )
         if memory_context:
             recent_facts = _truncate_memory_context(memory_context)
-            system_instructions += f"\nFacts about the user you remember:\n{recent_facts}"
-
+            system_instructions += (
+                f"\n[CRITICAL CONTEXT] Incorporate the following retrieved memories into your response implicitly:\n"
+                f"{recent_facts}\n"
+            )
         resolved_mode = _normalize_online_mode(online_mode)
         use_online = False
         if resolved_mode == "online":
@@ -300,18 +313,15 @@ def get_marie_response_stream(prompt, memory_context="", online_mode="auto"):
         print(f"Ollama Error: {exc}")
         yield "I am having trouble connecting to my brain."
 
-
 def _register_cancel_event(request_id):
     with _cancel_lock:
         cancel_event = threading.Event()
         _cancel_map[request_id] = cancel_event
         return cancel_event
 
-
 def _pop_cancel_event(request_id):
     with _cancel_lock:
         _cancel_map.pop(request_id, None)
-
 
 def _cancel_request(request_id=None):
     stopped = 0
@@ -328,12 +338,11 @@ def _cancel_request(request_id=None):
             stopped += 1
     return stopped
 
-
 def _resolve_request_context(payload):
     user_text = payload.get("text", "")
     rag_context = payload.get("memory_context")
     if not rag_context:
-        rag_context = db.get_all_rad_data()
+        rag_context = db.get_all_rad_data() if hasattr(db, "get_all_rad_data") else ""
 
     doc_context = payload.get("doc_context") or get_rag_context(user_text, top_k=4)
     if doc_context:
@@ -345,13 +354,17 @@ def _resolve_request_context(payload):
 
     return user_text, rag_context
 
-
 @app.post("/chat")
 def chat_endpoint(payload: dict = Body(...)):
     user_text, rag_context = _resolve_request_context(payload)
-    online_mode = _resolve_online_mode(payload)
 
+    if user_text:
+        threading.Thread(target=_auto_extract_memory_async, args=(user_text,), daemon=True).start()
+        
+    online_mode = _resolve_online_mode(payload)
     crew_config = CONFIG.get("crew", {})
+    
+    # Run background memory extraction for the user's message
     if _should_use_crew(user_text, crew_config):
         crew_result = run_crew_assist(user_text, memory_context=rag_context, config=crew_config)
         summary = str(crew_result.get("summary") or "").strip()
@@ -364,7 +377,6 @@ def chat_endpoint(payload: dict = Body(...)):
 
     return {"response": full_response, "sentiment": _extract_sentiment_tag(full_response)}
 
-
 @app.post("/chat/multi-agent")
 def chat_multi_agent_endpoint(payload: dict = Body(...)):
     user_text, rag_context = _resolve_request_context(payload)
@@ -374,12 +386,7 @@ def chat_multi_agent_endpoint(payload: dict = Body(...)):
     try:
         return run_multi_agent_round(user_text, memory_context=rag_context)
     except Exception as e:
-        return {
-            "researcher": "",
-            "coder": "",
-            "final": f"Multi-agent mode failed: {e}",
-        }
-
+        return {"researcher": "", "coder": "", "final": f"Multi-agent mode failed: {e}"}
 
 @app.post("/chat/stream")
 def chat_stream_endpoint(payload: dict = Body(...)):
@@ -394,27 +401,13 @@ def chat_stream_endpoint(payload: dict = Body(...)):
 
         def generate_crew_events():
             if not summary:
-                yield json.dumps(
-                    {
-                        "type": "error",
-                        "content": str(crew_result.get("error") or "Crew processing failed."),
-                        "request_id": request_id,
-                    }
-                ) + "\n"
+                yield json.dumps({"type": "error", "content": str(crew_result.get("error") or "Crew processing failed."), "request_id": request_id}) + "\n"
                 return
 
             for chunk in _chunk_text(summary):
                 yield json.dumps({"type": "token", "content": chunk}) + "\n"
 
-            yield json.dumps(
-                {
-                    "type": "done",
-                    "full_response": summary,
-                    "sentiment": _extract_sentiment_tag(summary),
-                    "request_id": request_id,
-                    "cancelled": False,
-                }
-            ) + "\n"
+            yield json.dumps({"type": "done", "full_response": summary, "sentiment": _extract_sentiment_tag(summary), "request_id": request_id, "cancelled": False}) + "\n"
 
         return StreamingResponse(
             generate_crew_events(),
@@ -447,15 +440,13 @@ def chat_stream_endpoint(payload: dict = Body(...)):
             if not cancel_event.is_set() and sentence_buffer.strip():
                 yield json.dumps({"type": "sentence", "content": sentence_buffer.strip()}) + "\n"
 
-            yield json.dumps(
-                {
-                    "type": "done",
-                    "full_response": full_response,
-                    "sentiment": _extract_sentiment_tag(full_response),
-                    "request_id": request_id,
-                    "cancelled": bool(cancel_event.is_set()),
-                }
-            ) + "\n"
+            yield json.dumps({
+                "type": "done",
+                "full_response": full_response,
+                "sentiment": _extract_sentiment_tag(full_response),
+                "request_id": request_id,
+                "cancelled": bool(cancel_event.is_set()),
+            }) + "\n"
         except Exception as e:
             yield json.dumps({"type": "error", "content": str(e), "request_id": request_id}) + "\n"
         finally:
@@ -467,14 +458,12 @@ def chat_stream_endpoint(payload: dict = Body(...)):
         headers={"X-MARIE-REQUEST-ID": request_id},
     )
 
-
 @app.post("/chat/stop")
 def stop_chat_endpoint(payload: dict = Body(None)):
     payload = payload or {}
     request_id = payload.get("request_id")
     stopped = _cancel_request(request_id=request_id)
     return {"status": "stopping", "request_id": request_id, "stopped": stopped}
-
 
 if __name__ == "__main__":
     uvicorn.run(

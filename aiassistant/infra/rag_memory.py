@@ -2,10 +2,12 @@ import os
 import shutil
 import threading
 import time
+import hashlib
 from pathlib import Path
 
+from aiassistant.infra.embeddings import get_marie_embedding_function
 from aiassistant.infra.config.app_config import CONFIG
-from aiassistant.infra.db.database import MarieDB
+from aiassistant.infra.db.database_manager import DatabaseManager
 
 try:
     from aiassistant.infra.memory_agent import get_memory_agent_context, warm_memory_agent_index
@@ -20,13 +22,13 @@ except ImportError:
     chromadb = None
     CHROMA_AVAILABLE = False
 
+# Unified to use PyPDF2 to match doc_indexer.py and avoid crash loops
 try:
-    from pypdf import PdfReader
+    import PyPDF2
     PDF_AVAILABLE = True
 except ImportError:
-    PdfReader = None
+    PyPDF2 = None
     PDF_AVAILABLE = False
-
 
 class LocalRAG:
     def __init__(self, knowledge_dir, persist_dir):
@@ -34,28 +36,29 @@ class LocalRAG:
         self.persist_dir = Path(persist_dir)
         self._lock = threading.RLock()
         self._file_fingerprints = {}
-
         self.collection = None
+        
         if CHROMA_AVAILABLE:
             try:
                 self.persist_dir.mkdir(parents=True, exist_ok=True)
                 client = chromadb.PersistentClient(path=str(self.persist_dir))
-                self.collection = client.get_or_create_collection("marie_knowledge")
+                marie_ef = get_marie_embedding_function()
+                
+                self.collection = client.get_or_create_collection(
+                    name="marie_knowledge", 
+                    embedding_function=marie_ef
+                )
             except BaseException as exc:
-                self.collection = None
-                print(f"[RAG] Chroma init failed, disabling local RAG: {exc}")
-                self._attempt_reset()
+                print(f"[RAG] Failed to init ChromaDB: {exc}")    
 
     def _attempt_reset(self):
-        if not self.persist_dir.exists():
-            return
+        if not self.persist_dir.exists(): return
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         backup_dir = self.persist_dir.parent / f"chroma_corrupt_{timestamp}"
         try:
             shutil.move(str(self.persist_dir), str(backup_dir))
             self.persist_dir.mkdir(parents=True, exist_ok=True)
-            if not CHROMA_AVAILABLE:
-                return
+            if not CHROMA_AVAILABLE: return
             client = chromadb.PersistentClient(path=str(self.persist_dir))
             self.collection = client.get_or_create_collection("marie_knowledge")
             print(f"[RAG] Reset corrupt Chroma store to {backup_dir}")
@@ -64,8 +67,7 @@ class LocalRAG:
             print(f"[RAG] Chroma reset failed: {exc}")
 
     def _iter_docs(self):
-        if not self.knowledge_dir.exists():
-            return []
+        if not self.knowledge_dir.exists(): return []
         doc_ext = {".txt", ".md", ".csv", ".json", ".py", ".pdf"}
         return [p for p in self.knowledge_dir.rglob("*") if p.is_file() and p.suffix.lower() in doc_ext]
 
@@ -75,16 +77,12 @@ class LocalRAG:
 
     def _read_file_text(self, path_obj):
         ext = path_obj.suffix.lower()
-        if ext == ".pdf":
-            if not PDF_AVAILABLE:
-                return ""
+        if ext == ".pdf" and PDF_AVAILABLE:
             try:
-                reader = PdfReader(str(path_obj))
-                pages = [(page.extract_text() or "") for page in reader.pages]
-                return "\n".join(pages)
+                reader = PyPDF2.PdfReader(str(path_obj))
+                return "\n".join([(page.extract_text() or "") for page in reader.pages])
             except Exception:
                 return ""
-
         try:
             return path_obj.read_text(encoding="utf-8", errors="ignore")
         except Exception:
@@ -92,29 +90,22 @@ class LocalRAG:
 
     def _chunk(self, text, chunk_size=750, overlap=120):
         cleaned = " ".join(text.split())
-        if not cleaned:
-            return []
-
-        chunks = []
-        start = 0
+        if not cleaned: return []
+        chunks, start = [], 0
         while start < len(cleaned):
             end = min(len(cleaned), start + chunk_size)
             chunks.append(cleaned[start:end])
-            if end == len(cleaned):
-                break
+            if end == len(cleaned): break
             start = max(0, end - overlap)
         return chunks
 
     def refresh_index(self):
-        if not self.collection:
-            return
-
+        if not self.collection: return
         with self._lock:
             for path_obj in self._iter_docs():
                 signature = self._file_signature(path_obj)
                 key = str(path_obj)
-                if self._file_fingerprints.get(key) == signature:
-                    continue
+                if self._file_fingerprints.get(key) == signature: continue
 
                 try:
                     previous = self.collection.get(where={"source": key})
@@ -129,11 +120,11 @@ class LocalRAG:
                     self._file_fingerprints[key] = signature
                     continue
 
-                ids = []
-                metadatas = []
-                documents = []
+                ids, metadatas, documents = [], [], []
                 for idx, chunk in enumerate(chunks):
-                    ids.append(f"{path_obj.name}:{idx}:{abs(hash(chunk))}")
+                    # FIX: Use stable MD5 hash instead of python's randomized hash()
+                    chunk_hash = hashlib.md5(chunk.encode('utf-8', 'ignore')).hexdigest()[:16]
+                    ids.append(f"{path_obj.name}:{idx}:{chunk_hash}")
                     metadatas.append({"source": key, "chunk": idx})
                     documents.append(chunk)
 
@@ -144,26 +135,15 @@ class LocalRAG:
                     print(f"[RAG] Failed to index {path_obj}: {e}")
 
     def query(self, question, top_k=4):
-        if not self.collection or not question:
-            return ""
-
+        if not self.collection or not question: return ""
         try:
             self.refresh_index()
             result = self.collection.query(query_texts=[question], n_results=top_k)
             docs = (result.get("documents") or [[]])[0]
-            if not docs:
-                return ""
-            lines = []
-            for doc in docs:
-                snippet = doc.strip()
-                if not snippet:
-                    continue
-                lines.append(f"- {snippet[:320]}")
-            return "\n".join(lines)
+            return "\n".join([f"- {doc.strip()[:320]}" for doc in docs if doc.strip()])
         except Exception as e:
             print(f"[RAG] Query failed: {e}")
             return ""
-
 
 _knowledge_dir = CONFIG["paths"].get("knowledge_dir")
 _persist_dir = str((Path(CONFIG["paths"]["db_path"]).resolve().parent / "chroma").resolve())
@@ -171,13 +151,9 @@ _persist_dir = str((Path(CONFIG["paths"]["db_path"]).resolve().parent / "chroma"
 RAG = LocalRAG(_knowledge_dir, _persist_dir)
 _MEMORY_AGENT_WARMED = False
 
-
 def _query_memory_agent(question, top_k):
     global _MEMORY_AGENT_WARMED
-
-    if get_memory_agent_context is None:
-        return ""
-
+    if get_memory_agent_context is None: return ""
     try:
         if not _MEMORY_AGENT_WARMED and warm_memory_agent_index is not None:
             warm_memory_agent_index()
@@ -186,60 +162,30 @@ def _query_memory_agent(question, top_k):
     except Exception:
         return ""
 
-
 def _query_searchable_mirror(question, top_k):
     clean = str(question or "").strip()
-    if not clean:
-        return ""
+    if not clean: return ""
     try:
-        db = MarieDB()
+        db = DatabaseManager()
         results = db.search_searchable_mirror(clean, limit=max(1, int(top_k)))
     except Exception:
         return ""
-
-    if not results:
-        return ""
-
+    
     lines = []
     for item in results:
         path = str(item.get("file_path", "")).strip()
         snippet = str(item.get("snippet", "")).strip()
-        if not path:
-            continue
-        if snippet:
-            lines.append(f"- {path} :: {snippet[:240]}")
-        else:
-            lines.append(f"- {path}")
-
+        if path: lines.append(f"- {path} :: {snippet[:240]}" if snippet else f"- {path}")
     return "\n".join(lines)
 
-
 def get_rag_context(question, top_k=4):
-    """Retrieve RAG context with mid-tier optimization.
-    
-    Respects device-class top_k and lazy loading settings.
-    """
-    from aiassistant.infra.optimization import get_device_capabilities
-    
-    # Auto-adjust top_k for mid-tier devices
-    caps = get_device_capabilities()
-    profile = caps.optimization_profile
-    optimized_top_k = profile.get("top_k", 4)
-    if top_k > optimized_top_k:
-        top_k = optimized_top_k
-    
     memory_snippets = _query_memory_agent(question, top_k=max(1, int(top_k)))
     local_snippets = RAG.query(question, top_k=top_k)
     mirror_snippets = _query_searchable_mirror(question, top_k=max(1, int(top_k)))
 
     sections = []
-    if memory_snippets:
-        sections.append("Memory agent snippets:\n" + memory_snippets)
-    if local_snippets:
-        sections.append("Knowledge folder snippets:\n" + local_snippets)
-    if mirror_snippets:
-        sections.append("Searchable mirror snippets:\n" + mirror_snippets)
+    if memory_snippets: sections.append("Memory agent snippets:\n" + memory_snippets)
+    if local_snippets: sections.append("Knowledge folder snippets:\n" + local_snippets)
+    if mirror_snippets: sections.append("Searchable mirror snippets:\n" + mirror_snippets)
 
-    if sections:
-        return "\n\n".join(sections).strip()
-    return ""
+    return "\n\n".join(sections).strip() if sections else ""
