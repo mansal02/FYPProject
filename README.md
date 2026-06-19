@@ -16,7 +16,7 @@ Safe, JSON-based desktop tool execution (file management, system commands, etc.)
 
 To keep this repository lightweight, the large model files required for MARIE's advanced features are hosted externally. You must download these before setting up the application.
 
-Access the required assets from our [Google Drive Link Here] (Note: Insert actual link).
+Access the required assets from our [https://drive.google.com/drive/folders/1ahuQnknA6HDMpG3TJZWw6Wao3GB7qS3M?usp=drive_link].
 
 Once downloaded, extract and place them into the following directories in your project root:
 
